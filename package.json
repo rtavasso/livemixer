@@ -1,0 +1,34 @@
+{
+  "name": "livemixer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "predev": "npm run fixtures && npm run build:worker",
+    "dev": "vite --host 127.0.0.1",
+    "build:worker": "tsx scripts/build-worker.ts",
+    "prebuild": "npm run fixtures && npm run build:worker",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 4179 --strictPort",
+    "test": "vitest run",
+    "test:browser": "playwright test",
+    "fixtures": "tsx scripts/create-fixtures.ts",
+    "inspect:stems": "tsx scripts/inspect-stems.ts",
+    "prepare:fadr": "tsx scripts/prepare-fadr.ts",
+    "setup:models": "tsx scripts/setup-models.ts && npm run build:worker"
+  },
+  "dependencies": {
+    "@mediapipe/tasks-vision": "1.0.1",
+    "fflate": "0.8.3",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@types/node": "22.19.11",
+    "esbuild": "0.25.12",
+    "tsx": "4.23.13",
+    "typescript": "5.9.3",
+    "vite": "6.4.3",
+    "vitest": "3.2.7"
+  }
+}

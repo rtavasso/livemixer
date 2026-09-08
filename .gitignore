@@ -1,0 +1,12 @@
+node_modules/
+dist/
+test-results/
+playwright-report/
+public/scenes/**
+!public/scenes/.gitkeep
+public/fixtures/
+public/models/**
+!public/models/.gitkeep
+*.local.json
+*.jsonl
+.env*

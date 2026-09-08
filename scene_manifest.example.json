@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "label": "My reviewed stem scenes",
+  "masterTrimDb": -9,
+  "control": {
+    "smoothingMs": 60,
+    "parameterRampMs": 30,
+    "recipeDwellMs": 120,
+    "recipeRampMs": 20,
+    "schedulerIntervalMs": 25,
+    "lookaheadMs": 150,
+    "minimumLeadMs": 50,
+    "maxFrameAgeMs": 200,
+    "lossHoldMs": 250,
+    "neutralReturnMs": 1000,
+    "reacquireMs": 250,
+    "highThreshold": 0.92,
+    "highHoldMs": 1200,
+    "rearmThreshold": 0.75,
+    "rearmMs": 500,
+    "neutral": 0.3
+  },
+  "path": ["scene_a", "scene_b"],
+  "repeatPath": false,
+  "scenes": [
+    {
+      "id": "scene_a",
+      "sourceSongId": "recording_a",
+      "label": "First instrumental passage",
+      "sourceSampleRate": 48000,
+      "sourceFrameCount": 384000,
+      "loopBars": 4,
+      "beatsPerBar": 4,
+      "nominalBpm": 120,
+      "recipeQuantizationBars": 1,
+      "anchorStem": "other",
+      "stems": {
+        "other": { "file": "scene_a/other.wav", "trimDb": 0 },
+        "bass": { "file": "scene_a/bass.wav", "trimDb": 0 },
+        "drums": { "file": "scene_a/drums.wav", "trimDb": 0 }
+      },
+      "recipes": {
+        "sparse": { "other": 0, "bass": null, "drums": null },
+        "pulse": { "other": 0, "bass": -6, "drums": -10 },
+        "open": { "other": 0, "bass": -2, "drums": -3 }
+      },
+      "filter": { "minHz": 800, "maxHz": 8000, "q": 0 },
+      "sceneTrimDb": -3,
+      "approval": {
+        "recipes": false, "recipeTransitions": false, "loopSeam": false, "filterRange": false,
+        "notes": "TEMPLATE ONLY. Paths do not exist. Replace lengths/rate with actual WAV metadata and audition all required cases."
+      }
+    },
+    {
+      "id": "scene_b",
+      "sourceSongId": "recording_b",
+      "label": "Second instrumental passage",
+      "sourceSampleRate": 48000,
+      "sourceFrameCount": 460800,
+      "loopBars": 4,
+      "beatsPerBar": 4,
+      "nominalBpm": 100,
+      "recipeQuantizationBars": 1,
+      "anchorStem": "other",
+      "stems": {
+        "other": { "file": "scene_b/other.wav", "trimDb": 0 },
+        "bass": { "file": "scene_b/bass.wav", "trimDb": 0 },
+        "drums": { "file": "scene_b/drums.wav", "trimDb": 0 }
+      },
+      "recipes": {
+        "sparse": { "other": 0, "bass": null, "drums": null },
+        "pulse": { "other": 0, "bass": -6, "drums": -10 },
+        "open": { "other": 0, "bass": -2, "drums": -3 }
+      },
+      "filter": { "minHz": 800, "maxHz": 8000, "q": 0 },
+      "sceneTrimDb": -3,
+      "approval": {
+        "recipes": false, "recipeTransitions": false, "loopSeam": false, "filterRange": false,
+        "notes": "TEMPLATE ONLY. Review this native-tempo entry and every recipe combination across the edge."
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "scene_a", "to": "scene_b", "kind": "fade_to_zero_reset", "fadeOutBeats": 1,
+      "fadeInMs": 10, "approved": false,
+      "notes": "Review all nine outgoing/incoming recipe combinations. No simultaneous cross-song audio."
+    }
+  ]
+}
