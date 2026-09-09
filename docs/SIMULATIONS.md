@@ -64,9 +64,9 @@ A Leap Motion Controller (LM-010) is the best-fitting sensor for this scaffold: 
 1. Install the tracking software that supports the LM-010 (V2, Orion 4, or the Gemini 5.0 preview all expose the WebSocket API; later Gemini/Hyperion releases removed it, in which case use `bridge/` with Ultraleap's Python bindings).
 2. In the Leap Motion control panel (tray icon → Settings → General) enable **Allow Web Apps**. The service then listens on port 6437. The same switch is `websockets_enabled` in the service's `config.json`; keep `websockets_allow_remote` off.
 3. Place the device on the desk between the performer and the display with its green light facing the performer: device x is then the performer's right, y is up, z is toward the performer.
-4. Open `sim.html?source=leap` (or pick *Leap Motion* in the overlay). The source frame is a box in millimetres from the device centre, default x −140…140, y 90…330, z −100…100; the overlay's status line shows the raw palm position so the box can be set to the intended reach, then two-corner calibration fine-tunes it. `LEAP_MAPPING` turns "toward the display" into a push. `?leap=ws://…` overrides the URL.
+4. Open `sim.html?source=leap` (or pick *Leap Motion* in the overlay). The source frame is a box in millimetres from the device centre, default x −160…160, y 100…450, z −120…120; the overlay's status line shows the raw palm position so the box can be set to the intended reach, then two-corner calibration fine-tunes it. `LEAP_MAPPING` turns "toward the display" into a push. `?leap=ws://…` overrides the URL.
 
-Leap hands carry `openness` (1 − grab strength) and `pinch`, so the `grab`/`release` gestures work, and `points` holds the five fingertips plus the palm.
+Leap hands carry `openness` (1 − grab strength) and `pinch`, so the `grab`/`release` gestures work, and `points` holds the five fingertips plus the palm. The service's per-hand `confidence` rates the pose fit, not detection (the 5.0 preview reports values around 0.01–0.1 for a well-tracked hand), so the source floors it at 0.5 before the tracker's acceptance threshold; the raw value is shown in the status line as `leapConfidence`.
 
 ## Writing a simulation
 

@@ -91,7 +91,8 @@ export default defineSimulation({
           const breathing = 1 + params.breathe * .35 * Math.sin(time * 2.2) * stillness;
           const target = (.55 + .45 * hand.push) * breathing;
           light.intensity = approach(light.intensity, target, input.dt, .12);
-          light.radius = approach(light.radius, params.radius * (1 - .45 * hand.push) * (1 + .4 * hand.radius / .06), input.dt, .15);
+          // Bigger hands get a bigger light, within reason: sources that report fingertips (Leap) have wide extents.
+          light.radius = approach(light.radius, params.radius * (1 - .45 * hand.push) * (1 + .4 * Math.min(hand.radius, .12) / .06), input.dt, .15);
         }
         for (let i = lights.length - 1; i >= 0; i--) {
           const l = lights[i];

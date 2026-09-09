@@ -19,6 +19,11 @@ const frame = (over: Record<string, unknown> = {}) => JSON.stringify({
   gestures: [], devices: [], ...over,
 });
 
+const B = DEFAULT_LEAP_BOX;
+const nx = (mm: number) => (mm - B.x[0]) / (B.x[1] - B.x[0]);
+const ny = (mm: number) => (mm - B.y[0]) / (B.y[1] - B.y[0]);
+const nz = (mm: number) => (mm - B.z[0]) / (B.z[1] - B.z[0]);
+
 describe('leap protocol', () => {
   it('ignores greetings and events, parses tracking frames', () => {
     expect(parseLeapMessage('{"serviceVersion":"5.0.0-preview+52386","version":6}')).toBeNull();
@@ -32,16 +37,23 @@ describe('leap protocol', () => {
     expect(hands).toHaveLength(1);
     const h = hands[0];
     expect(h.id).toBe(12);
-    expect(h.position.x).toBeCloseTo((41 + 140) / 280, 6); expect(h.position.y).toBeCloseTo((211 - 90) / 240, 6); expect(h.position.z).toBeCloseTo((-21 + 100) / 200, 6);
+    expect(h.position.x).toBeCloseTo(nx(41), 6); expect(h.position.y).toBeCloseTo(ny(211), 6); expect(h.position.z).toBeCloseTo(nz(-21), 6);
     expect(h.openness).toBeCloseTo(.75, 6); expect(h.pinch).toBeCloseTo(.1, 6); expect(h.confidence).toBeCloseTo(.98, 6);
     expect(h.points).toHaveLength(6); // five fingertips then the palm
-    expect(h.points![0].x).toBeCloseTo((-10 + 140) / 280, 6); // thumb first
-    expect(h.extent!.min.x).toBeCloseTo((-10 + 140) / 280, 6); expect(h.extent!.max.y).toBeCloseTo((265 - 90) / 240, 6);
+    expect(h.points![0].x).toBeCloseTo(nx(-10), 6); // thumb first
+    expect(h.extent!.min.x).toBeCloseTo(nx(-10), 6); expect(h.extent!.max.y).toBeCloseTo(ny(265), 6);
   });
   it('clamps outside the box and defaults missing strengths', () => {
     const h = leapFrameToHands(parseLeapMessage(frame({ hands: [{ id: 3, palmPosition: [900, -50, 500] }], pointables: [] }))!, DEFAULT_LEAP_BOX)[0];
     expect(h.position).toEqual({ x: 1, y: 0, z: 1 }); expect(h.openness).toBe(1); expect(h.pinch).toBe(0); expect(h.confidence).toBe(1);
     expect(h.points).toHaveLength(1);
+  });
+  it('never lets a zero pose-confidence hide a tracked hand from the tracker', () => {
+    const h = leapFrameToHands(parseLeapMessage(frame({ hands: [{ id: 3, palmPosition: [0, 200, 0], confidence: 0 }], pointables: [] }))!, DEFAULT_LEAP_BOX)[0];
+    expect(h.confidence).toBeGreaterThanOrEqual(.5);
+    const t = new HandTracker(LEAP_MAPPING);
+    for (let i = 0; i < 12; i++) { t.ingest({ source: 'leap', sequence: i, observedAtMs: i * 9, receivedAtMs: i * 9, hands: [h] }); t.tick(i * 9); }
+    expect(t.tick(110).hands).toHaveLength(1);
   });
   it('rejects a degenerate box', () => { expect(() => leapBoxSchema.parse({ x: [0, 5], y: [0, 100], z: [0, 100] })).toThrow(); });
 });
@@ -51,8 +63,8 @@ describe('leap mapping into sim space', () => {
     const hands = leapFrameToHands(parseLeapMessage(frame())!, DEFAULT_LEAP_BOX);
     const p = mapPoint(LEAP_MAPPING, hands[0].position);
     expect(p.x).toBeGreaterThan(.5);                       // palm at +41 mm: performer's right
-    expect(p.y).toBeCloseTo((211 - 90) / 240, 6);          // higher hand = higher on screen
-    expect(p.z).toBeCloseTo(1 - (-21 + 100) / 200, 6);     // z toward the performer is withdrawn; toward the display is pushed
+    expect(p.y).toBeCloseTo(ny(211), 6);                   // higher hand = higher on screen
+    expect(p.z).toBeCloseTo(1 - nz(-21), 6);               // z toward the performer is withdrawn; toward the display is pushed
     const nearDisplay = mapPoint(LEAP_MAPPING, { x: .5, y: .5, z: 0 }), nearPerformer = mapPoint(LEAP_MAPPING, { x: .5, y: .5, z: 1 });
     expect(nearDisplay.z).toBe(1); expect(nearPerformer.z).toBe(0);
   });

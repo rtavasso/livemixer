@@ -21,8 +21,12 @@ const mm = z.number().finite();
 const range = z.tuple([mm, mm]).refine(([a, b]) => b - a >= 20, { message: 'A box side needs at least 20 mm.' });
 export const leapBoxSchema = z.object({ x: range, y: range, z: range }).strict();
 export type LeapBox = z.infer<typeof leapBoxSchema>;
-/** A comfortable reach above the device; the service's own interaction box is about 235 × 235 × 148 mm around (0, 200, 0). */
-export const DEFAULT_LEAP_BOX: LeapBox = { x: [-140, 140], y: [90, 330], z: [-100, 100] };
+/**
+ * A comfortable reach above the device, measured with a real hand: people hold a hand 15–45 cm
+ * up without thinking about it. (The service's own interaction box is smaller, about
+ * 235 × 235 × 148 mm around (0, 200, 0).) Calibration in the overlay refines this per installation.
+ */
+export const DEFAULT_LEAP_BOX: LeapBox = { x: [-160, 160], y: [100, 450], z: [-120, 120] };
 
 const vec = z.tuple([mm, mm, mm]);
 const handSchema = z.object({
@@ -76,7 +80,9 @@ export function leapFrameToHands(frame: LeapFrame, box: LeapBox): HandObservatio
     const all = [palm, ...tips];
     const min = { x: Math.min(...all.map(p => p.x)), y: Math.min(...all.map(p => p.y)), z: Math.min(...all.map(p => p.z)) };
     const max = { x: Math.max(...all.map(p => p.x)), y: Math.max(...all.map(p => p.y)), z: Math.max(...all.map(p => p.z)) };
-    return { id: hand.id, position: palm, confidence: hand.confidence ?? 1, openness: 1 - (hand.grabStrength ?? 0), pinch: hand.pinchStrength ?? 0, extent: { min, max }, points: [...tips, palm] };
+    // Leap's `confidence` rates the pose fit, not whether a hand exists: the service only lists hands it is
+    // tracking, and some builds report 0 for it. Never let it fall under the tracker's acceptance threshold.
+    return { id: hand.id, position: palm, confidence: Math.max(.5, hand.confidence ?? 1), openness: 1 - (hand.grabStrength ?? 0), pinch: hand.pinchStrength ?? 0, extent: { min, max }, points: [...tips, palm] };
   });
 }
 
@@ -124,7 +130,7 @@ export class LeapSource implements InputSource {
       const first = frame.hands[0];
       this.palmMm = first ? [first.palmPosition[0], first.palmPosition[1], first.palmPosition[2]] : null;
       const stats: Record<string, number> = { leapFps: frame.currentFrameRate ?? 0, leapHands: frame.hands.length };
-      if (this.palmMm) { stats.palmX = Math.round(this.palmMm[0]); stats.palmY = Math.round(this.palmMm[1]); stats.palmZ = Math.round(this.palmMm[2]); }
+      if (first) { stats.palmX = Math.round(first.palmPosition[0]); stats.palmY = Math.round(first.palmPosition[1]); stats.palmZ = Math.round(first.palmPosition[2]); stats.leapConfidence = first.confidence ?? -1; stats.grab = first.grabStrength ?? -1; }
       this.emit({ source: 'leap', sequence: this.sequence++, observedAtMs, receivedAtMs, hands, stats });
       if (this.received === 1) this.state = { state: 'running', message: 'Leap tracking. Hold a hand above the device.' };
     };

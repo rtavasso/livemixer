@@ -1,6 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
 import { SIMULATIONS } from '../src/sim/host/registry';
 import { createTelemetrySink, type SinkClient } from '../scripts/telemetry-sink';
+import { DEFAULT_LEAP_BOX } from '../src/sim/input/leap';
 
 /**
  * Browser checks for the simulation page. Chromium headless renders WebGL2
@@ -114,8 +115,9 @@ test('leap source tracks a hand from a fake Leap Motion service (v6 WebSocket pr
     await page.waitForFunction(() => window.livemixerSim.host.state().tracked.hands.length === 1, null, { timeout: 15_000 });
     await page.waitForTimeout(600);
     const early = await page.evaluate(() => { const h = window.livemixerSim.host.state().tracked.hands[0]; return { x: h.position.x, y: h.position.y, z: h.position.z, openness: h.openness, points: h.points.length, vx: h.velocity.x }; });
-    expect(early.y).toBeGreaterThan(.4); expect(early.y).toBeLessThan(.7);   // 220 mm inside a 90…330 box
-    expect(early.z).toBeGreaterThan(.5);                                     // z = −30 mm is toward the display: pushed in
+    const expectY = (220 - DEFAULT_LEAP_BOX.y[0]) / (DEFAULT_LEAP_BOX.y[1] - DEFAULT_LEAP_BOX.y[0]);
+    expect(early.y).toBeGreaterThan(expectY - .1); expect(early.y).toBeLessThan(expectY + .1); // 220 mm inside the default box
+    expect(early.z).toBeGreaterThan(.5);                                                         // z = −30 mm is toward the display: pushed in
     expect(early.points).toBe(6); expect(early.openness).toBeCloseTo(1, 1); expect(early.vx).toBeGreaterThan(0);
     await page.waitForFunction(() => { const h = window.livemixerSim.host.state().tracked.hands[0]; return !!h && h.openness < .2; }, null, { timeout: 15_000 });
     const late = await page.evaluate(() => { const s = window.livemixerSim.host.state(); return { x: s.tracked.hands[0].position.x, stats: s.tracked.stats, status: s.source?.status().state }; });
