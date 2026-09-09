@@ -10,8 +10,8 @@
  */
 import type { Vec3 } from '../core/types';
 
-export type SourceId = 'pointer' | 'synthetic' | 'webcam' | 'depth' | 'replay';
-export const SOURCE_IDS: readonly SourceId[] = ['pointer', 'synthetic', 'webcam', 'depth', 'replay'];
+export type SourceId = 'pointer' | 'synthetic' | 'webcam' | 'leap' | 'depth' | 'replay';
+export const SOURCE_IDS: readonly SourceId[] = ['pointer', 'synthetic', 'webcam', 'leap', 'depth', 'replay'];
 
 export interface Box3 { min: Vec3; max: Vec3 }
 

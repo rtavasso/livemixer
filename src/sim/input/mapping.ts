@@ -43,6 +43,16 @@ export const SCREEN_MAPPING: SpaceMapping = {
 };
 /** The depth bridge already normalizes its bounding box; its frame is camera-oriented like an image. */
 export const DEPTH_MAPPING: SpaceMapping = IMAGE_MAPPING;
+/**
+ * Leap Motion on the desk between performer and display: source x already runs to the
+ * performer's right, y up; source z runs toward the performer, so "pushed in" (toward the
+ * display) is source z = 0.
+ */
+export const LEAP_MAPPING: SpaceMapping = {
+  x: { from: 'x', low: 0, high: 1, mirror: false },
+  y: { from: 'y', low: 0, high: 1, mirror: false },
+  z: { from: 'z', low: 1, high: 0, mirror: false },
+};
 
 export function mapAxis(map: AxisMap, value: number): number {
   let t = (value - map.low) / (map.high - map.low);

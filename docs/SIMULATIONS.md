@@ -28,8 +28,9 @@ URL parameters fix a configuration for an installation launch:
 | Parameter | Meaning |
 |---|---|
 | `sim=basin` | Simulation id (see the registry). |
-| `source=pointer\|synthetic\|webcam\|depth` | Input source. `replay` is chosen from the overlay with a file. |
+| `source=pointer\|synthetic\|webcam\|leap\|depth` | Input source. `replay` is chosen from the overlay with a file. |
 | `bridge=ws://127.0.0.1:8765` | Depth bridge URL. |
+| `leap=ws://127.0.0.1:6437/v6.json` | Leap Motion service URL. |
 | `ws=ws://127.0.0.1:9000` | Telemetry WebSocket the page connects out to (the audio process listens). |
 | `overlay=0` | Start with the overlay hidden. |
 | `quality=low\|medium\|high` · `dpr=1` · `rate=30` | GPU budget, pixel-ratio cap, telemetry rate. |
@@ -50,11 +51,22 @@ Three frames exist and only one of them is ever seen by a simulation.
 
 `InputFrame` → `HandTracker` → `HandState[]` → `detectGestures` → `SimInput`.
 
-- **Sources** (`src/sim/input/*.ts`) implement `InputSource`: `pointer` (mouse/touch; press = push, wheel = depth, Shift = closed hand), `synthetic` (deterministic scripted performer with an occupancy blob), `webcam` (MediaPipe landmarks through the existing local worker; depth from apparent hand size), `depth` (bridge WebSocket client), `replay` (JSONL recorded from any source).
+- **Sources** (`src/sim/input/*.ts`) implement `InputSource`: `pointer` (mouse/touch; press = push, wheel = depth, Shift = closed hand), `synthetic` (deterministic scripted performer with an occupancy blob), `webcam` (MediaPipe landmarks through the existing local worker; depth from apparent hand size), `leap` (Leap Motion Controller through the local service's WebSocket API; see below), `depth` (bridge WebSocket client), `replay` (JSONL recorded from any source).
 - **Tracker** (`conditioning.ts`): presence hysteresis (`enterMs` before a hand exists, `leaveMs` grace after the last observation), One-Euro filtering of position, EMA velocity, a faster-filtered `push` for tap-like responses, smoothed `presence` and `activity`, occupancy resampled into sim orientation. Deterministic: all time arrives through arguments.
 - **Gestures** (`gestures.ts`): `enter`, `leave`, `swipe` (once per fast segment, with direction), `push` (fast z rise), `hold` (still for ~1 s, once), `grab`/`release` (openness hysteresis; only landmark sources supply openness).
 
 `SimInput` also carries `occupancy`, a 64×48 field (row 0 = bottom) of how much of each cell the tracked matter fills. Simulations that want the whole silhouette rather than a point (a curtain, water) upload it as a texture.
+
+## Leap Motion Controller
+
+A Leap Motion Controller (LM-010) is the best-fitting sensor for this scaffold: it reports palm position in millimetres, five fingertips, grab and pinch strength, at over 100 Hz, and it needs no bridge process. The browser connects straight to the Leap Motion / Ultraleap service's JSON WebSocket API at `ws://127.0.0.1:6437/v6.json`.
+
+1. Install the tracking software that supports the LM-010 (V2, Orion 4, or the Gemini 5.0 preview all expose the WebSocket API; later Gemini/Hyperion releases removed it, in which case use `bridge/` with Ultraleap's Python bindings).
+2. In the Leap Motion control panel (tray icon → Settings → General) enable **Allow Web Apps**. The service then listens on port 6437. The same switch is `websockets_enabled` in the service's `config.json`; keep `websockets_allow_remote` off.
+3. Place the device on the desk between the performer and the display with its green light facing the performer: device x is then the performer's right, y is up, z is toward the performer.
+4. Open `sim.html?source=leap` (or pick *Leap Motion* in the overlay). The source frame is a box in millimetres from the device centre, default x −140…140, y 90…330, z −100…100; the overlay's status line shows the raw palm position so the box can be set to the intended reach, then two-corner calibration fine-tunes it. `LEAP_MAPPING` turns "toward the display" into a push. `?leap=ws://…` overrides the URL.
+
+Leap hands carry `openness` (1 − grab strength) and `pinch`, so the `grab`/`release` gestures work, and `points` holds the five fingertips plus the palm.
 
 ## Writing a simulation
 

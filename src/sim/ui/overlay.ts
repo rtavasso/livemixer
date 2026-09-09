@@ -24,7 +24,7 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, attrs: Record<string,
   return node;
 }
 const fmt = (v: number, digits = 2) => Number.isFinite(v) ? v.toFixed(digits) : '–';
-const SOURCE_LABELS: Record<SourceId, string> = { pointer: 'Pointer (mouse / touch)', synthetic: 'Synthetic performer', webcam: 'Webcam hand tracking', depth: 'Depth camera bridge', replay: 'Replay recording' };
+const SOURCE_LABELS: Record<SourceId, string> = { pointer: 'Pointer (mouse / touch)', synthetic: 'Synthetic performer', webcam: 'Webcam hand tracking', leap: 'Leap Motion (local service)', depth: 'Depth camera bridge', replay: 'Replay recording' };
 
 export class Overlay {
   private timer?: ReturnType<typeof setInterval>;
@@ -166,6 +166,23 @@ export class Overlay {
       nodes.push(el('div', { class: 'row' }, el('label', {}, 'Bridge WebSocket URL', url), el('button', { onclick: () => this.host.setDepthUrl(url.value) }, 'Connect')));
       nodes.push(el('p', { class: 'hint' }, 'Run bridge/depth_bridge.py next to the camera. See bridge/README.md.'));
     }
+    if (s.sourceId === 'leap') {
+      const url = el('input', { type: 'text', value: settings.leap.url, placeholder: 'ws://127.0.0.1:6437/v6.json' });
+      const box = settings.leap.box;
+      const num = (v: number) => el('input', { type: 'number', step: 10, value: v });
+      const inputs = { x: [num(box.x[0]), num(box.x[1])], y: [num(box.y[0]), num(box.y[1])], z: [num(box.z[0]), num(box.z[1])] } as const;
+      const apply = () => {
+        try {
+          const read = (pair: readonly [HTMLInputElement, HTMLInputElement]): [number, number] => [Number(pair[0].value), Number(pair[1].value)];
+          this.host.setLeapOptions({ url: url.value.trim(), box: { x: read(inputs.x), y: read(inputs.y), z: read(inputs.z) } });
+        } catch (error) { this.host.warn(error instanceof Error ? error.message : String(error)); }
+      };
+      nodes.push(el('div', { class: 'row' }, el('label', {}, 'Leap service WebSocket URL', url)));
+      nodes.push(el('p', { class: 'hint' }, 'Physical box in millimetres from the device centre: x to your right, y up, z toward you. Read the palm position in the stats line to set it, then fine-tune with calibration.'));
+      for (const axis of ['x', 'y', 'z'] as const) nodes.push(el('div', { class: 'row inline' }, el('label', {}, `${axis} min`, inputs[axis][0]), el('label', {}, `${axis} max`, inputs[axis][1])));
+      nodes.push(el('div', { class: 'row' }, el('button', { class: 'primary', onclick: apply }, 'Apply & reconnect')));
+      nodes.push(el('p', { class: 'hint' }, 'Needs "Allow Web Apps" enabled in the Leap Motion control panel (the service then listens on port 6437).'));
+    }
     if (s.sourceId === 'synthetic') {
       const hands = el('select'); hands.append(el('option', { value: '1' }, '1 hand'), el('option', { value: '2' }, '2 hands')); hands.value = String(settings.synthetic.hands);
       const speed = el('input', { type: 'range', min: .2, max: 3, step: .1, value: settings.synthetic.speed });
@@ -261,7 +278,8 @@ export class Overlay {
     this.presence.textContent = `presence ${fmt(s.tracked.presence)}`; this.activity.textContent = `activity ${fmt(s.tracked.activity)}`;
     const st = s.source?.status();
     const age = Number.isFinite(s.tracked.sourceAgeMs) ? `${Math.round(s.tracked.sourceAgeMs)} ms ago` : 'no frames yet';
-    this.status.textContent = `${st?.message ?? 'No source.'}\nLast frame ${age} · discarded ${s.tracked.discarded}${s.recording.active ? ` · recording ${s.recording.frames} frames` : ''}`;
+    const stats = Object.entries(s.tracked.stats).map(([k, v]) => `${k} ${Number.isInteger(v) ? v : v.toFixed(2)}`).join(' · ');
+    this.status.textContent = `${st?.message ?? 'No source.'}\nLast frame ${age} · discarded ${s.tracked.discarded}${s.recording.active ? ` · recording ${s.recording.frames} frames` : ''}${stats ? `\n${stats}` : ''}`;
     this.status.className = `status${st?.state === 'error' ? ' error' : st?.state === 'running' ? ' ok' : ''}`;
     this.hands.replaceChildren(s.tracked.hands.length ? el('table', {}, el('tr', {}, ...['hand', 'x', 'y', 'z', 'speed', 'open', 'push', 'age'].map(h => el('th', {}, h))), ...s.tracked.hands.map(h => el('tr', {}, el('td', {}, `#${h.id}`), el('td', {}, fmt(h.position.x)), el('td', {}, fmt(h.position.y)), el('td', {}, fmt(h.position.z)), el('td', {}, fmt(h.speed)), el('td', {}, fmt(h.openness, 1)), el('td', {}, fmt(h.push)), el('td', {}, `${(h.ageMs / 1000).toFixed(1)}s`)))) : el('p', { class: 'hint' }, 'No hand present.'));
     if (s.events.length) this.events.replaceChildren(...s.events.slice(-8).map(e => el('span', {}, `${e.type}${'direction' in e ? ` ${e.direction}` : ''} #${e.handId}`)));

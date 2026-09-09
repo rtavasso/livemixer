@@ -8,11 +8,12 @@
  */
 import { z } from 'zod';
 import { gestureSettingsSchema } from '../input/gestures';
-import { spaceMappingSchema, DEPTH_MAPPING, IMAGE_MAPPING, SCREEN_MAPPING, type SpaceMapping } from '../input/mapping';
+import { spaceMappingSchema, DEPTH_MAPPING, IMAGE_MAPPING, LEAP_MAPPING, SCREEN_MAPPING, type SpaceMapping } from '../input/mapping';
 import { trackerSettingsSchema } from '../input/conditioning';
+import { DEFAULT_LEAP_BOX, leapBoxSchema } from '../input/leap';
 import type { SourceId } from '../input/types';
 
-const sourceId = z.enum(['pointer', 'synthetic', 'webcam', 'depth', 'replay']);
+const sourceId = z.enum(['pointer', 'synthetic', 'webcam', 'leap', 'depth', 'replay']);
 
 export const settingsSchema = z.object({
   sim: z.string().default('trails'),
@@ -33,6 +34,7 @@ export const settingsSchema = z.object({
     occupancy: z.boolean().default(false),
   }).default({}),
   depth: z.object({ url: z.string().default('ws://127.0.0.1:8765') }).default({}),
+  leap: z.object({ url: z.string().default('ws://127.0.0.1:6437/v6.json'), box: leapBoxSchema.default(DEFAULT_LEAP_BOX) }).default({}),
   synthetic: z.object({ hands: z.union([z.literal(1), z.literal(2)]).default(1), speed: z.number().min(.1).max(5).default(1) }).default({}),
 }).strict();
 export type Settings = z.infer<typeof settingsSchema>;
@@ -43,6 +45,7 @@ export function defaultMapping(source: SourceId): SpaceMapping {
   switch (source) {
     case 'pointer': return SCREEN_MAPPING;
     case 'depth': return DEPTH_MAPPING;
+    case 'leap': return LEAP_MAPPING;
     default: return IMAGE_MAPPING;
   }
 }
@@ -70,6 +73,7 @@ export function applyUrlOverrides(settings: Settings, search: string): Settings 
   const overlay = q.get('overlay'); if (overlay !== null) next.overlay = overlay !== '0' && overlay !== 'false';
   const ws = q.get('ws'); if (ws !== null) next.telemetry.websocketUrl = ws;
   const bridge = q.get('bridge'); if (bridge) next.depth.url = bridge;
+  const leap = q.get('leap'); if (leap) next.leap.url = leap;
   const dpr = Number(q.get('dpr')); if (Number.isFinite(dpr) && dpr > 0) next.maxDpr = Math.min(3, Math.max(.5, dpr));
   const rate = Number(q.get('rate')); if (Number.isFinite(rate) && rate > 0) next.telemetry.rateHz = Math.min(120, Math.max(1, rate));
   return next;

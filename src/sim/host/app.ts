@@ -12,6 +12,7 @@ import { DEFAULT_TRACKER_SETTINGS, HandTracker, trackerSettingsSchema, type Trac
 import { DEFAULT_GESTURE_SETTINGS, detectGestures, emptyGestureMemory, gestureSettingsSchema, GESTURE_TYPES, type GestureEvent, type GestureMemory } from '../input/gestures';
 import { calibrateMapping, spaceMappingSchema, stableCapture, type CalibrationCaptures, type SpaceMapping } from '../input/mapping';
 import { DepthBridgeSource } from '../input/depth';
+import { LeapSource } from '../input/leap';
 import { PointerSource } from '../input/pointer';
 import { InputRecorder, parseRecording, ReplaySource } from '../input/replay';
 import { invalidateQuadCache } from '../gl/quad';
@@ -235,6 +236,7 @@ export class SimHost {
       case 'synthetic': source = new SyntheticSource(emit, this.settings.value.synthetic); break;
       case 'webcam': source = new WebcamSource(this.video, emit); break;
       case 'depth': source = new DepthBridgeSource(this.settings.value.depth.url, emit, this.now); break;
+      case 'leap': source = new LeapSource(this.settings.value.leap.url, this.settings.value.leap.box, emit, this.now); break;
       case 'replay': {
         if (!options.recording) throw new Error('Choose a recording file to replay.');
         source = new ReplaySource(parseRecording(options.recording), emit); break;
@@ -246,6 +248,10 @@ export class SimHost {
   }
 
   setDepthUrl(url: string) { this.settings.update(s => { s.depth.url = url; }); if (this.sourceId === 'depth') void this.setSource('depth'); }
+  setLeapOptions(options: Partial<Settings['leap']>) {
+    this.settings.update(s => { if (options.url !== undefined) s.leap.url = options.url; if (options.box) s.leap.box = options.box; });
+    if (this.sourceId === 'leap') void this.setSource('leap');
+  }
   setSyntheticOptions(options: Partial<Settings['synthetic']>) { this.settings.update(s => { Object.assign(s.synthetic, options); }); if (this.sourceId === 'synthetic') void this.setSource('synthetic'); }
 
   setMapping(mapping: SpaceMapping) {
