@@ -1,0 +1,22 @@
+.monitor-body { margin: 0; background: #0e110f; color: #dfe4e0; font: 13px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+.monitor { max-width: 900px; margin: 0 auto; padding: 24px; }
+.monitor header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 12px; }
+.monitor h1 { font-size: 22px; margin: 0; letter-spacing: -.3px; }
+.monitor h2 { font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: #9aa79e; margin: 0 0 8px; }
+.monitor .muted { color: #9aa79e; margin: 2px 0 0; }
+.monitor .meta { font-variant-numeric: tabular-nums; color: #9aa79e; white-space: nowrap; }
+.monitor section { border-top: 1px solid #2c342f; padding: 14px 0; }
+.monitor .bar, .monitor .param { display: grid; grid-template-columns: 140px 1fr 110px; gap: 10px; align-items: center; margin: 4px 0; font-variant-numeric: tabular-nums; }
+.monitor .track { height: 8px; background: #1a2320; border-radius: 4px; overflow: hidden; }
+.monitor .track i { display: block; height: 100%; background: #b9ec80; }
+.monitor .value { text-align: right; color: #b9ec80; }
+.monitor .name { color: #c8d1cb; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.monitor input[type=range] { width: 100%; accent-color: #b9ec80; }
+.monitor input[type=checkbox] { accent-color: #b9ec80; }
+.monitor table { border-collapse: collapse; margin-top: 8px; font-variant-numeric: tabular-nums; }
+.monitor td, .monitor th { padding: 2px 10px 2px 0; text-align: right; font-weight: 500; border-bottom: 1px solid #1f2723; }
+.monitor td:first-child, .monitor th:first-child { text-align: left; }
+.monitor button { font: inherit; font-size: 12px; background: #263229; color: #e5e9e4; border: 1px solid #4a5a4c; border-radius: 5px; padding: 5px 10px; cursor: pointer; }
+.monitor button.active { background: #b9ec80; color: #182510; border-color: #b9ec80; }
+.monitor pre { font: 11px/1.4 ui-monospace, Menlo, Consolas, monospace; background: #0b0e0c; border: 1px solid #1f2723; border-radius: 6px; padding: 10px; max-height: 240px; overflow: auto; margin: 0; }
+.monitor code { color: #b9ec80; }
