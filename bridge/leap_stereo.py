@@ -391,6 +391,36 @@ def reorient(image: np.ndarray, orientation: str = "none") -> np.ndarray:
     return np.ascontiguousarray(out)
 
 
+def reorient_points(u: np.ndarray | float, v: np.ndarray | float, width: int, height: int, orientation: str = "none") -> tuple[np.ndarray, np.ndarray]:
+    """Continuous pixel coordinates through the same transform :func:`reorient` applies to the image.
+
+    ``u``/``v`` are column/row with integer values at pixel centres (the
+    convention of :meth:`RectifiedView.ray_to_pixel`) and ``width``/``height``
+    the image size BEFORE reorientation. Each mode is affine, so points past
+    the image edge move consistently with the pixels: a projected skeleton
+    stays on top of the reoriented scan wherever it is. Used to keep hand
+    joints aligned with a depth image that ``--leap-orient`` has turned.
+    """
+    u = np.asarray(u, dtype=np.float64)
+    v = np.asarray(v, dtype=np.float64)
+    last_col, last_row = float(width - 1), float(height - 1)
+    if orientation == "none":
+        return u, v
+    if orientation == "rot90":
+        return last_row - v, u
+    if orientation == "rot180":
+        return last_col - u, last_row - v
+    if orientation == "rot270":
+        return v, last_col - u
+    if orientation == "flip-h":
+        return last_col - u, v
+    if orientation == "flip-v":
+        return u, last_row - v
+    if orientation == "transpose":
+        return v, u
+    raise ValueError(f"unknown orientation {orientation!r}; choose one of {ORIENTATIONS}")
+
+
 # --------------------------------------------------------------------------- #
 # Synthetic stereo: a stand-in raw camera and a ray-cast scene with known depth
 # --------------------------------------------------------------------------- #
@@ -709,3 +739,71 @@ def hand_shapes(t: float, absences: bool = True) -> list[Sphere | Capsule]:
     fist = Sphere((x, y, z), 38.0)
     forearm = Capsule((x + 10.0, y + 45.0, z + 20.0), (x + 70.0, y + 260.0, z + 110.0), 30.0)
     return [fist, forearm]
+
+
+#: Skeleton layout shared with ``depth_bridge`` (``N_JOINTS`` there): the palm, the wrist, the elbow, then five
+#: fingers thumb -> pinky with five joints each (carp, mcp, pip, dip, tip); seven widths: palm, arm, five fingers.
+SKELETON_JOINTS = 3 + 5 * 5
+SKELETON_WIDTHS = 2 + 5
+#: Where the synthetic fingers sit on the fist: azimuth around the fist's underside per finger (degrees from the
+#: direction away from the forearm), the polar angle of each joint from the point nearest the device (degrees, for
+#: the middle finger) and how far along that arc each finger reaches. Angles stay well inside the hemisphere the
+#: cameras see, so every joint lands on a matched pixel rather than on the silhouette.
+_FINGER_AZIMUTH_DEG = (-58.0, -24.0, 0.0, 22.0, 44.0)
+_JOINT_POLAR_DEG = (8.0, 22.0, 34.0, 44.0, 52.0)
+_FINGER_REACH = (0.72, 0.95, 1.0, 0.95, 0.8)
+_FINGER_WIDTH_MM = (16.0, 18.0, 18.0, 17.0, 15.0)
+
+
+@dataclass(frozen=True)
+class SceneSkeleton:
+    """Joints of the scripted hand in the scene frame (millimetres, ``x`` along the baseline, ``z`` = height).
+
+    ``points`` is ``(SKELETON_JOINTS, 3)`` in the layout above, ``widths_mm``
+    ``(SKELETON_WIDTHS,)`` diameters and ``extended`` one flag per finger.
+    """
+
+    points: np.ndarray
+    widths_mm: np.ndarray
+    extended: np.ndarray
+
+
+def _unit(v: np.ndarray) -> np.ndarray:
+    return v / np.linalg.norm(v)
+
+
+def hand_skeleton(t: float, absences: bool = True) -> SceneSkeleton | None:
+    """A skeleton lying ON the surfaces :func:`hand_shapes` renders at script time ``t``, or ``None`` when the hand is away.
+
+    The cameras look up, so the surface they scan is the underside of the fist
+    and forearm. The palm is the fist's lowest point, the fingers fan across
+    the lower hemisphere of the fist (a closed hand: nothing is extended), the
+    wrist and elbow sit on the underside of the forearm capsule. Every joint is
+    exactly on a rendered surface, so a correctly projected skeleton lands on
+    scan pixels of the same depth: that is what makes this a positive control
+    for the device-to-image convention detector in ``leap_source``.
+    """
+    shapes = hand_shapes(t, absences)
+    if not shapes:
+        return None
+    fist = next(s for s in shapes if isinstance(s, Sphere))
+    forearm = next(s for s in shapes if isinstance(s, Capsule))
+    centre, radius = np.asarray(fist.centre, dtype=np.float64), float(fist.radius)
+    a, b = np.asarray(forearm.a, dtype=np.float64), np.asarray(forearm.b, dtype=np.float64)
+    axis = _unit(b - a)
+    down = np.array([0.0, 0.0, -1.0])                  # toward the device: the side the cameras see
+    underside = _unit(down - (down @ axis) * axis)      # the forearm's lowest line, perpendicular to its axis
+    forward = _unit(-(axis - (axis @ down) * down))     # horizontal direction from the forearm toward the fingers
+    side = np.cross(down, forward)
+    points = np.empty((SKELETON_JOINTS, 3), dtype=np.float64)
+    points[0] = centre + radius * down
+    points[1] = a + forearm.radius * underside
+    points[2] = b + forearm.radius * underside
+    for f in range(5):
+        az = math.radians(_FINGER_AZIMUTH_DEG[f])
+        heading = math.cos(az) * forward + math.sin(az) * side
+        for j in range(5):
+            polar = math.radians(_JOINT_POLAR_DEG[j]) * _FINGER_REACH[f]
+            points[3 + 5 * f + j] = centre + radius * (math.cos(polar) * down + math.sin(polar) * heading)
+    widths = np.array([1.6 * radius, 2.0 * forearm.radius, *_FINGER_WIDTH_MM], dtype=np.float64)
+    return SceneSkeleton(points, widths, np.zeros(5, dtype=bool))

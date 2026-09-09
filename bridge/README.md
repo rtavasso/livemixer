@@ -1,6 +1,6 @@
 # Depth bridge
 
-A small native process that watches a physical box in front of a depth camera and streams whatever is inside it (a hand, an arm, a person) to the browser simulations as compact JSON over a WebSocket. The browser side (`src/sim/input/depth.ts`) connects to it; the wire format lives in `src/sim/input/protocol.ts` and is the single source of truth.
+A small native process that watches a physical box in front of a depth camera and streams whatever is inside it (a hand, an arm, a person) to the browser simulations as compact JSON over a WebSocket. A source that also tracks hands (the Leap Motion Controller) sends the hand skeleton in the same frame as its depth scan, so the browser gets both at once. The browser side (`src/sim/input/depth.ts`) connects to it; the wire format lives in `src/sim/input/protocol.ts` and is the single source of truth.
 
 `depth_bridge.py` is the reference implementation: one file, numpy + websockets, optional OpenCV and RealSense.
 
@@ -20,7 +20,7 @@ Python 3.10 or newer. Without OpenCV every in-range pixel is reported as one blo
 python bridge/depth_bridge.py --source synthetic
 ```
 
-The synthetic source renders a scripted performer (the same figure-eight script as the browser's synthetic source: present for 11 s, gone for 3 s, with occasional pushes towards the far plane) into a 640x480 depth image, so the whole pipeline runs. Add `--synthetic-hands 2` for two blobs (needs OpenCV to see them as two).
+The synthetic source renders a scripted performer (the same figure-eight script as the browser's synthetic source: present for 11 s, gone for 3 s, with occasional pushes towards the far plane) into a 640x480 depth image, so the whole pipeline runs. Add `--synthetic-hands 2` for two blobs (needs OpenCV to see them as two). Each synthetic hand also carries a procedural skeleton lying on its dome (palm at the centre, fingers fanning out, every joint at the rendered depth under it), so the `skeleton` path of the protocol runs without hardware too.
 
 Then open the simulation page pointed at the bridge:
 
@@ -55,6 +55,26 @@ python bridge/test_leap_stereo.py                                               
 
 `--near`/`--far` default to `0.1`/`0.45` m for the Leap sources (heights above the device: the controller's illumination gives up at about 45 cm) and `--roi` works as usual. The depth image is the rectified view, `--leap-view W H` (default 320x240) spanning `--leap-fov` degrees horizontally (default 90, so the focal length is `f = 320 / (2 * tan 45°) = 160` px). `leap-synthetic` renders a textured fist and forearm sweeping above the device through a stand-in fisheye camera model, then rectifies and matches exactly like the live source; it runs at ~10-15 fps on a laptop and is what the tests and fixtures use.
 
+### Hand tracking and depth in one stream
+
+The tracking service's own output, the hand skeleton, rides along with the scan. LeapC's tracking events (`LEAP_TRACKING_EVENT`, no extra policy needed beyond the background-frames flag the bridge already requests) are copied into plain records the moment they arrive: per hand the id, chirality, confidence, grab and pinch strength, the palm, the wrist (`arm.next_joint`), the elbow (`arm.prev_joint`), and per finger the five joints (metacarpal base, knuckle, the two inter-phalangeal joints, tip) with the proximal bone's width and the extended flag. A short deque of these (about a quarter second) is kept, and each stereo pair takes the tracking frame nearest its own timestamp (within 50 ms, else the skeleton is considered stale and the frame goes out without one).
+
+The skeleton is then **projected into the depth image** so that it coincides with the scan: the depth image is the rectified view of one camera looking up, so for a device-frame point `p` (millimetres, x along the long axis, y up, z toward the performer) the projection is `q = p - camera_origin` (the reference camera sits at `±baseline/2` along x; `--swap-cameras` makes it the other one), `depth = q.y`, `u = cx + fx·a/depth`, `v = cy + fy·b/depth` where `a`/`b` are the two remaining device axes with signs, then the same `--leap-orient` reorientation as the image. Widths (palm, forearm, fingers; all diameters) become `width·fx/depth` pixels at their own part's depth, so they are in the same perspective units as the scan. The forearm is trimmed to a 70 mm stub past the wrist before projecting. `BoxAnalyzer` normalizes the joints with exactly the ROI and depth range it uses for the pixels (`u/roi_w`, `v/roi_h`, `w = (depth - near)/(far - near)`, widths `/roi_w`); joints are **not** clamped (a small overshoot is allowed by the browser and keeps bones straight), the hand's `pos` is.
+
+Which of LeapC's device axes is image right and which is image down, with which signs, and which camera is the reference, is not documented and could not be checked here (the 5.0-preview service delivers no events to third-party clients). So the convention is a value: `--leap-hand-frame NAME` fixes it, where the names are `u{+|-}{x|z}_v{+|-}{z|x}_ref{+|-}` (which device axis and sign is `u`, which is `v`, and on which side of the device the reference camera sits), sixteen in all. The default `--leap-hand-frame auto` **detects** it: on every frame that has both a tracked hand and depth, every candidate projects the palm, the wrist and the 25 finger joints and scores the fraction that land on a depth pixel holding a measurement within ±30 mm of the joint's own depth. The right convention puts the skeleton on the scanned hand; the others put it beside, mirrored or transposed. Hits accumulate over frames and the winner is locked once at least 5 frames have been scored, it hits at least half its joints and leads the runner-up by 0.15; until then the leading candidate is used provisionally (plausible ones win ties: only `u` along the baseline with the reference camera on the low-`u` side can produce positive disparities, so if the scan works, those four are the real contenders). The lock is logged, the state line in the stall message shows the tally, and `leap_source.py --dump-images` prints the full table:
+
+```sh
+python bridge/leap_source.py --synthetic --dump-images 3      # the table shows u+x_v-z_ref- at 1.000, everything else below 0.35
+python bridge/depth_bridge.py --source leap --leap-hand-frame u+x_v-z_ref-   # skip detection once you know
+```
+
+`leap-synthetic` is the positive control: its scripted fist and forearm carry a skeleton lying on the rendered surfaces (`leap_stereo.hand_skeleton`), expressed in device millimetres under a chosen "true" convention and pushed through the same projector as live hands, and the tests check that auto mode locks on the truth for several different truths.
+
+What the browser receives (`hello.skeleton: true` announces it; plain depth cameras omit the field):
+
+- **When the frame has tracked hands, they are the `hands`:** `id` is the Leap's hand id, `pos` the palm, `conf = max(0.5, confidence)` (Ultraleap under-reports confidence and the browser's tracker drops hands below 0.3), `extent` the bounding box of every joint, `openness = 1 - grab_strength`, `pinch = pinch_strength`, `points` the palm and the five fingertips (`--points 0` drops them), and `skeleton` (below).
+- **When it has none, the blobs are reported exactly as for any depth camera** (no `skeleton`, no `openness`/`pinch`), so a Leap with tracking lost still drives the simulations from the scan; `stats.trackedHands` says which it was. A tracked hand whose palm has left the box by more than a quarter of it on any axis is dropped like any pixel outside the box rather than reported stuck to a wall.
+
 ### The 5.0-preview stall, and the fix
 
 The machine this was developed on runs "Leap Motion Service 5.0.0-preview" (the January 2021 Core Services build). With it, every LeapC client behaves the same way: it connects, receives the Connection, Device and Policy events, is granted the images policy (`0x2`) and then `LeapPollConnection` **never returns** again: no tracking, no images, whatever the timeout, allocator, window focus or host language. The service's own visualizer shows frames, so the device is fine; the client path of that build is broken.
@@ -83,8 +103,9 @@ A depth camera on a tripod looks at the performer; the controller looks up from 
 | `--leap-view W H` | Rectified view = depth image size (default 320x240). |
 | `--leap-fov DEG` | Horizontal field of view of that view (default 90). Wider sees more of the desk at lower angular resolution; the lenses cover about 132°. |
 | `--leap-min-intensity N` | Ignore IR pixels darker than N (default 16). |
-| `--swap-cameras` | Exchange the cameras before matching. |
-| `--leap-orient MODE` | Rotate or flip the depth image before analysis (default `none`). |
+| `--swap-cameras` | Exchange the cameras before matching (the skeleton's reference camera follows). |
+| `--leap-orient MODE` | Rotate or flip the depth image before analysis (default `none`); the skeleton is reoriented with it. |
+| `--leap-hand-frame MODE` | How the hand skeleton maps onto the depth image: `auto` (default, detected against the scan) or a convention name `u±x_v±z_ref±` / `u±z_v±x_ref±`. |
 
 ## The box: ROI, near, far
 
@@ -121,7 +142,7 @@ Occupancy is resampled through the same mapping (`mapOccupancy`), so a calibrate
   "occupancy": "AAAA...",                       // base64, width*height bytes, row 0 = top
   "voxels": "AAAA...",                          // base64, nx*ny*nz bytes, x fastest, then y (top first), then z (near first)
   "surface": "AAAA...",                         // base64, width*height bytes, row 0 = top; 0 = empty, else 1 + round(254·w)
-  "stats": { "pixels": 3376, "blobs": 1, "fps": 29.8, "processingMs": 6.1, "frameWidth": 640, "frameHeight": 480 } }
+  "stats": { "pixels": 3376, "blobs": 1, "trackedHands": 0, "fps": 29.8, "processingMs": 6.1, "frameWidth": 640, "frameHeight": 480 } }
 ```
 
 - `id` is stable while the same blob stays in view: blobs are matched to the previous frame by nearest centroid within `--max-jump` (normalized units) and survive a few missed frames. Ids never repeat in a run.
@@ -132,6 +153,17 @@ Occupancy is resampled through the same mapping (`mapOccupancy`), so a calibrate
 - `occupancy` is the fraction of in-range pixels per cell, `--occupancy W H` (default 32x24), omitted with `--no-occupancy`.
 - `voxels` is the foreground in 3D and `surface` its scanned front face; both are described below.
 - `t` is `time.perf_counter()` seconds; the browser estimates the offset itself.
+
+A source that tracks hands (`hello.skeleton: true`) replaces the blob hands with the tracked ones whenever it has any (see *Hand tracking and depth in one stream* for the rules) and attaches a `skeleton` to each. All coordinates are normalized like `pos` (`u` right, `v` down, `w` deep); joints are not clamped; widths are diameters as fractions of the ROI width at that part's depth; `fingers` always has exactly five entries (thumb to pinky) with exactly five joints each (carp, mcp, pip, dip, tip); `elbow`, `palmWidth` and `armWidth` are optional; everything is rounded to four decimals:
+
+```jsonc
+{ "id": 1, "pos": [0.5, 0.5, 0.25], "conf": 1, "extent": [[0.4735, 0.437, 0.25], [0.5268, 0.5665, 0.294]],
+  "openness": 1, "pinch": 0, "points": [[0.5, 0.5, 0.25], ...five fingertips...],
+  "skeleton": { "type": "right", "palm": [0.5, 0.5, 0.25], "wrist": [0.5, 0.5385, 0.2652], "elbow": [0.5, 0.5665, 0.294],
+                "palmWidth": 0.075, "armWidth": 0.045,
+                "fingers": [{ "joints": [[0.4952, 0.4965, 0.2507], [0.4889, 0.4917, 0.2533], [0.483, 0.4874, 0.2573], [0.478, 0.4836, 0.2628], [0.4735, 0.4803, 0.2673]],
+                              "width": 0.014, "extended": true }, ...four more... ] } }
+```
 
 `--morph N` runs N rounds of 3x3 morphological opening (pure numpy) to drop speckle; `--max-hands` caps the reported blobs (largest first, 16 at most). The occupancy grid, the voxel grid and the surface scan are all computed from the same opened mask, so they agree with each other and with `stats.pixels`.
 
@@ -185,10 +217,14 @@ python bridge/depth_bridge.py --source synthetic --dump 5 --occupancy 8 6 --voxe
 npx vitest run tests/sim/bridge-fixture.test.ts  # the fixture through the browser's zod schema
 ```
 
-`--dump N` prints the `hello` and N frames as JSON lines to stdout instead of serving. The fixture uses small grids (8x6 cells, 4 slabs) to stay readable; with a 640x480 frame every cell is exactly 80x80 pixels, which the layout tests rely on. The Python tests check the shapes by hand and pin the layouts (byte 0 is the top-left cell at the near plane, the last byte the bottom-right cell at the far plane, an empty surface cell is 0 and the near plane is 1); the vitest passes the checked-in fixture through `parseBridgeMessage`, decodes all three fields with `decodeOccupancy`/`decodeVoxels`/`decodeSurface`, and checks that the synthetic hand's voxels peak and its scan is nearest at its centroid and depth. A drift on either side fails a test.
+`--dump N` prints the `hello` and N frames as JSON lines to stdout instead of serving. The fixture uses small grids (8x6 cells, 4 slabs) to stay readable; with a 640x480 frame every cell is exactly 80x80 pixels, which the layout tests rely on. Its hands are tracked ones with a `skeleton` (the synthetic source's dome skeleton), so the fixture covers the skeleton schema as well; `pos` is the palm, which sits at the dome's centre and nearest depth, exactly where the blob's centroid used to be. The Python tests check the shapes by hand and pin the layouts (byte 0 is the top-left cell at the near plane, the last byte the bottom-right cell at the far plane, an empty surface cell is 0 and the near plane is 1); the vitest passes the checked-in fixture through `parseBridgeMessage`, decodes all three fields with `decodeOccupancy`/`decodeVoxels`/`decodeSurface`, and checks that the synthetic hand's voxels peak and its scan is nearest at its centroid and depth. A drift on either side fails a test.
+
+`python bridge/test_leap_stereo.py` also covers the hand-tracking half without hardware: the LeapC tracking struct layouts (`#pragma pack(1)`: `LEAP_HAND` is 1084 bytes, the event 48), a ctypes tracking event copied into hands, the device-to-image projection round-tripping through the rectified view under every convention and orientation, the synthetic skeleton landing on the scan, and auto mode locking on the true convention.
 
 ## Adding a camera
 
 Subclass `FrameSource` in `depth_bridge.py`, return `DepthFrame(uint16 millimetres, time.perf_counter())` from `read()` (row 0 = top, column 0 = left), open and close the device in `start()`/`stop()`, and add the class to the `SOURCES` dict so it becomes a `--source` choice. `read()` runs in a worker thread and may block; raise on hardware errors and the server will report and restart. `AzureKinectSource` is a documented stub showing the `pyk4a` and OpenNI2 calls; `leap_source.py` is a complete example of a source in its own module (listed in `LEAP_SOURCES` and imported on demand) that builds depth from a stereo pair.
+
+A source that also tracks hands sets `skeleton = True` and passes a tuple of `TrackedHand` records as the frame's third field: 28 joints in the image's own frame (pixel column, row and millimetres; the layout constants `JOINT_PALM`, `finger_joint(f, j)`, ... in `depth_bridge.py`), seven widths in pixels at each part's depth, and the per-finger extended flags. The analyzer normalizes them with the box; nothing else changes.
 
 The analyzer only ever sees millimetres and a frame size, so no other code changes.

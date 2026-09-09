@@ -132,6 +132,30 @@ describe('bridge fixture', () => {
     }
   });
 
+  it('skeletons, when the bridge sends them, are complete: five fingers of five finite joints, positive widths, points, and hello announces them', () => {
+    for (const f of frames) for (const h of f.hands) {
+      const s = h.skeleton;
+      if (!s) continue;
+      expect(hello.skeleton, 'a hand carries a skeleton, so hello must announce them').toBe(true);
+      expect(['left', 'right', 'unknown']).toContain(s.type);
+      expect(s.fingers).toHaveLength(5);
+      for (const finger of s.fingers) {
+        expect(finger.joints).toHaveLength(5);
+        for (const joint of finger.joints) for (const c of joint) expect(Number.isFinite(c)).toBe(true);
+        expect(finger.width).toBeGreaterThan(0);
+        expect(typeof finger.extended).toBe('boolean');
+      }
+      for (const p of [s.palm, s.wrist, ...(s.elbow ? [s.elbow] : [])]) for (const c of p) expect(Number.isFinite(c)).toBe(true);
+      if (s.palmWidth !== undefined) expect(s.palmWidth).toBeGreaterThan(0);
+      if (s.armWidth !== undefined) expect(s.armWidth).toBeGreaterThan(0);
+      // Tracked hands send their points (palm + five tips), and the browser builds the solid from the skeleton.
+      expect(h.points).toBeDefined(); expect(h.points!.length).toBeGreaterThanOrEqual(6);
+      const hand = bridgeFrameToInput(f, 0, 0, hello).hands.find(x => x.id === h.id)!;
+      expect(hand.capsules!.length).toBeGreaterThanOrEqual(20); // 5 × 4 bones (+ forearm when the elbow is sent)
+      expect(hand.points!.length).toBe(h.points!.length);
+    }
+  });
+
   it('converts into input frames with every field and stats forwarded', () => {
     for (const f of frames) {
       const input = bridgeFrameToInput(f, 1000, 1010, hello);

@@ -2,6 +2,9 @@ import { expect, test, type Page } from '@playwright/test';
 import { SIMULATIONS } from '../src/sim/host/registry';
 import { createTelemetrySink, type SinkClient } from '../scripts/telemetry-sink';
 import { DEFAULT_LEAP_BOX } from '../src/sim/input/leap';
+import { bridgeSkeleton, encodeOccupancy, PROTOCOL_VERSION, type BridgeSkeleton } from '../src/sim/input/protocol';
+import { skeletonCapsules } from '../src/sim/input/skeleton';
+import { surfaceFromCapsules } from '../src/sim/input/synthetic';
 
 /**
  * Browser checks for the simulation page. Chromium headless renders WebGL2
@@ -129,6 +132,74 @@ test('leap source tracks a hand from a fake Leap Motion service (v6 WebSocket pr
     const expectX = (100 - DEFAULT_LEAP_BOX.x[0]) / (DEFAULT_LEAP_BOX.x[1] - DEFAULT_LEAP_BOX.x[0]); // the hand stops at +100 mm
     expect(late.x).toBeGreaterThan(expectX - .08); expect(late.x).toBeLessThan(expectX + .08); expect(late.stats.leapHands).toBe(1); expect(late.status).toBe('running');
     await expect(page.locator('#overlay')).toContainText('Leap');
+    expect(errors).toEqual([]);
+  } finally { clearInterval(timer); for (const c of clients) c.close(); await sink.close(); }
+});
+
+/** A right hand in the bridge's box frame (u right, v down, w deep): palm at (u, v, w), fingers fanning upward, forearm below. */
+function fakeBridgeSkeleton(u: number, v: number, w: number): BridgeSkeleton {
+  const finger = (i: number) => {
+    const du = (i - 2) * .035, len = i === 0 ? .09 : .13;
+    const joints = [0, .3, .6, .85, 1].map(t => [u + du * t, v - .02 - len * t, w + .01 * t] as [number, number, number]) as BridgeSkeleton['fingers'][number]['joints'];
+    return { joints, width: .028, extended: true };
+  };
+  return { type: 'right', palm: [u, v, w], wrist: [u, v + .08, w], elbow: [u, v + .2, w + .02], palmWidth: .13, armWidth: .085, fingers: [0, 1, 2, 3, 4].map(finger) };
+}
+
+test('depth source takes hand skeletons and the scan together from a fake bridge, and the solid setting selects between them', async ({ page }) => {
+  test.setTimeout(90_000);
+  // A stand-in for `depth_bridge.py --source leap`: hello announces skeletons and a small scan, then ~30 Hz frames of one
+  // tracked hand drifting to the right, each with its skeleton and the scan a depth camera would make of that same hand.
+  const SCAN = { width: 16, height: 12 };
+  const clients = new Set<SinkClient>();
+  let seq = 0, started = Infinity;
+  const sink = await createTelemetrySink({ port: 0, onOpen: client => {
+    client.send({ type: 'hello', version: PROTOCOL_VERSION, source: 'fake-leap', box: { x: [-.3, .3], y: [-.2, .2], z: [.1, .5] }, fps: 30, surface: SCAN, skeleton: true });
+    clients.add(client); started = Math.min(started, performance.now());
+  } });
+  const timer = setInterval(() => {
+    if (!clients.size) return;
+    const t = (performance.now() - started) / 1000;
+    const u = .4 + Math.min(.2, t * .05), v = .55, w = .3;
+    const skeleton = fakeBridgeSkeleton(u, v, w);
+    const surface = encodeOccupancy(surfaceFromCapsules(skeletonCapsules(bridgeSkeleton(skeleton)), SCAN.width, SCAN.height));
+    const frame = { type: 'frame', seq: seq++, t: performance.now() / 1000, hands: [{ id: 1, pos: [u, v, w], conf: 1, extent: [[u - .1, v - .18, w], [u + .1, v + .1, w + .03]], openness: 1, pinch: 0, skeleton }], surface, stats: { fps: 30 } };
+    for (const c of clients) c.send(frame);
+  }, 33);
+  const solidState = () => page.evaluate(() => {
+    const s = window.livemixerSim.host.state(), h = s.tracked.hands[0], scan = s.tracked.surface;
+    let scanned = 0; if (scan) for (let i = 0; i < scan.mask.length; i++) if (scan.mask[i]) scanned++;
+    return { hands: s.tracked.hands.length, capsules: h?.capsules.length ?? 0, points: h?.points.length ?? 0, x: h?.position.x ?? -1, scanned, presence: s.tracked.presence, warnings: s.warnings.map(w => w.message), signals: s.signals, status: s.source?.status(), solid: s.solid, setting: window.livemixerSim.settings.value.solid };
+  });
+  try {
+    const errors = await openSim(page, `source=depth&bridge=ws://127.0.0.1:${sink.port}&sim=presence&overlay=1&quality=low&dpr=1`);
+    const solidHand = () => page.waitForFunction(() => { const h = window.livemixerSim.host.state().tracked.hands[0]; return !!h && h.capsules.length > 0 && !!window.livemixerSim.host.state().tracked.surface; }, null, { timeout: 20_000 });
+    await solidHand();
+    await page.waitForFunction(() => window.livemixerSim.host.state().tracked.presence > .5, null, { timeout: 15_000 });
+    // Under heavy CPU load a stalled frame can let the tracker drop and re-acquire the hand; wait for it to be solid again.
+    await solidHand();
+    const both = await solidState();
+    expect(both.hands).toBe(1);
+    expect(both.capsules).toBe(21);                    // 5 fingers × 4 bones + forearm
+    expect(both.points).toBe(6);                       // derived from the skeleton: palm + five tips
+    expect(both.scanned).toBeGreaterThan(0);           // the scan arrived and mapped into the volume
+    expect(both.x).toBeGreaterThan(.3); expect(both.x).toBeLessThan(.7); // the depth mapping mirrors u: a hand at u ≈ .4–.6 lands around the centre
+    expect(both.status?.state).toBe('running'); expect(both.status?.message).toContain('skeleton');
+    expect(both.solid).toBe('both'); expect(both.warnings).toEqual([]);
+    await expect(page.locator('#overlay')).toContainText('sends hand skeletons');
+    await expect(page.locator('#overlay')).toContainText('1 of 1 tracked hands solid');
+    // The same bridge with the skeleton chosen as the solid: the scan is withheld from the simulation, which keeps rendering cleanly.
+    await openSim(page, `source=depth&bridge=ws://127.0.0.1:${sink.port}&sim=presence&overlay=1&quality=low&dpr=1&solid=skeleton`);
+    await solidHand();
+    await page.waitForTimeout(1200);
+    await solidHand();
+    const skeletonOnly = await solidState();
+    expect(skeletonOnly.setting).toBe('skeleton'); expect(skeletonOnly.solid).toBe('skeleton');
+    expect(skeletonOnly.capsules).toBe(21); expect(skeletonOnly.scanned).toBeGreaterThan(0); // the tracker still holds everything; only the simulation's view changes
+    expect(skeletonOnly.warnings).toEqual([]);
+    for (const [name, value] of Object.entries(skeletonOnly.signals)) expect(Number.isFinite(value), `${name} finite`).toBe(true);
+    expect(skeletonOnly.signals.presence).toBeGreaterThan(.3);
+    await expect(page.locator('#overlay')).toContainText('simulation sees: skeleton');
     expect(errors).toEqual([]);
   } finally { clearInterval(timer); for (const c of clients) c.close(); await sink.close(); }
 });

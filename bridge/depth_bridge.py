@@ -39,6 +39,14 @@ Geometry conventions
   the ROI (row 0 = top, like the occupancy) holding each cell's NEAREST
   in-range depth as ``1 + round(254 * w)``, or 0 where the cell holds no
   foreground pixel. See :func:`scan_surface`.
+* A source that tracks hands (the Leap Motion Controller, and the synthetic
+  sources for testing) attaches :class:`TrackedHand` skeletons to its frames
+  in the SAME image frame as the depth pixels (column, row, millimetres). The
+  analyzer normalizes them with the same ROI and depth range as everything
+  else, so a joint and the scan pixel under it share coordinates; joints are
+  not clamped (a forearm may leave the box) but the hand's ``pos`` is. When a
+  frame carries tracked hands they are what ``hands`` reports, with a
+  ``skeleton``; otherwise the blobs are, exactly as for a plain depth camera.
 
 Dependencies: ``numpy`` and ``websockets`` (``pip install numpy websockets``).
 Optional: ``opencv-python`` for multi-blob connected components and for the
@@ -87,6 +95,22 @@ log = logging.getLogger("depth_bridge")
 
 Vec3 = tuple[float, float, float]
 
+# Skeleton joint layout, shared by every source that tracks hands and by the wire format: 28 points per hand.
+JOINT_PALM, JOINT_WRIST, JOINT_ELBOW = 0, 1, 2
+FINGER_JOINTS = 3                 # first finger joint; then N_FINGERS fingers x JOINTS_PER_FINGER joints
+JOINTS_PER_FINGER, N_FINGERS = 5, 5
+N_JOINTS = FINGER_JOINTS + N_FINGERS * JOINTS_PER_FINGER
+FINGER_NAMES = ("thumb", "index", "middle", "ring", "pinky")
+JOINT_NAMES = ("carp", "mcp", "pip", "dip", "tip")   # metacarpal base, knuckle, two inter-phalangeal joints, tip
+WIDTH_PALM, WIDTH_ARM, WIDTH_FINGERS = 0, 1, 2       # index into a hand's widths: palm, forearm, then one per finger
+N_WIDTHS = WIDTH_FINGERS + N_FINGERS
+HAND_TYPES = ("left", "right", "unknown")
+
+
+def finger_joint(finger: int, joint: int) -> int:
+    """Row of finger ``finger`` (0 = thumb) joint ``joint`` (0 = carp .. 4 = tip) in a hand's ``joints`` array."""
+    return FINGER_JOINTS + finger * JOINTS_PER_FINGER + joint
+
 
 # --------------------------------------------------------------------------- #
 # Frames and sources
@@ -94,22 +118,76 @@ Vec3 = tuple[float, float, float]
 
 
 @dataclass(frozen=True)
+class TrackedHand:
+    """A hand skeleton a source tracked, in the depth image's own frame.
+
+    ``joints`` is ``(N_JOINTS, 3)`` float64: continuous pixel column ``u`` and
+    row ``v`` with integer values at pixel centres (OpenCV's convention, the
+    one ``leap_stereo.RectifiedView.ray_to_pixel`` uses; a joint may lie past
+    the image edge) and depth in millimetres along the same axis as the depth
+    pixels. Rows are the palm, the wrist, the elbow (already trimmed to a stub
+    by the source) and five fingers thumb -> pinky with carp, mcp, pip, dip,
+    tip each (:func:`finger_joint`). ``widths_px`` holds ``N_WIDTHS`` DIAMETERS
+    in pixels at each part's own depth (palm, forearm, one per finger), which
+    puts them in the same perspective units as the image, so a width and the
+    scan around it agree. ``extended`` is one flag per finger. ``confidence``,
+    ``grab_strength`` and ``pinch_strength`` are in [0, 1] as the tracker
+    reports them. ``id`` is the tracker's id (stable while the hand stays
+    tracked); ``type`` is ``"left"``, ``"right"`` or ``"unknown"``.
+    """
+
+    id: int
+    type: str
+    joints: np.ndarray
+    widths_px: np.ndarray
+    extended: np.ndarray
+    confidence: float = 1.0
+    grab_strength: float = 0.0
+    pinch_strength: float = 0.0
+    has_elbow: bool = True
+
+    def __post_init__(self) -> None:
+        if self.type not in HAND_TYPES:
+            raise ValueError(f"hand type must be one of {HAND_TYPES}, got {self.type!r}")
+        if self.joints.shape != (N_JOINTS, 3):
+            raise ValueError(f"joints must have shape ({N_JOINTS}, 3), got {self.joints.shape}")
+        if self.widths_px.shape != (N_WIDTHS,):
+            raise ValueError(f"widths_px must have shape ({N_WIDTHS},), got {self.widths_px.shape}")
+        if self.extended.shape != (N_FINGERS,):
+            raise ValueError(f"extended must have shape ({N_FINGERS},), got {self.extended.shape}")
+        if not (np.isfinite(self.joints).all() and np.isfinite(self.widths_px).all()):
+            raise ValueError("a tracked hand must be finite everywhere")
+        if self.id < 0:
+            raise ValueError("hand ids are non-negative")
+
+    def finger(self, index: int) -> np.ndarray:
+        """The ``(JOINTS_PER_FINGER, 3)`` joints of finger ``index`` (0 = thumb)."""
+        start = finger_joint(index, 0)
+        return self.joints[start:start + JOINTS_PER_FINGER]
+
+
+@dataclass(frozen=True)
 class DepthFrame:
-    """One depth image.
+    """One depth image, optionally with the hands a tracker saw in it.
 
     ``depth_mm`` is ``uint16`` millimetres with shape ``(height, width)``;
     0 means "no measurement". ``timestamp`` is seconds on
     ``time.perf_counter()``'s clock, taken as close to capture as possible.
+    ``hands`` is ``None`` for a source without hand tracking, otherwise the
+    :class:`TrackedHand` skeletons in this image's frame (possibly none).
     """
 
     depth_mm: np.ndarray
     timestamp: float
+    hands: tuple[TrackedHand, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.depth_mm.ndim != 2:
             raise ValueError(f"depth image must be 2-D, got shape {self.depth_mm.shape}")
         if self.depth_mm.dtype != np.uint16:
             raise ValueError(f"depth image must be uint16 millimetres, got {self.depth_mm.dtype}")
+        if self.hands is not None and not isinstance(self.hands, tuple):
+            object.__setattr__(self, "hands", tuple(self.hands))
 
     @property
     def height(self) -> int:
@@ -133,6 +211,8 @@ class FrameSource(ABC):
     name: str = "unknown"
     #: Nominal capture rate, or ``None`` when unknown.
     fps: float | None = None
+    #: True when frames can carry :class:`TrackedHand` skeletons (announced as ``skeleton`` in ``hello``).
+    skeleton: bool = False
 
     def start(self) -> None:
         """Open the device. Called once before the first ``read()``."""
@@ -169,9 +249,12 @@ class SyntheticSource(FrameSource):
     analyzer has something to reject. Rendering is a pure function of the
     script time ``t`` (``render(t)``), which makes it deterministic for tests;
     ``read()`` derives ``t`` from the wall clock and paces itself to ``fps``.
+    Each hand also carries a procedural skeleton (:meth:`scripted_skeleton`)
+    lying inside its dome, so the skeleton path is exercised without hardware.
     """
 
     name = "synthetic"
+    skeleton = True
 
     def __init__(
         self,
@@ -231,6 +314,53 @@ class SyntheticSource(FrameSource):
             canvas = np.where(rho2 <= 1.0, np.minimum(canvas, surface), canvas)
         return np.clip(canvas, 0, 65535).astype(np.uint16)
 
+    # Where the procedural skeleton sits inside the dome, in dome units (1 = the rim): the wrist and the
+    # forearm stub run toward image-down, the fingers fan toward image-up (angles clockwise from up).
+    _FINGER_FAN_DEG = (-62.0, -28.0, 0.0, 24.0, 48.0)
+    _FINGER_REACH = (0.6, 0.85, 0.9, 0.85, 0.72)
+    _JOINT_ALONG = (0.18, 0.42, 0.64, 0.83, 1.0)
+    _WRIST_RHO, _ELBOW_RHO = 0.55, 0.95
+    _WIDTHS_OF_HALF = (1.5, 0.9, 0.28, 0.26, 0.26, 0.24, 0.22)  # diameters as fractions of the dome's half-width
+
+    def scripted_skeleton(self, hand: ScriptedHand, index: int) -> TrackedHand:
+        """A skeleton inside ``hand``'s dome: the palm at its centre, fingers fanning up, the forearm stub down.
+
+        Every joint's depth is the dome surface at the pixel holding it (the
+        centre is nearest, the rim ``dome_mm`` deeper), so the skeleton lies
+        ON the rendered scan the way a Leap skeleton lies on the stereo scan,
+        and the rendering itself is untouched. The second hand of a two-hand
+        script is a left hand with the thumb on the other side.
+        """
+        width, height = self.width, self.height
+        centre = self._near_mm + hand.z * (self._far_mm - self._near_mm)
+        mirror = -1.0 if index % 2 else 1.0
+
+        def joint(rho: float, angle_deg: float) -> tuple[float, float, float]:
+            angle = math.radians(angle_deg) * mirror
+            x = hand.x + rho * hand.r * math.sin(angle)
+            y = hand.y - rho * hand.r * 1.4 * math.cos(angle)
+            px, py = min(width - 1, int(x * width)), min(height - 1, int(y * height))  # the pixel holding (x, y)
+            dx = ((px + 0.5) / width - hand.x) / hand.r
+            dy = ((py + 0.5) / height - hand.y) / (hand.r * 1.4)
+            return x * width - 0.5, y * height - 0.5, centre + self.dome_mm * (dx * dx + dy * dy)
+
+        joints = np.empty((N_JOINTS, 3), dtype=np.float64)
+        joints[JOINT_PALM] = joint(0.0, 0.0)
+        joints[JOINT_WRIST] = joint(self._WRIST_RHO, 180.0)
+        joints[JOINT_ELBOW] = joint(self._ELBOW_RHO, 180.0)
+        for f in range(N_FINGERS):
+            for j in range(JOINTS_PER_FINGER):
+                joints[finger_joint(f, j)] = joint(self._FINGER_REACH[f] * self._JOINT_ALONG[j], self._FINGER_FAN_DEG[f])
+        widths_px = hand.r * width * np.asarray(self._WIDTHS_OF_HALF, dtype=np.float64)
+        return TrackedHand(
+            id=index + 1, type="right" if index % 2 == 0 else "left", joints=joints, widths_px=widths_px,
+            extended=np.ones(N_FINGERS, dtype=bool), confidence=1.0, grab_strength=0.0, pinch_strength=0.0,
+        )
+
+    def tracked_hands(self, t: float) -> tuple[TrackedHand, ...]:
+        """The skeletons of the hands present at script time ``t``, in the image frame of ``render(t)``."""
+        return tuple(self.scripted_skeleton(hand, i) for i, hand in enumerate(self.scripted_hands(t)))
+
     def read(self) -> DepthFrame:
         now = time.perf_counter()
         if self._origin is None:
@@ -241,7 +371,8 @@ class SyntheticSource(FrameSource):
             now = time.perf_counter()
         period = 1.0 / self.fps
         self._next_due = max(self._next_due, now - period) + period
-        return DepthFrame(self.render((now - self._origin) * self.speed), now)
+        t = (now - self._origin) * self.speed
+        return DepthFrame(self.render(t), now, self.tracked_hands(t))
 
 
 class RealSenseSource(FrameSource):
@@ -411,6 +542,9 @@ class AnalyzerConfig:
     blob; a blob missing for more than ``max_missed`` frames loses its id.
     ``depth_percentile`` picks the blob depth (10 = its nearest tenth, so a
     reaching hand reads as pushed even when the arm behind it is in the box).
+    A tracked hand (skeleton) is reported while its palm is inside the box
+    widened by ``hand_margin`` on every axis (normalized units); farther out it
+    is dropped like any pixel outside the box, instead of sticking to a wall.
     """
 
     occupancy: tuple[int, int] | None = (32, 24)
@@ -424,6 +558,7 @@ class AnalyzerConfig:
     max_missed: int = 5
     depth_percentile: float = 10.0
     conf_saturation: float = 4.0
+    hand_margin: float = 0.25
 
     def __post_init__(self) -> None:
         if self.occupancy is not None:
@@ -469,6 +604,84 @@ class Blob:
 
 
 @dataclass(frozen=True)
+class SkeletonHand:
+    """A tracked hand normalized to the box, ready for the wire.
+
+    ``joints`` is ``(N_JOINTS, 3)`` in box units (``u``/``v`` over the ROI,
+    ``w`` over the depth range), NOT clamped: the browser expects a forearm
+    to leave the box with its direction intact. ``widths`` are diameters in
+    ``u`` units (fractions of the ROI width). ``conf`` is the reported
+    confidence floored at 0.5 (Ultraleap under-reports it and the browser's
+    tracker drops hands below 0.3), ``openness`` is ``1 - grab_strength`` and
+    ``pinch`` the pinch strength. ``points`` are the palm and the fingertips.
+    """
+
+    id: int
+    type: str
+    joints: np.ndarray
+    widths: np.ndarray
+    extended: np.ndarray
+    conf: float
+    openness: float
+    pinch: float
+    has_elbow: bool
+    points: tuple[Vec3, ...]
+
+    @property
+    def pos(self) -> Vec3:
+        palm = self.joints[JOINT_PALM]
+        return (float(palm[0]), float(palm[1]), float(palm[2]))
+
+    @property
+    def extent(self) -> tuple[Vec3, Vec3]:
+        """Bounding box of every joint (the elbow stub included when present)."""
+        joints = self.joints if self.has_elbow else np.delete(self.joints, JOINT_ELBOW, axis=0)
+        lo, hi = joints.min(axis=0), joints.max(axis=0)
+        return (float(lo[0]), float(lo[1]), float(lo[2])), (float(hi[0]), float(hi[1]), float(hi[2]))
+
+    def finger(self, index: int) -> np.ndarray:
+        start = finger_joint(index, 0)
+        return self.joints[start:start + JOINTS_PER_FINGER]
+
+
+MIN_TRACKED_CONF = 0.5
+
+
+def normalize_tracked_hand(hand: TrackedHand, roi: tuple[int, int, int, int], near_mm: float, far_mm: float, sample_points: int = MAX_POINTS) -> SkeletonHand:
+    """Normalize a :class:`TrackedHand` with the same box as the pixels: ``u``/``v`` over the ROI, ``w`` over the depth range.
+
+    A pixel-centre coordinate ``c`` (integer = centre) becomes
+    ``(c + 0.5 - roi_start) / roi_size``, the rule the blob centroids and the
+    grids use, so a joint and the scan cell under it agree. Widths divide by
+    the ROI width. Nothing is clamped here; ``sample_points == 0`` (``--points
+    0``) suppresses the point list like it does for blobs.
+    """
+    x0, y0, x1, y1 = roi
+    rw, rh = float(x1 - x0), float(y1 - y0)
+    src = hand.joints
+    joints = np.empty_like(src)
+    joints[:, 0] = (src[:, 0] + 0.5 - x0) / rw
+    joints[:, 1] = (src[:, 1] + 0.5 - y0) / rh
+    joints[:, 2] = (src[:, 2] - near_mm) / (far_mm - near_mm)
+    widths = hand.widths_px / rw
+    palm = joints[JOINT_PALM]
+    tips = [joints[finger_joint(f, JOINTS_PER_FINGER - 1)] for f in range(N_FINGERS)]
+    points: tuple[Vec3, ...] = tuple((float(p[0]), float(p[1]), float(p[2])) for p in (palm, *tips)) if sample_points > 0 else ()
+    return SkeletonHand(
+        id=int(hand.id), type=hand.type, joints=joints, widths=widths, extended=hand.extended.astype(bool),
+        conf=min(1.0, max(MIN_TRACKED_CONF, float(hand.confidence))),
+        openness=min(1.0, max(0.0, 1.0 - float(hand.grab_strength))),
+        pinch=min(1.0, max(0.0, float(hand.pinch_strength))),
+        has_elbow=bool(hand.has_elbow), points=points,
+    )
+
+
+def hand_in_box(hand: SkeletonHand, margin: float) -> bool:
+    """Whether the palm lies inside the unit box widened by ``margin`` on every axis."""
+    return all(-margin <= c <= 1.0 + margin for c in hand.pos)
+
+
+@dataclass(frozen=True)
 class AnalysisResult:
     blobs: tuple[Blob, ...]
     #: ``uint8`` array of shape ``(height, width)``, row 0 = top of the ROI; ``None`` when disabled.
@@ -478,6 +691,8 @@ class AnalysisResult:
     voxels: np.ndarray | None = None
     #: ``uint8`` array of shape ``(height, width)``, row 0 = top, 0 = empty else 1 + round(254 w); ``None`` when disabled.
     surface: np.ndarray | None = None
+    #: Tracked hands normalized to the box; empty for a source without tracking or when it saw none.
+    hands: tuple[SkeletonHand, ...] = ()
 
 
 def erode3(mask: np.ndarray, iterations: int = 1) -> np.ndarray:
@@ -728,7 +943,10 @@ class BoxAnalyzer:
     nearest-percentile depth, extent, confidence, sample points -> stable ids
     from :class:`BlobTracker` -> occupancy grid of the mask -> voxel grid of
     the mask binned by depth (the foreground in 3D) -> surface scan (nearest
-    depth per cell). All outputs are ROI-normalized (see the module docstring).
+    depth per cell) -> the frame's tracked hands, if any, normalized with the
+    same box (:func:`normalize_tracked_hand`) and kept while their palm is
+    within ``hand_margin`` of it. All outputs are ROI-normalized (see the
+    module docstring).
     """
 
     def __init__(self, box: BoxConfig, config: AnalyzerConfig | None = None) -> None:
@@ -782,16 +1000,22 @@ class BoxAnalyzer:
         occupancy = downsample_occupancy(mask, *cfg.occupancy) if cfg.occupancy else None
         voxels = voxelize(roi, mask, near_mm, far_mm, *cfg.voxels) if cfg.voxels else None
         surface = scan_surface(roi, mask, near_mm, far_mm, *cfg.surface) if cfg.surface else None
+        hands: list[SkeletonHand] = []
+        for hand in frame.hands or ():
+            skeleton = normalize_tracked_hand(hand, (x0, y0, x1, y1), near_mm, far_mm, cfg.sample_points)
+            if hand_in_box(skeleton, cfg.hand_margin):
+                hands.append(skeleton)
         fps = self._rate.tick(frame.timestamp)
         stats = {
             "pixels": float(in_range),
             "blobs": float(len(candidates)),
+            "trackedHands": float(len(hands)),
             "fps": round(fps, 2),
             "processingMs": round((time.perf_counter() - started) * 1000.0, 3),
             "frameWidth": float(frame.width),
             "frameHeight": float(frame.height),
         }
-        return AnalysisResult(tracked, occupancy, stats, voxels, surface)
+        return AnalysisResult(tracked, occupancy, stats, voxels, surface, tuple(hands[:MAX_HANDS]))
 
 
 # --------------------------------------------------------------------------- #
@@ -806,6 +1030,57 @@ def _unit(x: float) -> float:
 
 def _vec(p: Sequence[float]) -> list[float]:
     return [_unit(p[0]), _unit(p[1]), _unit(p[2])]
+
+
+def _open_vec(p: Sequence[float]) -> list[float]:
+    """A skeleton joint: rounded like ``pos`` but NOT clamped (the browser keeps joints outside the box)."""
+    return [round(float(p[0]), 4), round(float(p[1]), 4), round(float(p[2]), 4)]
+
+
+def _width(w: float) -> float:
+    return round(max(0.0, float(w)), 4)
+
+
+def skeleton_message(hand: SkeletonHand) -> dict[str, Any]:
+    """The ``skeleton`` object of a tracked hand (``bridgeSkeletonSchema`` in protocol.ts)."""
+    msg: dict[str, Any] = {"type": hand.type, "palm": _open_vec(hand.joints[JOINT_PALM]), "wrist": _open_vec(hand.joints[JOINT_WRIST])}
+    if hand.has_elbow:
+        msg["elbow"] = _open_vec(hand.joints[JOINT_ELBOW])
+    msg["palmWidth"] = _width(hand.widths[WIDTH_PALM])
+    msg["armWidth"] = _width(hand.widths[WIDTH_ARM])
+    msg["fingers"] = [
+        {
+            "joints": [_open_vec(p) for p in hand.finger(f)],
+            "width": _width(hand.widths[WIDTH_FINGERS + f]),
+            "extended": bool(hand.extended[f]),
+        }
+        for f in range(N_FINGERS)
+    ]
+    return msg
+
+
+def tracked_hand_message(hand: SkeletonHand) -> dict[str, Any]:
+    """A ``hands[]`` entry for a tracked hand: ``pos`` is the palm (clamped), ``extent`` spans every joint."""
+    return {
+        "id": int(hand.id),
+        "pos": _vec(hand.pos),
+        "conf": _unit(hand.conf),
+        "extent": [_vec(hand.extent[0]), _vec(hand.extent[1])],
+        "openness": _unit(hand.openness),
+        "pinch": _unit(hand.pinch),
+        "points": [_vec(p) for p in hand.points[:MAX_POINTS]],
+        "skeleton": skeleton_message(hand),
+    }
+
+
+def blob_hand_message(b: Blob) -> dict[str, Any]:
+    return {
+        "id": int(b.id),
+        "pos": _vec(b.pos),
+        "conf": _unit(b.conf),
+        "extent": [_vec(b.extent[0]), _vec(b.extent[1])],
+        "points": [_vec(p) for p in b.points[:MAX_POINTS]],
+    }
 
 
 def _encode_grid(grid: np.ndarray, ndim: int, what: str) -> str:
@@ -832,8 +1107,9 @@ def encode_surface(grid: np.ndarray) -> str:
 
 def hello_message(
     source: str, box: BoxConfig, fps: float | None, occupancy: tuple[int, int] | None,
-    voxels: tuple[int, int, int] | None = None, surface: tuple[int, int] | None = None,
+    voxels: tuple[int, int, int] | None = None, surface: tuple[int, int] | None = None, skeleton: bool = False,
 ) -> dict[str, Any]:
+    """The ``hello``; ``skeleton`` is announced only when the source tracks hands, omitted otherwise."""
     msg: dict[str, Any] = {
         "type": "hello",
         "version": PROTOCOL_VERSION,
@@ -852,20 +1128,17 @@ def hello_message(
         msg["voxels"] = {"nx": int(voxels[0]), "ny": int(voxels[1]), "nz": int(voxels[2])}
     if surface is not None:
         msg["surface"] = {"width": int(surface[0]), "height": int(surface[1])}
+    if skeleton:
+        msg["skeleton"] = True
     return msg
 
 
 def frame_message(seq: int, t: float, result: AnalysisResult) -> dict[str, Any]:
-    hands = [
-        {
-            "id": int(b.id),
-            "pos": _vec(b.pos),
-            "conf": _unit(b.conf),
-            "extent": [_vec(b.extent[0]), _vec(b.extent[1])],
-            "points": [_vec(p) for p in b.points[:MAX_POINTS]],
-        }
-        for b in result.blobs[:MAX_HANDS]
-    ]
+    """One ``frame``: tracked hands (with skeletons) when the frame has any, otherwise the blobs, exactly as before."""
+    if result.hands:
+        hands = [tracked_hand_message(h) for h in result.hands[:MAX_HANDS]]
+    else:
+        hands = [blob_hand_message(b) for b in result.blobs[:MAX_HANDS]]
     msg: dict[str, Any] = {"type": "frame", "seq": int(seq), "t": round(float(t), 6), "hands": hands}
     if result.occupancy is not None:
         msg["occupancy"] = encode_occupancy(result.occupancy)
@@ -1057,6 +1330,7 @@ def build_parser() -> argparse.ArgumentParser:
     leap.add_argument("--leap-min-intensity", type=int, default=16, help="ignore IR pixels darker than this, 0..255; the LEDs do not reach the background (default: %(default)s)")
     leap.add_argument("--swap-cameras", action="store_true", help="exchange the two cameras before matching (use when the depth image stays empty with a hand over the device)")
     leap.add_argument("--leap-orient", choices=LEAP_ORIENTATIONS, default="none", help="rotate/flip the depth image before analysis so image right/down mean what the browser expects (default: none)")
+    leap.add_argument("--leap-hand-frame", default="auto", metavar="MODE", help="how the LeapC hand skeleton is projected onto the depth image: 'auto' (default: every convention is scored against the scan until one clearly leads) or a convention name u{+|-}{x|z}_v{+|-}{z|x}_ref{+|-}, see bridge/README.md")
     p.add_argument("--log-level", default="info", choices=("debug", "info", "warning", "error"))
     return p
 
@@ -1072,11 +1346,11 @@ def make_source(args: argparse.Namespace) -> FrameSource:
         try:
             view = leap.ls.RectifiedView.from_fov(args.leap_view[0], args.leap_view[1], args.leap_fov)
             params = leap.ls.StereoParams(min_depth_mm=args.near * 1000.0, min_intensity=args.leap_min_intensity)
+            if args.source == "leap-synthetic":
+                return leap.LeapSyntheticSource(view, params, args.swap_cameras, args.leap_orient, fps=args.fps, paced=args.dump is None, hand_frame=args.leap_hand_frame)
+            return leap.LeapStereoSource(args.leapc, view, params, args.swap_cameras, args.leap_orient, fps=args.fps, hand_frame=args.leap_hand_frame)
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
-        if args.source == "leap-synthetic":
-            return leap.LeapSyntheticSource(view, params, args.swap_cameras, args.leap_orient, fps=args.fps, paced=args.dump is None)
-        return leap.LeapStereoSource(args.leapc, view, params, args.swap_cameras, args.leap_orient, fps=args.fps)
     raise SystemExit(f"unknown source {args.source!r}")
 
 
@@ -1108,7 +1382,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(str(exc))
     source = make_source(args)
     analyzer = BoxAnalyzer(box, config)
-    hello = hello_message(source.name, box, source.fps, config.occupancy, config.voxels, config.surface)
+    hello = hello_message(source.name, box, source.fps, config.occupancy, config.voxels, config.surface, skeleton=source.skeleton)
 
     if args.dump is not None:
         if hasattr(sys.stdout, "reconfigure"):

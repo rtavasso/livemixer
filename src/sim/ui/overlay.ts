@@ -9,6 +9,8 @@
 import type { AnyParamValue, ParamSpec } from '../core/types';
 import type { SimHost, HostState } from '../host/app';
 import { SIMULATIONS } from '../host/registry';
+import { SOLID_CHOICES, type SolidChoice } from '../host/settings';
+import { DepthBridgeSource } from '../input/depth';
 import { AXES, type Axis, type CalibrationCaptures, type SpaceMapping } from '../input/mapping';
 import { SOURCE_IDS, type SourceId } from '../input/types';
 
@@ -39,6 +41,8 @@ export class Overlay {
   private telemetryStatus = el('div', { class: 'status' }); private lastFrame = el('pre'); private showFrame = false;
   private mappingBox = el('div'); private calibrationStatus = el('div', { class: 'status' });
   private diagnostics = el('div', { class: 'status' });
+  /** Depth source only: what the connected bridge sends and how many hands are solid. */
+  private depthStatus = el('div', { class: 'status' });
   private simSelect = el('select'); private sourceSelect = el('select');
   private paramOutputs = new Map<string, HTMLOutputElement | HTMLInputElement>();
   private signalBars = new Map<string, { bar: HTMLSpanElement; out: HTMLOutputElement; row: HTMLElement }>();
@@ -166,7 +170,8 @@ export class Overlay {
     if (s.sourceId === 'depth') {
       const url = el('input', { type: 'text', value: settings.depth.url, placeholder: 'ws://127.0.0.1:8765' });
       nodes.push(el('div', { class: 'row' }, el('label', {}, 'Bridge WebSocket URL', url), el('button', { onclick: () => this.host.setDepthUrl(url.value) }, 'Connect')));
-      nodes.push(el('p', { class: 'hint' }, 'Run bridge/depth_bridge.py next to the camera. See bridge/README.md.'));
+      nodes.push(el('p', { class: 'hint' }, 'Run bridge/depth_bridge.py next to the camera (--source leap for a Leap Motion Controller: hand skeletons and the depth scan together). See bridge/README.md.'));
+      nodes.push(this.depthStatus);
     }
     if (s.sourceId === 'leap') {
       const url = el('input', { type: 'text', value: settings.leap.url, placeholder: 'ws://127.0.0.1:6437/v6.json' });
@@ -184,7 +189,7 @@ export class Overlay {
       for (const axis of ['x', 'y', 'z'] as const) nodes.push(el('div', { class: 'row inline' }, el('label', {}, `${axis} min`, inputs[axis][0]), el('label', {}, `${axis} max`, inputs[axis][1])));
       const ratio = () => (box.z[1] - box.z[0]) / Math.max(1, box.y[1] - box.y[0]);
       nodes.push(el('div', { class: 'row' }, el('button', { class: 'primary', onclick: apply }, 'Apply & reconnect'), el('button', { title: 'Sets Volume depth to the box depth ÷ height so a solid hand keeps its proportions.', onclick: () => { this.host.setVolumeDepth(ratio()); this.host.warn(`Volume depth set to ${ratio().toFixed(2)} to match the Leap box.`); } }, `Match volume depth (${ratio().toFixed(2)})`)));
-      nodes.push(el('p', { class: 'hint' }, 'Needs "Allow Web Apps" enabled in the Leap Motion control panel (the service then listens on port 6437). Keep the box proportions like the display (width : height : depth ≈ aspect : 1 : volume depth) so the solid hand is not stretched.'));
+      nodes.push(el('p', { class: 'hint' }, 'Older services (V2, Orion, Gemini 5.0/5.1) need "Allow Web Apps" enabled in the Leap Motion control panel (the service then listens on port 6437). Ultraleap Gemini 5.2+ and Hyperion removed this JSON WebSocket API: with current Ultraleap software use the depth bridge instead (source=depth, python bridge/depth_bridge.py --source leap), which delivers hand tracking and the depth scan together. Keep the box proportions like the display (width : height : depth ≈ aspect : 1 : volume depth) so the solid hand is not stretched.'));
     }
     if (s.sourceId === 'synthetic') {
       const hands = el('select'); hands.append(el('option', { value: '1' }, '1 hand'), el('option', { value: '2' }, '2 hands')); hands.value = String(settings.synthetic.hands);
@@ -265,11 +270,13 @@ export class Overlay {
     dpr.addEventListener('change', () => this.host.setMaxDpr(Number(dpr.value)));
     const depth = el('input', { type: 'number', min: .25, max: 3, step: .05, value: settings.volumeDepth });
     depth.addEventListener('change', () => this.host.setVolumeDepth(Number(depth.value)));
+    const solid = el('select'); for (const s of SOLID_CHOICES) solid.appendChild(el('option', { value: s }, s)); solid.value = settings.solid;
+    solid.addEventListener('change', () => this.host.setSolid(solid.value as SolidChoice));
     const tracker = this.host.tracker.settings;
     const num = (key: 'enterMs' | 'leaveMs' | 'minCutoff' | 'beta', step: number) => { const i = el('input', { type: 'number', step, value: tracker[key] }); i.addEventListener('change', () => this.host.setTrackerSettings({ [key]: Number(i.value) })); return el('label', {}, key, i); };
     return el('div', {},
-      el('div', { class: 'row' }, el('label', {}, 'Quality', quality), el('label', {}, 'Max pixel ratio', dpr), el('label', {}, 'Volume depth', depth)),
-      el('p', { class: 'hint' }, 'Volume depth is the z size of the 3D space in units of the canvas height; hands live inside it.'),
+      el('div', { class: 'row' }, el('label', {}, 'Quality', quality), el('label', {}, 'Max pixel ratio', dpr), el('label', {}, 'Volume depth', depth), el('label', {}, 'Solid', solid)),
+      el('p', { class: 'hint' }, 'Volume depth is the z size of the 3D space in units of the canvas height; hands live inside it. Solid: what a simulation is handed when the source knows both the depth scan and the hand skeleton — both (the scan for contact, the skeleton for fingertips and gestures), scan only, or skeleton only (the capsule hand collides).'),
       el('div', { class: 'row' }, num('enterMs', 10), num('leaveMs', 10), num('minCutoff', .1), num('beta', .005)),
       el('p', { class: 'hint' }, 'enter/leave: presence hysteresis. minCutoff lower = calmer at rest; beta higher = less lag when moving.'),
     );
@@ -287,6 +294,12 @@ export class Overlay {
     const stats = Object.entries(s.tracked.stats).map(([k, v]) => `${k} ${Number.isInteger(v) ? v : v.toFixed(2)}`).join(' · ');
     this.status.textContent = `${st?.message ?? 'No source.'}\nLast frame ${age} · discarded ${s.tracked.discarded}${s.recording.active ? ` · recording ${s.recording.frames} frames` : ''}${stats ? `\n${stats}` : ''}`;
     this.status.className = `status${st?.state === 'error' ? ' error' : st?.state === 'running' ? ' ok' : ''}`;
+    if (s.source instanceof DepthBridgeSource) {
+      const hello = s.source.hello, solidHands = s.tracked.hands.filter(h => h.capsules.length).length;
+      this.depthStatus.textContent = hello
+        ? `${hello.skeleton ? 'The bridge sends hand skeletons' : 'The bridge sends no skeletons (blobs and the scan only)'}${hello.surface ? ` · scan ${hello.surface.width}×${hello.surface.height}` : ' · no scan'} · ${solidHands} of ${s.tracked.hands.length} tracked hands solid · simulation sees: ${s.solid}`
+        : 'Waiting for the bridge hello…';
+    }
     this.hands.replaceChildren(s.tracked.hands.length ? el('table', {}, el('tr', {}, ...['hand', 'x', 'y', 'z', 'speed', 'open', 'push', 'age'].map(h => el('th', {}, h))), ...s.tracked.hands.map(h => el('tr', {}, el('td', {}, `#${h.id}`), el('td', {}, fmt(h.position.x)), el('td', {}, fmt(h.position.y)), el('td', {}, fmt(h.position.z)), el('td', {}, fmt(h.speed)), el('td', {}, fmt(h.openness, 1)), el('td', {}, fmt(h.push)), el('td', {}, `${(h.ageMs / 1000).toFixed(1)}s`)))) : el('p', { class: 'hint' }, 'No hand present.'));
     if (s.events.length) this.events.replaceChildren(...s.events.slice(-8).map(e => el('span', {}, `${e.type}${'direction' in e ? ` ${e.direction}` : ''} #${e.handId}`)));
     for (const [name, { bar, out, row }] of this.signalBars) {

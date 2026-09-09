@@ -3,8 +3,9 @@
  * JSON WebSocket API (`ws://127.0.0.1:6437/v6.json`). No native code, no
  * bridge process: the service must merely have "Allow Web Apps"
  * (`websockets_enabled`) switched on. Available in V2, Orion 4 and the
- * Gemini 5.0 preview; later Gemini/Hyperion releases dropped this API, for
- * those use `bridge/` with Ultraleap's Python bindings instead.
+ * Gemini 5.0 preview; Gemini 5.2+ and Hyperion dropped this API. With those,
+ * `bridge/depth_bridge.py --source leap` (the `depth` source) delivers the same
+ * skeleton alongside a stereo depth scan; the capsule rules are shared in skeleton.ts.
  *
  * Device coordinates are millimetres with the origin at the device centre:
  * x to the performer's right, y up, z toward the performer (the device lies
@@ -14,6 +15,7 @@
  */
 import { z } from 'zod';
 import { ClockMapper } from './protocol';
+import { skeletonCapsules, type Skeleton, type SkeletonFinger } from './skeleton';
 import type { Capsule, HandObservation, InputFrame, InputSource, InputSourceStatus } from './types';
 import type { Vec3 } from '../core/types';
 
@@ -94,31 +96,39 @@ const mmToSourceX = (mmValue: number, box: LeapBox) => mmValue / (box.x[1] - box
 const FOREARM_MM = 70;
 
 /**
- * Build the solid hand: three phalanx capsules per finger (two for the thumb, whose
- * metacarpal Leap reports as zero length), one metacarpal capsule per finger from the
- * carpal base to the knuckle (five of them make the palm), and a forearm capsule from
- * the wrist toward the elbow. Radii are half the reported widths.
+ * Reduce the Leap JSON hand (millimetres) to the generic skeleton in the box-normalized source
+ * frame: joints through the open mapping, widths as box-width fractions, the forearm cut to
+ * FOREARM_MM in millimetre space (the box is not isotropic, so cutting after normalization
+ * would bend with the box proportions). Fingers whose joints the service did not send (only
+ * abridged test frames do that) contribute no bones.
  */
-export function leapHandCapsules(hand: LeapFrame['hands'][number], fingers: LeapFrame['pointables'], box: LeapBox): Capsule[] {
-  const out: Capsule[] = [];
-  const seg = (a: [number, number, number], b: [number, number, number], widthMm: number) => {
-    const dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
-    if (dx * dx + dy * dy + dz * dz < 1) return; // zero-length bone (thumb metacarpal)
-    out.push({ a: toSourceOpen(a, box), b: toSourceOpen(b, box), radius: mmToSourceX(widthMm / 2, box) });
-  };
+export function leapSkeleton(hand: LeapFrame['hands'][number], fingers: LeapFrame['pointables'], box: LeapBox): Skeleton {
+  const list: SkeletonFinger[] = [];
   for (const f of fingers) {
-    const width = f.width ?? 16;
-    if (f.carpPosition && f.mcpPosition) seg(f.carpPosition, f.mcpPosition, width * 1.15);
-    if (f.mcpPosition && f.pipPosition) seg(f.mcpPosition, f.pipPosition, width);
-    if (f.pipPosition && f.dipPosition) seg(f.pipPosition, f.dipPosition, width * .9);
-    if (f.dipPosition && (f.btipPosition ?? f.tipPosition)) seg(f.dipPosition, f.btipPosition ?? f.tipPosition, width * .8);
+    if (!f.carpPosition || !f.mcpPosition || !f.pipPosition || !f.dipPosition) continue;
+    const joints: SkeletonFinger['joints'] = [toSourceOpen(f.carpPosition, box), toSourceOpen(f.mcpPosition, box), toSourceOpen(f.pipPosition, box), toSourceOpen(f.dipPosition, box), toSourceOpen(f.btipPosition ?? f.tipPosition, box)];
+    list.push({ joints, width: mmToSourceX(f.width ?? 16, box), extended: f.extended ?? true });
   }
+  let elbow: Vec3 | undefined;
   if (hand.wrist && hand.elbow) {
     const d = [hand.elbow[0] - hand.wrist[0], hand.elbow[1] - hand.wrist[1], hand.elbow[2] - hand.wrist[2]];
     const len = Math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) || 1, cut = Math.min(len, FOREARM_MM) / len;
-    seg(hand.wrist, [hand.wrist[0] + d[0] * cut, hand.wrist[1] + d[1] * cut, hand.wrist[2] + d[2] * cut], (hand.armWidth ?? 55) * .85);
+    elbow = toSourceOpen([hand.wrist[0] + d[0] * cut, hand.wrist[1] + d[1] * cut, hand.wrist[2] + d[2] * cut], box);
   }
-  return out;
+  return {
+    palm: toSourceOpen(hand.stabilizedPalmPosition ?? hand.palmPosition, box), wrist: toSourceOpen(hand.wrist ?? hand.palmPosition, box), elbow,
+    palmWidth: hand.palmWidth === undefined ? undefined : mmToSourceX(hand.palmWidth, box), armWidth: mmToSourceX(hand.armWidth ?? 55, box), fingers: list,
+  };
+}
+
+/**
+ * Build the solid hand: three phalanx capsules per finger (two for the thumb, whose
+ * metacarpal Leap reports as zero length), one metacarpal capsule per finger from the
+ * carpal base to the knuckle (five of them make the palm), and a forearm capsule from
+ * the wrist toward the elbow. Radii are half the reported widths (see skeleton.ts).
+ */
+export function leapHandCapsules(hand: LeapFrame['hands'][number], fingers: LeapFrame['pointables'], box: LeapBox): Capsule[] {
+  return skeletonCapsules(leapSkeleton(hand, fingers, box));
 }
 
 /** Reduce a Leap frame to hand observations in the box-normalized source frame. */

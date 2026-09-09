@@ -54,14 +54,20 @@ export const LEAP_MAPPING: SpaceMapping = {
   z: { from: 'z', low: 1, high: 0, mirror: false },
 };
 
+/** Unclamped axis map: geometry that may legitimately leave the volume (a forearm, a fingertip past the edge). */
+export function mapAxisOpen(map: AxisMap, value: number): number {
+  const t = (value - map.low) / (map.high - map.low);
+  return map.mirror ? 1 - t : t;
+}
 export function mapAxis(map: AxisMap, value: number): number {
-  let t = (value - map.low) / (map.high - map.low);
-  if (map.mirror) t = 1 - t;
-  return Math.min(1, Math.max(0, t));
+  return Math.min(1, Math.max(0, mapAxisOpen(map, value)));
 }
 
 export function mapPoint(mapping: SpaceMapping, p: Vec3): Vec3 {
   return { x: mapAxis(mapping.x, p[mapping.x.from]), y: mapAxis(mapping.y, p[mapping.y.from]), z: mapAxis(mapping.z, p[mapping.z.from]) };
+}
+export function mapPointOpen(mapping: SpaceMapping, p: Vec3): Vec3 {
+  return { x: mapAxisOpen(mapping.x, p[mapping.x.from]), y: mapAxisOpen(mapping.y, p[mapping.y.from]), z: mapAxisOpen(mapping.z, p[mapping.z.from]) };
 }
 
 /** Map a source-frame box; corners may swap under mirroring so min/max are recomputed. */
@@ -73,8 +79,9 @@ export function mapBox(mapping: SpaceMapping, box: Box3): Box3 {
 /** Scale factor from a source axis interval onto sim [0, 1] (radii are scaled by the sim x axis's source). */
 export function axisScale(map: AxisMap): number { return 1 / Math.abs(map.high - map.low); }
 
+/** Capsules are not clamped: a bone crossing the box edge keeps its length and direction instead of being crushed flat against the wall. */
 export function mapCapsule(mapping: SpaceMapping, c: Capsule): Capsule {
-  return { a: mapPoint(mapping, c.a), b: mapPoint(mapping, c.b), radius: c.radius * axisScale(mapping.x) };
+  return { a: mapPointOpen(mapping, c.a), b: mapPointOpen(mapping, c.b), radius: c.radius * axisScale(mapping.x) };
 }
 
 export function mapObservation(mapping: SpaceMapping, o: HandObservation): HandObservation {

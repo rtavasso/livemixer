@@ -25,7 +25,7 @@ import { BroadcastTransport, WebSocketTransport, WindowTransport } from '../tele
 import type { HandTelemetry, TelemetryFrame, TelemetrySchema } from '../telemetry/types';
 import { FixedStepper, RateMeter } from './loop';
 import { findSimulation, SIMULATIONS, validateRegistry, type AnySimulation } from './registry';
-import { defaultMapping, SettingsStore, type Settings } from './settings';
+import { defaultMapping, SettingsStore, type Settings, type SolidChoice } from './settings';
 
 export interface HostWarning { atMs: number; message: string }
 export interface HostPerf { fps: number; stepMs: number; renderMs: number; steps: number; droppedMs: number }
@@ -47,6 +47,8 @@ export interface HostState {
   dpr: number;
   width: number; height: number;
   quality: Quality;
+  /** Which solid the simulation is handed (settings); telemetry always reports the tracker's full state. */
+  solid: SolidChoice;
   recording: { active: boolean; frames: number };
   telemetry: { sent: number; rateHz: number; transports: { id: string; status: { connected: boolean; detail: string } }[] };
   contextLost: boolean;
@@ -222,6 +224,8 @@ export class SimHost {
   /** The volume's depth in uniform units; instances are rebuilt because they size their worlds from it. */
   setVolumeDepth(depth: number) { this.settings.update(s => { s.volumeDepth = Math.min(3, Math.max(.25, depth)); }); this.createInstance(); }
   setMaxDpr(dpr: number) { this.settings.update(s => { s.maxDpr = Math.min(3, Math.max(.5, dpr)); }); this.resize(true); }
+  /** Takes effect on the next step; the instance keeps running since simulations handle any mix of scan and capsules. */
+  setSolid(solid: SolidChoice) { this.settings.update(s => { s.solid = solid; }); this.notify(); }
 
   async setSource(id: SourceId, options: { recording?: string } = {}): Promise<void> {
     if (!SOURCE_IDS.includes(id)) throw new Error(`Unknown source "${id}".`);
@@ -357,14 +361,15 @@ export class SimHost {
       return;
     }
     this.resize();
-    const primary = this.tracked.hands[0] ?? null;
+    const { hands, volume, surface } = this.simSolid();
+    const primary = hands[0] ?? null;
     const stepStart = this.now();
     let stepped = false;
     let result;
     try {
       result = this.stepper.advance(now, dt => {
         this.simTime += dt;
-        const input: SimInput = { time: this.simTime, dt, hands: this.tracked.hands, primary, events: stepped ? [] : this.pendingEvents, presence: this.tracked.presence, activity: this.tracked.activity, occupancy: this.tracked.occupancy, volume: this.tracked.volume, surface: this.tracked.surface };
+        const input: SimInput = { time: this.simTime, dt, hands, primary, events: stepped ? [] : this.pendingEvents, presence: this.tracked.presence, activity: this.tracked.activity, occupancy: this.tracked.occupancy, volume, surface };
         this.instance!.step(input, this.params as never);
         stepped = true;
       });
@@ -381,6 +386,17 @@ export class SimHost {
     const renderEnd = this.now();
     this.perf = { fps: this.fps.value, stepMs: this.perf.stepMs + .1 * (stepEnd - stepStart - this.perf.stepMs), renderMs: this.perf.renderMs + .1 * (renderEnd - stepEnd - this.perf.renderMs), steps: result.steps, droppedMs: result.droppedMs };
     if (this.bus.publishFrame(now, () => this.telemetryFrame(now))) { this.lastEvents = this.frameEvents; this.frameEvents = []; }
+  }
+
+  /**
+   * The solid the simulation sees this frame, per the `solid` setting. Hands are copied, never
+   * mutated: the tracker's state (and telemetry, which reads it) keeps the full description.
+   */
+  private simSolid(): { hands: HandState[]; volume: TrackedInput['volume']; surface: TrackedInput['surface'] } {
+    const t = this.tracked, solid = this.settings.value.solid;
+    if (solid === 'scan') return { hands: t.hands.map(h => h.capsules.length ? { ...h, capsules: [] } : h), volume: t.volume, surface: t.surface };
+    if (solid === 'skeleton') return { hands: t.hands, volume: null, surface: null };
+    return { hands: t.hands, volume: t.volume, surface: t.surface };
   }
 
   // ------------------------------------------------------------------ telemetry
@@ -414,7 +430,7 @@ export class SimHost {
       simulation: this.definition, params: this.params, signals: this.signals, signalViolations: this.signalViolations,
       source: this.source, sourceId: this.sourceId, tracked: this.tracked, events: this.lastEvents, mapping: this.tracker.mapping, calibration: this.calibration,
       perf: this.perf, warnings: this.warnings, gpu: this.gpu, dpr: Math.min(this.settings.value.maxDpr, window.devicePixelRatio || 1), width: this.canvas.width, height: this.canvas.height,
-      quality: this.settings.value.quality, recording: { active: this.recording, frames: this.recorder.length },
+      quality: this.settings.value.quality, solid: this.settings.value.solid, recording: { active: this.recording, frames: this.recorder.length },
       telemetry: { sent: this.bus.sent, rateHz: this.bus.rateHz, transports: this.bus.transportStatus() }, contextLost: this.contextLost,
     };
   }

@@ -33,12 +33,14 @@ import numpy as np  # noqa: E402
 import depth_bridge as db  # noqa: E402
 import leap_source as lsrc  # noqa: E402
 import leap_stereo as ls  # noqa: E402
-from test_bridge import ProtocolAssertions, grid_sizes  # noqa: E402
+from test_bridge import TRACKED_HAND_KEYS, ProtocolAssertions, grid_sizes  # noqa: E402
 
 VIEW = ls.RectifiedView(320, 240, 1.0)  # f = 160 px, +-45 deg
 MODEL = ls.FisheyeModel()               # 640x240 raw stand-in, principal points 4 px apart
 NEAR_MM, FAR_MM = 100.0, 450.0
 BOX = db.BoxConfig(near_m=NEAR_MM / 1000.0, far_m=FAR_MM / 1000.0)
+BASELINE = ls.CONTROLLER_BASELINE_MM
+TRUTHS = ("u+x_v-z_ref-", "u-x_v+z_ref+", "u+z_v+x_ref-")  # the default, its mirror image, and a transposed one
 
 
 def sphere_scene(z: float, x: float = 20.0, y: float = -10.0, radius: float = 40.0, **kw: object) -> ls.SyntheticStereoScene:
@@ -286,6 +288,21 @@ class ReorientTests(unittest.TestCase):
             ls.reorient(img, "upside")
         self.assertEqual(ls.ORIENTATIONS, db.LEAP_ORIENTATIONS, "the CLI choices mirror the maths module")
 
+    def test_reorient_points_follows_the_pixels(self) -> None:
+        """A marked pixel moved by ``reorient`` is found again where ``reorient_points`` sends its coordinates."""
+        for name in ls.ORIENTATIONS:
+            for (row, col) in ((0, 0), (1, 2), (3, 4), (2, 1)):
+                img = np.zeros((4, 5), dtype=np.uint16)
+                img[row, col] = 9
+                out = ls.reorient(img, name)
+                u, v = ls.reorient_points(float(col), float(row), 5, 4, name)
+                self.assertEqual(int(out[int(v), int(u)]), 9, f"{name} ({row}, {col})")
+        u, v = ls.reorient_points(np.array([-1.0, 4.5]), np.array([0.5, -2.0]), 5, 4, "rot90")  # affine: off-image points move too
+        self.assertEqual(u.tolist(), [3.0 - 0.5, 3.0 + 2.0])
+        self.assertEqual(v.tolist(), [-1.0, 4.5])
+        with self.assertRaises(ValueError):
+            ls.reorient_points(0.0, 0.0, 5, 4, "upside")
+
 
 # ---- synthetic scene ------------------------------------------------------- #
 
@@ -333,6 +350,32 @@ class SceneTests(unittest.TestCase):
             for shape in ls.hand_shapes(float(t)):
                 if isinstance(shape, ls.Sphere):
                     self.assertTrue(219.0 <= shape.centre[2] <= 351.0, f"t={t}: the fist stays inside the default box heights")
+
+    def test_hand_skeleton_sits_on_the_shapes(self) -> None:
+        self.assertIsNone(ls.hand_skeleton(12.0))
+        self.assertEqual(ls.SKELETON_JOINTS, db.N_JOINTS)
+        self.assertEqual(ls.SKELETON_WIDTHS, db.N_WIDTHS)
+        for t in (0.0, 2.0, 5.0):
+            sk = ls.hand_skeleton(t)
+            assert sk is not None
+            self.assertEqual(sk.points.shape, (db.N_JOINTS, 3))
+            self.assertEqual(sk.widths_mm.shape, (db.N_WIDTHS,))
+            self.assertTrue((sk.widths_mm > 0).all())
+            self.assertFalse(sk.extended.any(), "a fist")
+            fist = next(s for s in ls.hand_shapes(t) if isinstance(s, ls.Sphere))
+            forearm = next(s for s in ls.hand_shapes(t) if isinstance(s, ls.Capsule))
+            centre = np.asarray(fist.centre)
+            palm = sk.points[db.JOINT_PALM]
+            self.assertTrue(np.allclose(palm, centre + (0.0, 0.0, -fist.radius)), "the palm is the fist's lowest point")
+            finger_pts = sk.points[db.FINGER_JOINTS:]
+            self.assertTrue(np.allclose(np.linalg.norm(finger_pts - centre, axis=1), fist.radius), "finger joints lie on the fist")
+            self.assertTrue((finger_pts[:, 2] < centre[2]).all(), "on its underside, where the cameras look")
+            a, b = np.asarray(forearm.a), np.asarray(forearm.b)
+            axis = (b - a) / np.linalg.norm(b - a)
+            for joint in (sk.points[db.JOINT_WRIST], sk.points[db.JOINT_ELBOW]):
+                foot = a + np.clip((joint - a) @ axis, 0.0, np.linalg.norm(b - a)) * axis
+                self.assertAlmostEqual(float(np.linalg.norm(joint - foot)), forearm.radius, places=6, msg="wrist and elbow lie on the forearm's surface")
+                self.assertLess(float(joint[2]), float(foot[2]), "below its axis")
 
 
 # ---- the box, through BoxAnalyzer ------------------------------------------ #
@@ -415,8 +458,71 @@ class LeapSyntheticSourceTests(unittest.TestCase):
         a, b = src.read(), src.read()
         self.assertEqual(a.depth_mm.shape, (320, 240))
         self.assertGreaterEqual(b.timestamp, a.timestamp)
+        assert a.hands is not None
+        self.assertEqual(len(a.hands), 1, "read() carries the skeleton, reoriented with the image")
+        self.assertGreater(lsrc.joint_hits(a.hands[0].joints[lsrc.SCORED_JOINTS], a.depth_mm, 30.0), 24)
         with self.assertRaises(ValueError):
             lsrc.LeapSyntheticSource(VIEW, orient="sideways")
+        with self.assertRaises(ValueError):
+            lsrc.LeapSyntheticSource(VIEW, hand_frame="sideways")
+        with self.assertRaises(ValueError):
+            lsrc.LeapSyntheticSource(VIEW, true_frame="sideways")
+        self.assertIsNone(lsrc.LeapSyntheticSource(VIEW, paced=False, skeletons=False).frame_at(2.0).hands, "a source without tracking sends None")
+
+    def test_skeleton_lies_on_the_rendered_hand(self) -> None:
+        """Under its true convention the projected skeleton lands on the scan: exact on the truth depth, close on SGBM's."""
+        for truth in TRUTHS:
+            src = lsrc.LeapSyntheticSource(VIEW, paced=False, hand_frame=truth, true_frame=truth)
+            for t in (0.0, 1.0, 2.5):
+                frame = src.frame_at(t)
+                assert frame.hands is not None
+                self.assertEqual(len(frame.hands), 1)
+                hand = frame.hands[0]
+                self.assertEqual((hand.id, hand.type), (1, "right"))
+                self.assertEqual(hand.grab_strength, 1.0, "a fist")
+                _, truth_depth = src.scene(t).render_pinhole(src.reference_camera, VIEW)
+                scored = hand.joints[lsrc.SCORED_JOINTS]
+                self.assertEqual(lsrc.joint_hits(scored, np.rint(truth_depth).astype(np.uint16), 3.0), len(scored), f"{truth} t={t}: every joint is on the rendered surface")
+                self.assertGreaterEqual(lsrc.joint_hits(scored, frame.depth_mm, 30.0), len(scored) - 2, f"{truth} t={t}: and on the stereo scan within 30 mm")
+                self.assertTrue((hand.widths_px > 0).all())
+                fist = next(s for s in ls.hand_shapes(t) if isinstance(s, ls.Sphere))
+                self.assertAlmostEqual(float(hand.widths_px[db.WIDTH_PALM]), 1.6 * fist.radius * VIEW.fx / float(hand.joints[db.JOINT_PALM, 2]), places=6, msg="widths are width * fx / depth")
+                elbow, wrist = hand.joints[db.JOINT_ELBOW], hand.joints[db.JOINT_WRIST]
+                self.assertLess(float(np.hypot(elbow[0] - wrist[0], elbow[1] - wrist[1])), 70.0 * VIEW.fx / 150.0, "the forearm is a stub")
+            self.assertEqual(src.device_hands(12.0), ())
+        # The device-frame skeleton really is the scene skeleton seen from the reference camera.
+        src = lsrc.LeapSyntheticSource(VIEW, paced=False, hand_frame=TRUTHS[1], true_frame=TRUTHS[1])
+        device = src.device_hands(2.0)[0].joints
+        scene = ls.hand_skeleton(2.0)
+        assert scene is not None
+        origin = src.scene(2.0).camera_origin(ls.CAMERA_LEFT)
+        expected_u, expected_v = VIEW.ray_to_pixel((scene.points[:, 0] - origin[0]) / scene.points[:, 2], scene.points[:, 1] / scene.points[:, 2])
+        projected = src.projector.project(device)
+        self.assertTrue(np.allclose(projected[:, 0], expected_u) and np.allclose(projected[:, 1], expected_v) and np.allclose(projected[:, 2], scene.points[:, 2]))
+
+    def test_auto_mode_finds_the_true_convention(self) -> None:
+        for truth in TRUTHS:
+            src = lsrc.LeapSyntheticSource(VIEW, paced=False, hand_frame="auto", true_frame=truth)
+            detector = src.projector.detector
+            assert detector is not None
+            self.assertIsNone(detector.locked)
+            for t in np.arange(0.5, 4.0, 0.25):
+                frame = src.frame_at(float(t))
+                assert frame.hands is not None
+                self.assertEqual(len(frame.hands), 1, "hands are reported with the provisional best while scoring")
+                if detector.locked is not None:
+                    break
+            self.assertIsNotNone(detector.locked, f"{truth}: {detector.table()}")
+            assert detector.locked is not None
+            self.assertEqual(detector.locked.name, truth, detector.table())
+            self.assertEqual(detector.locked_after, detector.min_frames, "a clean scene locks as soon as allowed")
+            self.assertGreaterEqual(float(detector.scores.max()), 0.95)
+            self.assertIn("locked", src.projector.describe())
+            self.assertIn(truth, detector.table().splitlines()[1])
+            self.assertTrue(src.projector.locked)
+            after = detector.frames
+            src.frame_at(4.5)
+            self.assertEqual(detector.frames, after, "a locked detector stops scoring")
 
 
 class LeapBindingTests(unittest.TestCase):
@@ -434,6 +540,70 @@ class LeapBindingTests(unittest.TestCase):
         info = lsrc.LeapDeviceInfo(3, 40000, 2.3, 2.0, 470000, "LP0", 0, 0)
         self.assertEqual(info.baseline_mm, 40.0)
         self.assertEqual(info.type_name, "Leap Motion Controller")
+
+    def test_tracking_struct_layouts(self) -> None:
+        """LeapC.h is ``#pragma pack(1)``: LEAP_HAND is 1084 bytes (1088 would be x64 natural alignment) and the event 48."""
+        self.assertEqual(C.sizeof(lsrc._Quaternion), 16)
+        self.assertEqual(C.sizeof(lsrc._Bone), 44)
+        self.assertEqual(C.sizeof(lsrc._Digit), 184)
+        self.assertEqual(C.sizeof(lsrc._Palm), 80)
+        self.assertEqual(C.sizeof(lsrc._Hand), 1084)
+        self.assertEqual(C.sizeof(lsrc._TrackingEvent), 48)
+        self.assertEqual((lsrc._Hand.visible_time.offset, lsrc._Hand.palm.offset, lsrc._Hand.digits.offset, lsrc._Hand.arm.offset), (16, 40, 120, 1040))
+        self.assertEqual((lsrc._Digit.bones.offset, lsrc._Digit.is_extended.offset), (4, 180))
+        self.assertEqual((lsrc._Palm.width.offset, lsrc._Palm.direction.offset, lsrc._Palm.orientation.offset), (48, 52, 64))
+        self.assertEqual((lsrc._TrackingEvent.tracking_frame_id.offset, lsrc._TrackingEvent.nHands.offset, lsrc._TrackingEvent.pHands.offset, lsrc._TrackingEvent.framerate.offset), (24, 32, 36, 44))
+
+    @staticmethod
+    def make_hand(hand_id: int, hand_type: int, palm: tuple[float, float, float] = (10.0, 300.0, -20.0)) -> lsrc._Hand:
+        h = lsrc._Hand()
+        h.id, h.type, h.confidence, h.grab_strength, h.pinch_strength = hand_id, hand_type, 0.9, 0.3, 0.1
+        px, py, pz = palm
+        h.palm.position, h.palm.width = lsrc._Vector(px, py, pz), 85.0
+        h.palm.normal, h.palm.direction = lsrc._Vector(0.0, -1.0, 0.0), lsrc._Vector(0.0, 0.0, -1.0)
+        h.arm.next_joint, h.arm.prev_joint, h.arm.width = lsrc._Vector(px, py, pz + 60.0), lsrc._Vector(px, py + 20.0, pz + 300.0), 55.0
+        for f in range(5):
+            digit = h.digits[f]
+            digit.finger_id, digit.is_extended = f, f % 2
+            for b in range(4):
+                digit.bones[b].prev_joint = lsrc._Vector(px + 10.0 * f, py + 10.0 * b, pz - 20.0)
+                digit.bones[b].next_joint = lsrc._Vector(px + 10.0 * f, py + 10.0 * b + 10.0, pz - 20.0)
+                digit.bones[b].width = 15.0 + b
+        return h
+
+    def test_tracking_event_is_copied_into_device_hands(self) -> None:
+        hands = (lsrc._Hand * 2)(self.make_hand(3, 0), self.make_hand(4, 1, (-40.0, 250.0, 30.0)))
+        event = lsrc._TrackingEvent()
+        event.info.timestamp, event.info.frame_id, event.nHands, event.framerate = 123456, 9, 2, 110.0
+        event.pHands = C.cast(hands, C.POINTER(lsrc._Hand))
+        frame = lsrc.read_tracking_event(event)
+        self.assertEqual((frame.timestamp_us, frame.frame_id, frame.framerate), (123456, 9, 110.0))
+        self.assertEqual([(h.id, h.type) for h in frame.hands], [(3, "left"), (4, "right")])
+        left = frame.hands[0]
+        self.assertEqual(left.joints.shape, (db.N_JOINTS, 3))
+        self.assertEqual(left.joints[db.JOINT_PALM].tolist(), [10.0, 300.0, -20.0])
+        self.assertEqual(left.joints[db.JOINT_WRIST].tolist(), [10.0, 300.0, 40.0], "wrist = arm.next_joint")
+        self.assertEqual(left.joints[db.JOINT_ELBOW].tolist(), [10.0, 320.0, 280.0], "elbow = arm.prev_joint")
+        for f in range(5):
+            for j in range(4):
+                self.assertEqual(left.joints[db.finger_joint(f, j)].tolist(), [10.0 + 10.0 * f, 300.0 + 10.0 * j, -40.0], "carp, mcp, pip, dip are the bones' prev_joints")
+            self.assertEqual(left.joints[db.finger_joint(f, 4)].tolist(), [10.0 + 10.0 * f, 340.0, -40.0], "the tip is the distal bone's next_joint")
+        self.assertEqual(left.widths_mm.tolist(), [85.0, 55.0, 16.0, 16.0, 16.0, 16.0, 16.0], "a finger's width is its proximal bone's")
+        self.assertEqual(left.extended.tolist(), [False, True, False, True, False])
+        self.assertAlmostEqual(left.confidence, 0.9, places=6)
+        self.assertAlmostEqual(left.grab_strength, 0.3, places=6)
+        self.assertAlmostEqual(left.pinch_strength, 0.1, places=6)
+        self.assertEqual(frame.hands[1].joints[db.JOINT_PALM].tolist(), [-40.0, 250.0, 30.0], "the second hand is read at the packed stride")
+        # Defensive: an impossible count, a null pointer or garbage numbers never become hands.
+        event.nHands = lsrc.MAX_TRACKED_HANDS + 1
+        self.assertEqual(lsrc.read_tracking_event(event).hands, ())
+        event.nHands, event.pHands = 2, C.POINTER(lsrc._Hand)()
+        self.assertEqual(lsrc.read_tracking_event(event).hands, ())
+        hands[0].palm.position = lsrc._Vector(float("nan"), 300.0, -20.0)
+        hands[1].digits[2].bones[3].next_joint = lsrc._Vector(0.0, 1e6, 0.0)
+        event.pHands = C.cast(hands, C.POINTER(lsrc._Hand))
+        self.assertEqual(lsrc.read_tracking_event(event).hands, ())
+        self.assertEqual(lsrc.read_hand(self.make_hand(5, 7)).type, "unknown")  # type: ignore[union-attr]
 
     def test_library_search(self) -> None:
         with self.assertRaises(RuntimeError) as ctx:
@@ -488,7 +658,175 @@ class LeapBindingTests(unittest.TestCase):
         expected = ls.StereoDepth(40.0, VIEW.fx).compute(*ls.Rectifier(MODEL.ray_to_pixel, MODEL.width, MODEL.height, VIEW).rectify_pair(raw_left, raw_right))
         self.assertTrue(np.array_equal(frame.depth_mm, expected))
         self.assertEqual(len(analyzer().analyze(frame).blobs), 1)
+        self.assertEqual(frame.hands, (), "no tracking event yet: no hands, still a tracking source")
+        assert src.projector is not None
+        self.assertIn("auto", src.state())
+        # A tracking frame near the pair's timestamp lends its hands; a stale one does not.
+        hand = LeapBindingTests.make_hand(3, 1, (20.0, 300.0, -10.0))
+        hands = (lsrc._Hand * 1)(hand)
+        event = lsrc._TrackingEvent()
+        event.info.timestamp, event.nHands, event.pHands = 1_000_000, 1, C.cast(hands, C.POINTER(lsrc._Hand))
+        src._on_tracking(event)
+        self.assertEqual(src.tracking_frames, 1)
+        self.assertIn("tracking=1 frames, 1 hand(s)", src.state())
+        with src._cond:
+            src._latest = lsrc.StereoPair(raw_left, raw_right, matrix_version=5, frame_id=2, timestamp=12.6, seq=2, timestamp_us=1_020_000)
+        frame = src.read()
+        assert frame.hands is not None
+        self.assertEqual([(h.id, h.type) for h in frame.hands], [(3, "right")])
+        self.assertTrue(np.isfinite(frame.hands[0].joints).all())
+        with src._cond:
+            src._latest = lsrc.StereoPair(raw_left, raw_right, matrix_version=5, frame_id=3, timestamp=12.7, seq=3, timestamp_us=1_200_000)
+        self.assertEqual(src.read().hands, (), "200 ms later the skeleton is stale")
         src._thread = None
+
+
+# ---- the skeleton's device-to-image projection --------------------------------- #
+
+
+def device_hand(palm: tuple[float, float, float], spread_mm: float = 40.0, hand_id: int = 1) -> lsrc.DeviceHand:
+    """A device-frame hand around ``palm`` (mm: x along the baseline, y up, z toward the performer), fingers toward -z."""
+    joints = np.tile(np.asarray(palm, dtype=np.float64), (db.N_JOINTS, 1))
+    joints[db.JOINT_WRIST] += (0.0, 0.0, spread_mm)
+    joints[db.JOINT_ELBOW] += (0.0, 40.0, 250.0)
+    for f in range(db.N_FINGERS):
+        for j in range(db.JOINTS_PER_FINGER):
+            along = (j + 1) / db.JOINTS_PER_FINGER
+            joints[db.finger_joint(f, j)] += ((f - 2) * spread_mm / 2.0 * along, -8.0 * along, -spread_mm * along)
+    widths = np.array([85.0, 55.0, 18.0, 17.0, 17.0, 16.0, 14.0])
+    return lsrc.DeviceHand(hand_id, "right", 0.8, 0.2, 0.0, joints, widths, np.ones(5, dtype=bool))
+
+
+def painted_depth(projected: np.ndarray, shape: tuple[int, int] = (240, 320), radius: int = 3) -> np.ndarray:
+    """A depth image holding each projected joint's depth in a small square around its pixel, 0 elsewhere."""
+    depth = np.zeros(shape, dtype=np.uint16)
+    for u, v, d in projected:
+        if np.isfinite(u) and np.isfinite(v) and 0 <= u < shape[1] and 0 <= v < shape[0]:
+            ui, vi = int(round(u)), int(round(v))
+            depth[max(0, vi - radius):vi + radius + 1, max(0, ui - radius):ui + radius + 1] = int(round(d))
+    return depth
+
+
+class HandFrameTests(unittest.TestCase):
+    def test_sixteen_named_candidates_with_the_plausible_ones_first(self) -> None:
+        self.assertEqual(len(lsrc.HAND_FRAMES), 16)
+        self.assertEqual(len(set(lsrc.HAND_FRAME_NAMES)), 16)
+        self.assertEqual(lsrc.DEFAULT_HAND_FRAME, "u+x_v-z_ref-")
+        self.assertEqual([f.plausible for f in lsrc.HAND_FRAMES][:4], [True] * 4)
+        self.assertEqual(sum(f.plausible for f in lsrc.HAND_FRAMES), 4, "u along the baseline with the reference camera on the low-u side")
+        for frame in lsrc.HAND_FRAMES:
+            self.assertIs(lsrc.HAND_FRAME_BY_NAME[frame.name], frame)
+            self.assertEqual({frame.u_axis, frame.v_axis}, {0, 2})
+        self.assertEqual(lsrc.HandFrame(0, 1, 2, -1, -1).name, "u+x_v-z_ref-")
+        self.assertEqual(lsrc.HandFrame(2, -1, 0, 1, 1).name, "u-z_v+x_ref+")
+        with self.assertRaises(ValueError):
+            lsrc.HandFrame(0, 1, 1, -1, -1)
+        with self.assertRaises(ValueError):
+            lsrc.HandFrame(0, 2, 2, -1, -1)
+        self.assertEqual(lsrc.HAND_FRAMES[0].reference_sign(False), -1)
+        self.assertEqual(lsrc.HAND_FRAMES[0].reference_sign(True), 1, "--swap-cameras makes the other camera the reference")
+
+    def test_projection_round_trips_through_the_view(self) -> None:
+        rng = np.random.default_rng(3)
+        points = rng.uniform(-150.0, 150.0, (40, 3))
+        points[:, 1] = rng.uniform(120.0, 420.0, 40)  # above the device
+        for frame in lsrc.HAND_FRAMES:
+            for swap in (False, True):
+                ref = frame.reference_sign(swap)
+                cam = frame.device_to_camera(points, ref, BASELINE)
+                self.assertTrue(np.allclose(frame.camera_to_device(cam, ref, BASELINE), points), frame.name)
+                image = lsrc.project_hand_points(points, frame, VIEW, BASELINE, swap)
+                self.assertTrue(np.allclose(image[:, 2], points[:, 1]), "depth is the height above the device")
+                tx, ty = VIEW.pixel_to_ray(image[:, 0], image[:, 1])  # the view's own ray through that pixel...
+                back = frame.camera_to_device(np.stack([tx * image[:, 2], ty * image[:, 2], image[:, 2]], axis=-1), ref, BASELINE)
+                self.assertTrue(np.allclose(back, points), f"{frame.name} swap={swap}: ...times the depth is the device point again")
+                straight_up = np.array([[ref * BASELINE / 2.0, 300.0, 0.0]])  # right above the reference camera
+                u, v, _ = lsrc.project_hand_points(straight_up, frame, VIEW, BASELINE, swap)[0]
+                self.assertAlmostEqual(float(u), VIEW.cx - 0.5)
+                self.assertAlmostEqual(float(v), VIEW.cy - 0.5)
+        default = lsrc.HAND_FRAMES[0]
+        image = lsrc.project_hand_points(np.array([[100.0, 200.0, -50.0]]), default, VIEW, BASELINE)
+        self.assertGreater(float(image[0, 0]), VIEW.cx, "u+x: +x is image right")
+        self.assertGreater(float(image[0, 1]), VIEW.cy, "v-z: -z (away from the performer) is image down")
+        low = lsrc.project_hand_points(np.array([[0.0, 0.0, 0.0], [0.0, -5.0, 0.0]]), default, VIEW, BASELINE)
+        self.assertTrue(np.isnan(low[:, :2]).all(), "on or below the device plane there is no pixel")
+
+    def test_projection_follows_the_image_orientation(self) -> None:
+        hand = device_hand((60.0, 300.0, -40.0))
+        for orient in ls.ORIENTATIONS:
+            plain = lsrc.project_hand_points(hand.joints, lsrc.HAND_FRAMES[0], VIEW, BASELINE)
+            turned = lsrc.project_hand_points(hand.joints, lsrc.HAND_FRAMES[0], VIEW, BASELINE, orient=orient)
+            depth = ls.reorient(painted_depth(plain), orient)
+            self.assertEqual(lsrc.joint_hits(turned, depth, 1.0), db.N_JOINTS, orient)
+
+    def test_forearm_stub_widths_and_hits(self) -> None:
+        self.assertTrue(np.allclose(lsrc.trim_forearm(np.zeros(3), np.array([0.0, 0.0, 300.0])), [0.0, 0.0, 70.0]))
+        self.assertTrue(np.allclose(lsrc.trim_forearm(np.zeros(3), np.array([0.0, 0.0, 50.0])), [0.0, 0.0, 50.0]), "an arm already shorter than the stub is kept")
+        projector = lsrc.HandProjector(VIEW, BASELINE, hand_frame=lsrc.DEFAULT_HAND_FRAME)
+        hand = device_hand((60.0, 300.0, -40.0))
+        tracked = projector.to_image_hand(hand)
+        assert tracked is not None
+        self.assertEqual((tracked.id, tracked.type, tracked.confidence, tracked.grab_strength), (1, "right", 0.8, 0.2))
+        self.assertAlmostEqual(float(tracked.widths_px[db.WIDTH_PALM]), 85.0 * VIEW.fx / 300.0, places=6, msg="palm width in pixels at the palm's depth")
+        self.assertAlmostEqual(float(tracked.widths_px[db.WIDTH_ARM]), 55.0 * VIEW.fx / 300.0, places=6)
+        finger_depth = tracked.finger(1)[:, 2].mean()
+        self.assertAlmostEqual(float(tracked.widths_px[db.WIDTH_FINGERS + 1]), 17.0 * VIEW.fx / finger_depth, places=6, msg="a finger's width at its mean depth")
+        elbow, wrist = tracked.joints[db.JOINT_ELBOW], tracked.joints[db.JOINT_WRIST]
+        self.assertAlmostEqual(float(np.linalg.norm(hand.joints[db.JOINT_WRIST] - hand.joints[db.JOINT_ELBOW])), float(np.hypot(40.0, 210.0)))
+        self.assertLess(abs(float(elbow[2] - wrist[2])), 70.0, "the elbow is a stub 70 mm past the wrist")
+        self.assertIsNone(projector.to_image_hand(device_hand((0.0, 5.0, 0.0))), "fingertips reaching below the device plane: not a hand this camera can see")
+        projected = projector.project(hand.joints)
+        self.assertEqual(lsrc.joint_hits(projected, painted_depth(projected), 1.0), db.N_JOINTS)
+        self.assertEqual(lsrc.joint_hits(projected, painted_depth(projected) + np.uint16(40), 30.0), 0, "the depth must agree within the tolerance")
+        self.assertEqual(lsrc.joint_hits(projected, np.zeros((240, 320), np.uint16), 30.0), 0, "an empty scan never hits")
+        self.assertEqual(lsrc.joint_hits(projected + np.array([1000.0, 0.0, 0.0]), painted_depth(projected), 30.0), 0, "off-image joints never hit")
+        self.assertEqual(projector.describe(), "u+x_v-z_ref- (fixed)")
+        with self.assertRaises(ValueError):
+            lsrc.HandProjector(VIEW, BASELINE, hand_frame="u+y_v-z_ref-")
+
+
+class HandFrameDetectorTests(unittest.TestCase):
+    def test_locks_on_the_convention_that_puts_joints_on_the_scan(self) -> None:
+        for truth in TRUTHS:
+            frame_true = lsrc.HAND_FRAME_BY_NAME[truth]
+            detector = lsrc.HandFrameDetector(min_frames=5)
+            projector = lsrc.HandProjector(VIEW, BASELINE, hand_frame="auto", detector=detector)
+            self.assertEqual(projector.frame, lsrc.HAND_FRAMES[0], "before any evidence the default is the provisional pick")
+            self.assertIn("nothing scored yet", projector.describe())
+            for i, x in enumerate((-80.0, -40.0, 0.0, 40.0, 80.0, 60.0)):
+                hand = device_hand((x, 280.0 + 10.0 * i, -30.0 + 15.0 * i))
+                depth = painted_depth(lsrc.project_hand_points(hand.joints, frame_true, VIEW, BASELINE))
+                tracked = projector.resolve((hand,), depth)
+                self.assertEqual(len(tracked), 1)
+                if detector.locked is not None:
+                    break
+            self.assertIsNotNone(detector.locked, detector.table())
+            assert detector.locked is not None
+            self.assertEqual(detector.locked.name, truth, detector.table())
+            self.assertEqual(detector.locked_after, 5)
+            self.assertEqual(float(detector.scores[lsrc.HAND_FRAMES.index(frame_true)]), 1.0)
+            self.assertIs(projector.frame, frame_true)
+            self.assertTrue(projector.locked)
+            self.assertIn("locked after 5 frames", projector.describe())
+            self.assertEqual(detector.table().splitlines()[1].split()[0], truth)
+
+    def test_uninformative_frames_do_not_count_and_a_tie_does_not_lock(self) -> None:
+        detector = lsrc.HandFrameDetector(min_frames=2)
+        hand = device_hand((50.0, 300.0, -40.0))
+        self.assertIsNone(detector.observe(np.zeros((240, 320), np.uint16), lambda f: lsrc.project_hand_points(hand.joints, f, VIEW, BASELINE)))
+        self.assertEqual((detector.frames, detector.total), (0, 0), "an empty scan teaches nothing")
+        both = np.maximum(
+            painted_depth(lsrc.project_hand_points(hand.joints, lsrc.HAND_FRAME_BY_NAME["u+x_v-z_ref-"], VIEW, BASELINE)),
+            painted_depth(lsrc.project_hand_points(hand.joints, lsrc.HAND_FRAME_BY_NAME["u+x_v+z_ref-"], VIEW, BASELINE)),
+        )
+        for _ in range(4):
+            self.assertIsNone(detector.observe(both, lambda f: lsrc.project_hand_points(hand.joints, f, VIEW, BASELINE)))
+        self.assertIsNone(detector.locked, "two conventions fit equally well: keep scoring")
+        self.assertEqual(detector.frames, 4)
+        self.assertIn("leading", detector.describe())
+        self.assertEqual(detector.best.name, "u+x_v-z_ref-", "ties go to the more plausible candidate")
+        with self.assertRaises(ValueError):
+            lsrc.HandFrameDetector(candidates=())
 
 
 # ---- CLI --------------------------------------------------------------------- #
@@ -509,14 +847,27 @@ class DumpCliTests(ProtocolAssertions):
         self.assertEqual(hello["source"], "leap-synthetic")
         self.assertEqual(hello["box"]["z"], [0.1, 0.45], "the Leap sources default to the controller's range")
         self.assertEqual(grid_sizes(hello), ((32, 24), (32, 24, 16), (8, 6)))
+        self.assertIs(hello["skeleton"], True)
         for seq, frame in enumerate(frames):
             self.assert_frame(frame, *grid_sizes(hello))
             self.assertEqual(frame["seq"], seq)
             self.assertEqual(frame["stats"]["frameWidth"], 320.0)  # type: ignore[index]
+            self.assertEqual(frame["stats"]["trackedHands"], 1.0)  # type: ignore[index]
             self.assertEqual(len(frame["hands"]), 1, "the script starts with the hand above the device")  # type: ignore[arg-type]
+            hand = frame["hands"][0]  # type: ignore[index]
+            self.assertEqual(set(hand), TRACKED_HAND_KEYS)
+            self.assertEqual(hand["skeleton"]["type"], "right")
+            self.assertEqual(hand["openness"], 0.0, "a fist")
+            self.assertFalse(any(f["extended"] for f in hand["skeleton"]["fingers"]))
             surface = base64.b64decode(frame["surface"])  # type: ignore[arg-type]
             self.assertEqual(len(surface), 48)
             self.assertTrue(any(surface))
+        fixed = run_bridge("--source", "leap-synthetic", "--dump", "1", "--no-voxels", "--no-occupancy", "--no-surface", "--leap-hand-frame", "u-x_v+z_ref+")
+        self.assertEqual(fixed.returncode, 0, fixed.stderr)
+        self.assertEqual(len(json.loads(fixed.stdout.splitlines()[1])["hands"]), 1, "a fixed convention is used as given (here a wrong one, but it still projects)")
+        bad = run_bridge("--source", "leap-synthetic", "--dump", "1", "--leap-hand-frame", "u+y_v-z_ref-")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("unknown hand frame", bad.stderr)
 
     def test_range_flags_override_the_leap_defaults(self) -> None:
         proc = run_bridge("--source", "leap-synthetic", "--dump", "1", "--near", "0.2", "--far", "0.5", "--no-voxels", "--no-occupancy")
@@ -538,6 +889,20 @@ class DumpCliTests(ProtocolAssertions):
         self.assertEqual(names, sorted(f"leap_{i:03d}_{kind}.png" for i in range(2) for kind in ("left", "right", "depth", "depth_preview")))
         self.assertIn("in [100, 450] mm", proc.stderr)
         self.assertNotIn("--swap-cameras", proc.stderr, "the synthetic pair is in the right order")
+        self.assertRegex(proc.stderr, r"1 tracked hand\(s\), 2[5-7] of 27 joints on a scan pixel within 30 mm")
+        self.assertIn("hand frame candidates after 2 scored frames", proc.stderr, "auto mode prints the table")
+        table = proc.stderr.split("hand frame candidates")[1].splitlines()
+        leader = table[1].split()
+        self.assertEqual(leader[0], "u+x_v-z_ref-", table)
+        self.assertGreaterEqual(float(leader[1]), 0.9, "the truth leads even with the hand centred at t = 0")
+        self.assertIn("<- leading", table[1], "two frames are not enough to lock, so the table marks the leader")
+        self.assertLess(float(table[2].split()[1]), 0.8)
+        proc = subprocess.run([sys.executable, os.path.join(HERE, "leap_source.py"), "--synthetic", "--dump-images", "1", "--out", out, "--hand-frame", "u+x_v-z_ref-"], capture_output=True, text=True, timeout=120, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("hand frame u+x_v-z_ref- (fixed)", proc.stderr)
+        proc = subprocess.run([sys.executable, os.path.join(HERE, "leap_source.py"), "--synthetic", "--dump-images", "1", "--out", out, "--hand-frame", "nope"], capture_output=True, text=True, timeout=120, check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("unknown hand frame", proc.stderr)
 
 
 if __name__ == "__main__":

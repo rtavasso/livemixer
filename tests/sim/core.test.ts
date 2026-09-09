@@ -90,12 +90,14 @@ describe('registry', () => {
 
 describe('settings', () => {
   it('falls back per key on invalid stored data', () => {
-    const s = parseSettings({ sim: 'basin', quality: 'ultra', maxDpr: 'x', telemetry: { rateHz: 20 } });
-    expect(s.sim).toBe('basin'); expect(s.quality).toBe('medium'); expect(s.maxDpr).toBe(1.25); expect(s.telemetry.rateHz).toBe(20);
+    const s = parseSettings({ sim: 'basin', quality: 'ultra', maxDpr: 'x', solid: 'bogus', telemetry: { rateHz: 20 } });
+    expect(s.sim).toBe('basin'); expect(s.quality).toBe('medium'); expect(s.maxDpr).toBe(1.25); expect(s.solid).toBe('both'); expect(s.telemetry.rateHz).toBe(20);
+    expect(parseSettings({ solid: 'scan' }).solid).toBe('scan');
   });
   it('applies URL overrides', () => {
-    const s = applyUrlOverrides(parseSettings({}), '?sim=prism&source=depth&bridge=ws://cam:1&ws=ws://audio:2&overlay=0&quality=low&dpr=1&rate=15');
-    expect(s).toMatchObject({ sim: 'prism', source: 'depth', overlay: false, quality: 'low', maxDpr: 1, depth: { url: 'ws://cam:1' }, telemetry: { websocketUrl: 'ws://audio:2', rateHz: 15 } });
+    const s = applyUrlOverrides(parseSettings({}), '?sim=prism&source=depth&bridge=ws://cam:1&ws=ws://audio:2&overlay=0&quality=low&dpr=1&rate=15&solid=skeleton');
+    expect(s).toMatchObject({ sim: 'prism', source: 'depth', overlay: false, quality: 'low', maxDpr: 1, solid: 'skeleton', depth: { url: 'ws://cam:1' }, telemetry: { websocketUrl: 'ws://audio:2', rateHz: 15 } });
+    expect(applyUrlOverrides(parseSettings({}), '?solid=nope').solid).toBe('both');
   });
   it('persists through a storage shim', () => {
     const store: Record<string, string> = {};

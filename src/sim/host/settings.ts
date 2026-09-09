@@ -23,6 +23,12 @@ export const settingsSchema = z.object({
   maxDpr: z.number().min(.5).max(3).default(1.25),
   /** Depth of the simulation volume in uniform units (canvas height = 1). */
   volumeDepth: z.number().min(.25).max(3).default(1),
+  /**
+   * Which solid the simulations are given when a source knows both the depth scan and the hand
+   * skeleton: everything (simulations collide with the scan and read fingertips off the skeleton),
+   * the scan alone (capsules stripped), or the skeleton alone (scan and volume withheld).
+   */
+  solid: z.enum(['both', 'scan', 'skeleton']).default('both'),
   overlay: z.boolean().default(true),
   mappings: z.record(sourceId, spaceMappingSchema).default({}),
   params: z.record(z.string(), z.record(z.string(), z.union([z.number(), z.boolean(), z.string()]))).default({}),
@@ -40,6 +46,8 @@ export const settingsSchema = z.object({
   synthetic: z.object({ hands: z.union([z.literal(1), z.literal(2)]).default(1), speed: z.number().min(.1).max(5).default(1), surface: z.boolean().default(true) }).default({}),
 }).strict();
 export type Settings = z.infer<typeof settingsSchema>;
+export type SolidChoice = Settings['solid'];
+export const SOLID_CHOICES: readonly SolidChoice[] = ['both', 'scan', 'skeleton'];
 
 export const STORAGE_KEY = 'livemixer-sim-settings';
 
@@ -72,6 +80,7 @@ export function applyUrlOverrides(settings: Settings, search: string): Settings 
   const sim = q.get('sim'); if (sim) next.sim = sim;
   const source = q.get('source'); if (source && sourceId.safeParse(source).success) next.source = source as SourceId;
   const quality = q.get('quality'); if (quality === 'low' || quality === 'medium' || quality === 'high') next.quality = quality;
+  const solid = q.get('solid'); if (solid && (SOLID_CHOICES as readonly string[]).includes(solid)) next.solid = solid as SolidChoice;
   const overlay = q.get('overlay'); if (overlay !== null) next.overlay = overlay !== '0' && overlay !== 'false';
   const ws = q.get('ws'); if (ws !== null) next.telemetry.websocketUrl = ws;
   const bridge = q.get('bridge'); if (bridge) next.depth.url = bridge;

@@ -11,7 +11,12 @@
  * Conventions the schema cannot express:
  *  - Every `pos`, `extent` and `points` coordinate is expected in [0, 1]; the
  *    bridge clamps, and the browser's axis mapping clamps again, so a small
- *    overshoot is harmless rather than fatal.
+ *    overshoot is harmless rather than fatal. `skeleton` joints are the
+ *    exception: they are sent unclamped (a forearm leaves the box) and the
+ *    browser keeps them that way so bones are never crushed against a wall.
+ *  - A `skeleton` (bridges that track hands, `--source leap`) is projected into
+ *    the SAME normalized box as the depth scan, so the two coincide; its widths
+ *    are diameters as fractions of the box width at that depth.
  *  - The occupancy grid spans the SAME box as `pos` (the bridge's region of
  *    interest and depth range), not the whole camera image, so the browser
  *    can invert one set of axis maps for both.
@@ -27,12 +32,15 @@
  * the Python bridge has a fixture test against the same sample messages.
  */
 import { z } from 'zod';
+import { skeletonCapsules, skeletonPoints, type Skeleton } from './skeleton';
 import type { DepthSurface, HandObservation, InputFrame, OccupancyGrid, VoxelGrid } from './types';
 
 export const PROTOCOL_VERSION = 1;
 
 const unit = z.number().finite();
 const vec = z.tuple([unit, unit, unit]);
+/** A diameter as a fraction of the box width. Zero is tolerated (a line) rather than dropping the whole frame. */
+const width = unit.min(0);
 
 export const bridgeHelloSchema = z.object({
   type: z.literal('hello'),
@@ -49,6 +57,28 @@ export const bridgeHelloSchema = z.object({
   voxels: z.object({ nx: z.number().int().min(1).max(128), ny: z.number().int().min(1).max(128), nz: z.number().int().min(1).max(128) }).optional(),
   /** Depth surface size when the bridge sends the foreground scan. */
   surface: z.object({ width: z.number().int().min(1).max(512), height: z.number().int().min(1).max(512) }).optional(),
+  /** True when the bridge tracks hands and can attach a `skeleton` to them. */
+  skeleton: z.boolean().optional(),
+}).strict();
+
+/**
+ * A tracked hand skeleton in the box frame (same normalization as `pos`, joints NOT clamped).
+ * Widths are diameters in normalized u units. Fingers run thumb → pinky, joints wrist → tip.
+ */
+export const bridgeSkeletonSchema = z.object({
+  type: z.enum(['left', 'right', 'unknown']),
+  palm: vec,
+  wrist: vec,
+  /** Already trimmed by the bridge to a stub (≈70 mm) past the wrist. */
+  elbow: vec.optional(),
+  palmWidth: width.optional(),
+  armWidth: width.optional(),
+  fingers: z.array(z.object({
+    /** [carpal base, knuckle, proximal joint, distal joint, tip] */
+    joints: z.tuple([vec, vec, vec, vec, vec]),
+    width,
+    extended: z.boolean(),
+  }).strict()).length(5),
 }).strict();
 
 export const bridgeHandSchema = z.object({
@@ -62,6 +92,8 @@ export const bridgeHandSchema = z.object({
   pinch: unit.min(0).max(1).optional(),
   /** Optional sample points on the blob surface, same normalization as pos. */
   points: z.array(vec).max(256).optional(),
+  /** The tracked skeleton, when the bridge fits one; blob hands (tracking lost) omit it. */
+  skeleton: bridgeSkeletonSchema.optional(),
 }).strict();
 
 export const bridgeFrameSchema = z.object({
@@ -93,6 +125,7 @@ export const bridgeMessageSchema = z.discriminatedUnion('type', [bridgeHelloSche
 export type BridgeHello = z.infer<typeof bridgeHelloSchema>;
 export type BridgeFrame = z.infer<typeof bridgeFrameSchema>;
 export type BridgeHand = z.infer<typeof bridgeHandSchema>;
+export type BridgeSkeleton = z.infer<typeof bridgeSkeletonSchema>;
 export type BridgeMessage = z.infer<typeof bridgeMessageSchema>;
 
 export function parseBridgeMessage(text: string): BridgeMessage {
@@ -138,13 +171,28 @@ export function decodeVoxels(base64: string, nx: number, ny: number, nz: number)
 
 const v3 = (t: [number, number, number]) => ({ x: t[0], y: t[1], z: t[2] });
 
+/** The wire skeleton as the generic one (tuples → vectors; the frame and units already agree). */
+export function bridgeSkeleton(s: BridgeSkeleton): Skeleton {
+  return {
+    palm: v3(s.palm), wrist: v3(s.wrist), elbow: s.elbow ? v3(s.elbow) : undefined, palmWidth: s.palmWidth, armWidth: s.armWidth,
+    fingers: s.fingers.map(f => ({ joints: [v3(f.joints[0]), v3(f.joints[1]), v3(f.joints[2]), v3(f.joints[3]), v3(f.joints[4])], width: f.width, extended: f.extended })),
+  };
+}
+
 /** Convert a validated bridge frame into the generic input contract. */
 export function bridgeFrameToInput(frame: BridgeFrame, observedAtMs: number, receivedAtMs: number, hello: BridgeHello | null): InputFrame {
-  const hands: HandObservation[] = frame.hands.map(h => ({
-    id: h.id, position: v3(h.pos), confidence: h.conf,
-    extent: h.extent ? { min: v3(h.extent[0]), max: v3(h.extent[1]) } : undefined,
-    openness: h.openness, pinch: h.pinch, points: h.points?.map(v3),
-  }));
+  const hands: HandObservation[] = frame.hands.map(h => {
+    const skeleton = h.skeleton ? bridgeSkeleton(h.skeleton) : null;
+    const capsules = skeleton ? skeletonCapsules(skeleton) : [];
+    return {
+      id: h.id, position: v3(h.pos), confidence: h.conf,
+      extent: h.extent ? { min: v3(h.extent[0]), max: v3(h.extent[1]) } : undefined,
+      openness: h.openness, pinch: h.pinch,
+      // A tracking bridge may leave `points` to the browser: the palm and fingertips are in the skeleton.
+      points: h.points?.map(v3) ?? (skeleton ? skeletonPoints(skeleton) : undefined),
+      capsules: capsules.length ? capsules : undefined,
+    };
+  });
   const occupancy = frame.occupancy && hello?.occupancy ? decodeOccupancy(frame.occupancy, hello.occupancy.width, hello.occupancy.height) : undefined;
   const voxels = frame.voxels && hello?.voxels ? decodeVoxels(frame.voxels, hello.voxels.nx, hello.voxels.ny, hello.voxels.nz) : undefined;
   const surface = frame.surface && hello?.surface ? decodeSurface(frame.surface, hello.surface.width, hello.surface.height) : undefined;

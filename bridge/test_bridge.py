@@ -76,9 +76,13 @@ def synthetic(**kw: object) -> db.SyntheticSource:
 
 # ---- protocol shape checks (hand-written mirror of protocol.ts) ------------ #
 
-HELLO_REQUIRED, HELLO_OPTIONAL = {"type", "version", "source", "box"}, {"fps", "occupancy", "voxels", "surface"}
+HELLO_REQUIRED, HELLO_OPTIONAL = {"type", "version", "source", "box"}, {"fps", "occupancy", "voxels", "surface", "skeleton"}
 FRAME_REQUIRED, FRAME_OPTIONAL = {"type", "seq", "t", "hands"}, {"occupancy", "voxels", "surface", "stats"}
-HAND_REQUIRED, HAND_OPTIONAL = {"id", "pos"}, {"conf", "extent", "openness", "pinch", "points"}
+HAND_REQUIRED, HAND_OPTIONAL = {"id", "pos"}, {"conf", "extent", "openness", "pinch", "points", "skeleton"}
+SKELETON_REQUIRED, SKELETON_OPTIONAL = {"type", "palm", "wrist", "fingers"}, {"elbow", "palmWidth", "armWidth"}
+FINGER_KEYS = {"joints", "width", "extended"}
+TRACKED_HAND_KEYS = {"id", "pos", "conf", "extent", "openness", "pinch", "points", "skeleton"}
+BLOB_HAND_KEYS = {"id", "pos", "conf", "extent", "points"}
 
 
 class ProtocolAssertions(unittest.TestCase):
@@ -124,6 +128,8 @@ class ProtocolAssertions(unittest.TestCase):
             self.assert_grid_size(m["voxels"], {"nx", "ny", "nz"}, 128)
         if "surface" in m:
             self.assert_grid_size(m["surface"], {"width", "height"}, 512)
+        if "skeleton" in m:
+            self.assertIs(m["skeleton"], True, "announced only when the source tracks hands, never false")
 
     def assert_grid_size(self, size: object, keys: set[str], limit: int) -> None:
         assert isinstance(size, dict)
@@ -163,6 +169,46 @@ class ProtocolAssertions(unittest.TestCase):
             self.assertLessEqual(len(pts), 256)
             for p in pts:
                 self.assert_vec(p)
+        for key in ("openness", "pinch"):
+            if key in h:
+                self.assert_number(h[key], 0.0, 1.0)
+        if "skeleton" in h:
+            self.assert_skeleton(h["skeleton"])
+
+    def assert_open_vec(self, v: object) -> None:
+        """A skeleton joint: finite, rounded, NOT clamped (but nowhere near nonsense)."""
+        self.assertIsInstance(v, list)
+        assert isinstance(v, list)
+        self.assertEqual(len(v), 3)
+        for x in v:
+            self.assert_number(x, -1.0, 2.0)
+            self.assertEqual(x, round(x, 4))
+
+    def assert_skeleton(self, s: object) -> None:
+        """Mirror of ``bridgeSkeletonSchema``: exactly five fingers with five joints each, widths >= 0, type in the enum."""
+        assert isinstance(s, dict)
+        keys = set(s)
+        self.assertTrue(SKELETON_REQUIRED <= keys <= SKELETON_REQUIRED | SKELETON_OPTIONAL, keys)
+        self.assertIn(s["type"], db.HAND_TYPES)
+        for key in ("palm", "wrist", "elbow"):
+            if key in s:
+                self.assert_open_vec(s[key])
+        for key in ("palmWidth", "armWidth"):
+            if key in s:
+                self.assert_number(s[key], 0.0)
+        fingers = s["fingers"]
+        assert isinstance(fingers, list)
+        self.assertEqual(len(fingers), 5)
+        for f in fingers:
+            assert isinstance(f, dict)
+            self.assertEqual(set(f), FINGER_KEYS)
+            joints = f["joints"]
+            assert isinstance(joints, list)
+            self.assertEqual(len(joints), 5)
+            for j in joints:
+                self.assert_open_vec(j)
+            self.assert_number(f["width"], 0.0)
+            self.assertIsInstance(f["extended"], bool)
 
     def assert_frame(
         self, m: dict[str, object], occupancy: tuple[int, int] | None,
@@ -583,6 +629,187 @@ class SurfaceTests(unittest.TestCase):
         self.assertNotIn("surface", db.hello_message("synthetic", db.BoxConfig(), 30.0, (8, 6), (8, 6, 4), None))
 
 
+# ---- tracked hands (skeletons) --------------------------------------------- #
+
+
+def tracked_hand(palm: tuple[float, float, float] = (319.5, 239.5, 0.0), spread_px: float = 60.0, hand_id: int = 7, hand_type: str = "right", **kw: float) -> db.TrackedHand:
+    """A hand in a 640x480 image: the forearm stub goes image-down from the palm, the fingers fan image-up and deeper."""
+    if palm[2] == 0.0:
+        palm = (palm[0], palm[1], float(depth_at(0.3)))
+    joints = np.tile(np.asarray(palm, dtype=np.float64), (db.N_JOINTS, 1))
+    joints[db.JOINT_WRIST] += (0.0, spread_px, 5.0)
+    joints[db.JOINT_ELBOW] += (0.0, 2.0 * spread_px, 10.0)
+    for f in range(db.N_FINGERS):
+        for j in range(db.JOINTS_PER_FINGER):
+            along = (j + 1) / db.JOINTS_PER_FINGER
+            joints[db.finger_joint(f, j)] += ((f - 2) * spread_px / 2.0 * along, -spread_px * along, 20.0 * along)
+    widths = np.array([80.0, 50.0, 14.0, 16.0, 16.0, 15.0, 12.0])
+    extended = np.array([False, True, True, True, False])
+    return db.TrackedHand(hand_id, hand_type, joints, widths, extended, confidence=kw.get("confidence", 0.2), grab_strength=kw.get("grab", 0.25), pinch_strength=kw.get("pinch", 0.6))
+
+
+class TrackedHandTests(ProtocolAssertions):
+    ROI = (160, 120, 480, 360)  # --roi 0.25 0.25 0.75 0.75 of a 640x480 frame: 320x240 pixels
+
+    def test_normalizes_with_the_same_box_as_the_pixels(self) -> None:
+        hand = tracked_hand(palm=(319.5, 239.5, float(depth_at(0.3))))  # pixel-centre coordinates of the ROI's middle
+        sk = db.normalize_tracked_hand(hand, self.ROI, NEAR_MM, FAR_MM)
+        self.assertEqual(sk.id, 7)
+        self.assertEqual(sk.type, "right")
+        for got, want in zip(sk.pos, (0.5, 0.5, 0.3)):
+            self.assertAlmostEqual(got, want, places=6)
+        wrist = sk.joints[db.JOINT_WRIST]
+        self.assertAlmostEqual(float(wrist[1]), 0.5 + 60.0 / 240.0, places=6, msg="60 px down is 60/240 of the ROI height")
+        self.assertAlmostEqual(float(wrist[2]), 0.3 + 5.0 / (FAR_MM - NEAR_MM), places=6)
+        tip = sk.joints[db.finger_joint(4, 4)]
+        self.assertAlmostEqual(float(tip[0]), 0.5 + 60.0 / 320.0, places=6, msg="the pinky tip is 60 px right: 60/320 of the ROI width")
+        self.assertAlmostEqual(float(sk.widths[db.WIDTH_PALM]), 80.0 / 320.0, places=6, msg="widths are diameters in u units")
+        self.assertAlmostEqual(float(sk.widths[db.WIDTH_FINGERS + 1]), 16.0 / 320.0, places=6)
+        self.assertEqual(sk.conf, 0.5, "confidence is floored at 0.5: Ultraleap under-reports it")
+        self.assertAlmostEqual(sk.openness, 0.75)
+        self.assertAlmostEqual(sk.pinch, 0.6)
+        self.assertEqual(len(sk.points), 6, "the palm and five tips")
+        self.assertEqual(sk.points[0], sk.pos)
+        self.assertEqual(list(sk.extended), [False, True, True, True, False])
+        lo, hi = sk.extent
+        self.assertTrue(all(lo[a] <= sk.pos[a] <= hi[a] for a in range(3)))
+        self.assertEqual(db.normalize_tracked_hand(hand, self.ROI, NEAR_MM, FAR_MM, sample_points=0).points, (), "--points 0 drops them")
+        self.assertEqual(db.normalize_tracked_hand(tracked_hand(confidence=0.9), self.ROI, NEAR_MM, FAR_MM).conf, 0.9)
+
+    def test_joints_are_not_clamped_but_pos_and_extent_are(self) -> None:
+        hand = tracked_hand(palm=(159.5, 119.5, float(depth_at(0.0))))  # the ROI's top-left corner: fingers leave it upward
+        sk = db.normalize_tracked_hand(hand, self.ROI, NEAR_MM, FAR_MM)
+        self.assertLess(float(sk.joints[:, 1].min()), 0.0)
+        self.assertAlmostEqual(sk.pos[0], 0.0, places=6)
+        m = db.tracked_hand_message(sk)
+        self.assertEqual(set(m), TRACKED_HAND_KEYS)
+        self.assert_hand(m)
+        self.assertEqual(m["pos"], [0.0, 0.0, 0.0])
+        self.assertEqual(m["extent"][0], [0.0, 0.0, 0.0], "clamped like pos")
+        self.assertLess(min(j[1] for f in m["skeleton"]["fingers"] for j in f["joints"]), 0.0, "skeleton joints keep their overshoot")
+        self.assertTrue(all(0.0 <= c <= 1.0 for p in m["points"] for c in p))
+
+    def test_analyzer_carries_tracked_hands_and_frame_message_prefers_them(self) -> None:
+        src, t = synthetic(), 2.0
+        scripted = src.scripted_hands(t)[0]
+        result = make_analyzer().analyze(db.DepthFrame(src.render(t), t, src.tracked_hands(t)))
+        self.assertEqual(len(result.blobs), 1, "blobs are still computed")
+        self.assertEqual(len(result.hands), 1)
+        self.assertEqual(result.stats["trackedHands"], 1.0)
+        self.assertEqual(result.stats["blobs"], 1.0)
+        m = db.frame_message(3, 1.0, result)
+        self.assert_frame(m, (8, 6), (8, 6, 4), (8, 6))
+        h = m["hands"][0]
+        self.assertEqual(set(h), TRACKED_HAND_KEYS)
+        self.assertEqual(h["id"], 1)
+        for got, want in zip(h["pos"], (scripted.x, scripted.y, scripted.z)):
+            self.assertAlmostEqual(got, want, delta=1e-3)
+        self.assertEqual((h["conf"], h["openness"], h["pinch"]), (1.0, 1.0, 0.0))
+        self.assertEqual(len(h["points"]), 6)
+        self.assertEqual(h["points"][0], h["pos"])
+        sk = h["skeleton"]
+        self.assertEqual(set(sk), SKELETON_REQUIRED | SKELETON_OPTIONAL)
+        self.assertEqual(sk["type"], "right")
+        self.assertEqual(sk["palm"], h["pos"])
+        self.assertEqual([len(f["joints"]) for f in sk["fingers"]], [5] * 5)
+        self.assertTrue(all(f["width"] > 0 for f in sk["fingers"]) and sk["palmWidth"] > 0 and sk["armWidth"] > 0)
+        self.assertTrue(all(f["extended"] for f in sk["fingers"]))
+        joints = [sk["palm"], sk["wrist"], sk["elbow"], *(j for f in sk["fingers"] for j in f["joints"])]
+        lo, hi = h["extent"]
+        for a in range(3):
+            self.assertAlmostEqual(lo[a], min(j[a] for j in joints), delta=1e-4)
+            self.assertAlmostEqual(hi[a], max(j[a] for j in joints), delta=1e-4)
+        text = db.encode_message(m)
+        self.assertEqual(json.loads(text), m)
+        self.assertNotIn("NaN", text)
+
+    def test_falls_back_to_blobs_without_tracked_hands(self) -> None:
+        src, t = synthetic(), 2.0
+        for hands in (None, ()):
+            result = make_analyzer().analyze(db.DepthFrame(src.render(t), t, hands))
+            self.assertEqual(result.hands, ())
+            self.assertEqual(result.stats["trackedHands"], 0.0)
+            m = db.frame_message(0, 0.0, result)
+            self.assertEqual(len(m["hands"]), 1)
+            self.assertEqual(set(m["hands"][0]), BLOB_HAND_KEYS, "exactly the blob hand of a plain depth camera")
+            self.assertEqual(m["hands"][0]["id"], result.blobs[0].id)
+            self.assert_frame(m, (8, 6), (8, 6, 4), (8, 6))
+
+    def test_hand_outside_the_box_is_dropped(self) -> None:
+        analyzer = make_analyzer()
+        depth = backdrop()
+
+        def hands_for(palm: tuple[float, float, float], **cfg: object) -> int:
+            frame = db.DepthFrame(depth, 0.0, (tracked_hand(palm=palm),))
+            return len(db.BoxAnalyzer(analyzer.box, db.AnalyzerConfig(occupancy=None, voxels=None, surface=None, **cfg)).analyze(frame).hands)  # type: ignore[arg-type]
+
+        self.assertEqual(hands_for((319.5, 239.5, float(depth_at(0.5)))), 1)
+        self.assertEqual(hands_for((319.5, 239.5, float(depth_at(1.2)))), 1, "a quarter box past the far plane is still reported (margin 0.25)")
+        self.assertEqual(hands_for((319.5, 239.5, float(depth_at(1.3)))), 0, "farther out it is dropped like any pixel outside the box")
+        self.assertEqual(hands_for((319.5, 239.5, float(depth_at(2.0)))), 0)
+        self.assertEqual(hands_for((-200.0, 239.5, float(depth_at(0.5)))), 0, "well left of the ROI")
+        self.assertEqual(hands_for((-100.0, 239.5, float(depth_at(0.5)))), 1, "just left of it, within the margin")
+        self.assertEqual(hands_for((319.5, 239.5, float(depth_at(1.2))), hand_margin=0.0), 0)
+
+    def test_synthetic_skeleton_lies_on_the_dome(self) -> None:
+        src = synthetic()
+        for t in (0.0, 2.0, 5.5, 9.0):
+            depth = src.render(t)
+            scripted = src.scripted_hands(t)
+            hands = src.tracked_hands(t)
+            self.assertEqual(len(hands), len(scripted))
+            for hand, script in zip(hands, scripted):
+                u, v = np.rint(hand.joints[:, 0]).astype(int), np.rint(hand.joints[:, 1]).astype(int)
+                self.assertTrue((u >= 0).all() and (u < 640).all() and (v >= 0).all() and (v < 480).all())
+                rendered = depth[v, u].astype(np.float64)
+                self.assertLess(float(np.abs(rendered - hand.joints[:, 2]).max()), 1.5, f"t={t}: every joint's depth is the dome under it")
+                self.assertTrue(((rendered >= NEAR_MM) & (rendered <= FAR_MM)).all(), "every joint is on a foreground pixel")
+                palm = hand.joints[db.JOINT_PALM]
+                self.assertAlmostEqual(float(palm[0]), script.x * 640 - 0.5, places=6)
+                self.assertAlmostEqual(float(palm[1]), script.y * 480 - 0.5, places=6)
+                self.assertAlmostEqual(float(palm[2]), depth_at(script.z), delta=0.5, msg="the palm is the dome's centre, its nearest point")
+                self.assertGreaterEqual(float(hand.joints[:, 2].min()), float(palm[2]) - 1e-9)
+                dx = ((hand.joints[:, 0] + 0.5) / 640 - script.x) / script.r
+                dy = ((hand.joints[:, 1] + 0.5) / 480 - script.y) / (script.r * 1.4)
+                self.assertLessEqual(float((dx * dx + dy * dy).max()), 1.0, "every joint is inside the dome")
+                self.assertTrue((hand.widths_px > 0).all())
+        self.assertEqual(src.tracked_hands(12.0), (), "no hand, no skeleton")
+        two = synthetic(hands=2).tracked_hands(2.0)
+        self.assertEqual([(h.id, h.type) for h in two], [(1, "right"), (2, "left")])
+        src.start()
+        frame = src.read()
+        assert frame.hands is not None
+        self.assertEqual(len(frame.hands), 1, "read() carries the skeleton")
+        self.assertTrue(src.skeleton)
+
+    def test_tracked_hand_validation(self) -> None:
+        good = tracked_hand()
+        with self.assertRaises(ValueError):
+            db.TrackedHand(1, "both", good.joints, good.widths_px, good.extended)
+        with self.assertRaises(ValueError):
+            db.TrackedHand(1, "left", good.joints[:5], good.widths_px, good.extended)
+        with self.assertRaises(ValueError):
+            db.TrackedHand(1, "left", good.joints, good.widths_px[:3], good.extended)
+        bad = good.joints.copy()
+        bad[3, 2] = float("nan")
+        with self.assertRaises(ValueError):
+            db.TrackedHand(1, "left", bad, good.widths_px, good.extended)
+        with self.assertRaises(ValueError):
+            db.TrackedHand(-1, "left", good.joints, good.widths_px, good.extended)
+        self.assertEqual(good.finger(2).shape, (5, 3))
+
+    def test_hello_announces_skeleton_only_when_asked(self) -> None:
+        box = db.BoxConfig(near_m=NEAR, far_m=FAR)
+        with_skeleton = db.hello_message("synthetic", box, 30.0, (8, 6), (8, 6, 4), (8, 6), skeleton=True)
+        self.assert_hello(with_skeleton)
+        self.assertIs(with_skeleton["skeleton"], True)
+        without = db.hello_message("realsense", box, 30.0, (8, 6), (8, 6, 4), (8, 6))
+        self.assert_hello(without)
+        self.assertNotIn("skeleton", without)
+        self.assertFalse(db.RealSenseSource.skeleton)
+        self.assertTrue(db.SyntheticSource.skeleton)
+
+
 class TrackerTests(unittest.TestCase):
     def test_greedy_nearest_matching_and_new_ids(self) -> None:
         tr = db.BlobTracker(max_jump=0.25, max_missed=1)
@@ -609,7 +836,7 @@ class TrackerTests(unittest.TestCase):
 class MessageTests(ProtocolAssertions):
     def test_hello_message_shape(self) -> None:
         box = db.BoxConfig(near_m=NEAR, far_m=FAR, box_x=(-0.5, 0.5), box_y=(-0.4, 0.4))
-        m = db.hello_message("synthetic", box, 30.0, (8, 6), (8, 6, 4), (16, 12))
+        m = db.hello_message("synthetic", box, 30.0, (8, 6), (8, 6, 4), (16, 12), skeleton=True)
         self.assert_hello(m)
         self.assertEqual(set(m), HELLO_REQUIRED | HELLO_OPTIONAL)
         self.assertEqual(m["box"], {"x": [-0.5, 0.5], "y": [-0.4, 0.4], "z": [NEAR, FAR]})
@@ -664,10 +891,15 @@ class DumpCliTests(ProtocolAssertions):
         self.assertEqual(hello["occupancy"], {"width": 8, "height": 6})
         self.assertEqual(hello["voxels"], {"nx": 8, "ny": 6, "nz": 4})
         self.assertEqual(hello["surface"], {"width": 8, "height": 6})
+        self.assertIs(hello["skeleton"], True, "the synthetic source tracks a skeleton")
         for seq, frame in enumerate(frames):
             self.assert_frame(frame, *grid_sizes(hello))
             self.assertEqual(frame["seq"], seq)
             self.assertEqual(len(frame["hands"]), 1, "the script starts with one hand present")  # type: ignore[arg-type]
+            hand = frame["hands"][0]  # type: ignore[index]
+            self.assertEqual(set(hand), TRACKED_HAND_KEYS)
+            self.assertEqual(len(hand["skeleton"]["fingers"]), 5)
+            self.assertEqual(frame["stats"]["trackedHands"], 1.0)  # type: ignore[index]
         ts = [f["t"] for f in frames]
         self.assertEqual(ts, sorted(ts))  # type: ignore[type-var]
 
@@ -707,7 +939,8 @@ class DumpCliTests(ProtocolAssertions):
         for frame in lines[1:]:
             self.assert_frame(frame, None, (32, 24, 16), (64, 48))
             for hand in frame["hands"]:  # type: ignore[union-attr]
-                self.assertEqual(hand["points"], [])
+                self.assertEqual(hand["points"], [], "--points 0 applies to tracked hands too")
+                self.assertIn("skeleton", hand)
 
     def test_no_voxels_and_no_surface_flags_drop_those_fields_everywhere(self) -> None:
         lines = run_dump("--dump", "2", "--no-voxels", "--no-surface", "--occupancy", "8", "6", "--resolution", "160", "120", "--min-pixels", "20")
@@ -740,8 +973,14 @@ class DumpCliTests(ProtocolAssertions):
         self.assert_hello(lines[0])
         sizes = grid_sizes(lines[0])
         self.assertEqual(sizes, ((8, 6), (8, 6, 4), (8, 6)), "the fixture is generated with every field on, at small sizes")
+        self.assertIs(lines[0].get("skeleton"), True, "the fixture exercises the skeleton path")
         for frame in lines[1:]:
             self.assert_frame(frame, *sizes)
+            hands = frame["hands"]
+            assert isinstance(hands, list)
+            self.assertEqual(len(hands), 1, "the script starts with the hand present")
+            self.assertEqual(set(hands[0]), TRACKED_HAND_KEYS)
+            self.assertEqual(hands[0]["skeleton"]["palm"], hands[0]["pos"], "pos is the palm")
 
 
 if __name__ == "__main__":

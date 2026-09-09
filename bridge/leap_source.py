@@ -10,6 +10,16 @@ so the browser sees the usual blobs, occupancy, voxels and surface scan.
 rendered stereo pair (a fist and forearm sweeping above the device) and needs
 no hardware.
 
+Hand tracking rides along: the service's tracking events (the hand skeleton
+LeapC computes from the same images) are copied into :class:`DeviceHand`
+records, matched to the stereo pair by timestamp and projected into the depth
+image's frame (:class:`HandProjector`), so every :class:`DepthFrame` carries
+both the scan and the skeleton, aligned. Which way the device axes sit behind
+the rectified view is not documented, so the projection is a
+:class:`HandFrame` convention chosen from sixteen candidates: fixed by
+``--leap-hand-frame NAME`` or, by default, detected by scoring every
+candidate against the scan (:class:`HandFrameDetector`).
+
 LeapC across service versions
 -----------------------------
 * The library is searched in the Ultraleap Gemini/Hyperion SDK, then the old
@@ -42,8 +52,9 @@ import os
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator, Sequence
 
 import numpy as np
 
@@ -82,7 +93,11 @@ else:
     import leap_stereo as ls  # type: ignore[no-redef]
 
 _db = _bridge_module()
-DepthFrame, FrameSource = _db.DepthFrame, _db.FrameSource
+DepthFrame, FrameSource, TrackedHand = _db.DepthFrame, _db.FrameSource, _db.TrackedHand
+N_JOINTS, N_WIDTHS, N_FINGERS, JOINTS_PER_FINGER = _db.N_JOINTS, _db.N_WIDTHS, _db.N_FINGERS, _db.JOINTS_PER_FINGER
+JOINT_PALM, JOINT_WRIST, JOINT_ELBOW, FINGER_JOINTS = _db.JOINT_PALM, _db.JOINT_WRIST, _db.JOINT_ELBOW, _db.FINGER_JOINTS
+WIDTH_PALM, WIDTH_ARM, WIDTH_FINGERS = _db.WIDTH_PALM, _db.WIDTH_ARM, _db.WIDTH_FINGERS
+finger_joint = _db.finger_joint
 
 log = logging.getLogger("leap_source")
 
@@ -218,6 +233,53 @@ class _LogEvents(C.Structure):
     _fields_ = [("nEvents", C.c_uint32), ("events", C.POINTER(_LogEvent))]
 
 
+# Hand tracking (LEAP_TRACKING_EVENT, eLeapEventType_Tracking = 0x100). Like every LeapC struct these are
+# ``#pragma pack(1)``; with x64 natural alignment LEAP_HAND would be 1088 bytes (padded after ``arm``) and
+# the event 56 (pHands at 40). The field offsets inside LEAP_HAND are the same either way; only the stride
+# between hands and the position of pHands/framerate differ, which is what the tests pin.
+
+
+class _Quaternion(C.Structure):
+    _pack_ = 1
+    _fields_ = [("x", C.c_float), ("y", C.c_float), ("z", C.c_float), ("w", C.c_float)]
+
+
+class _Bone(C.Structure):
+    _pack_ = 1
+    _fields_ = [("prev_joint", _Vector), ("next_joint", _Vector), ("width", C.c_float), ("rotation", _Quaternion)]
+
+
+class _Digit(C.Structure):
+    """``LEAP_DIGIT``: ``bones`` are metacarpal, proximal, intermediate, distal."""
+
+    _pack_ = 1
+    _fields_ = [("finger_id", C.c_int32), ("bones", _Bone * 4), ("is_extended", C.c_uint32)]
+
+
+class _Palm(C.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("position", _Vector), ("stabilized_position", _Vector), ("velocity", _Vector), ("normal", _Vector),
+        ("width", C.c_float), ("direction", _Vector), ("orientation", _Quaternion),
+    ]
+
+
+class _Hand(C.Structure):
+    """``LEAP_HAND``: ``type`` is ``eLeapHandType`` (0 left, 1 right); ``digits`` run thumb, index, middle, ring, pinky."""
+
+    _pack_ = 1
+    _fields_ = [
+        ("id", C.c_uint32), ("flags", C.c_uint32), ("type", C.c_int32), ("confidence", C.c_float), ("visible_time", C.c_uint64),
+        ("pinch_distance", C.c_float), ("grab_angle", C.c_float), ("pinch_strength", C.c_float), ("grab_strength", C.c_float),
+        ("palm", _Palm), ("digits", _Digit * 5), ("arm", _Bone),
+    ]
+
+
+class _TrackingEvent(C.Structure):
+    _pack_ = 1
+    _fields_ = [("info", _FrameHeader), ("tracking_frame_id", C.c_int64), ("nHands", C.c_uint32), ("pHands", C.POINTER(_Hand)), ("framerate", C.c_float)]
+
+
 _ALLOCATE = C.CFUNCTYPE(C.c_void_p, C.c_uint32, C.c_uint32, C.c_void_p)
 _DEALLOCATE = C.CFUNCTYPE(None, C.c_void_p, C.c_void_p)
 
@@ -228,6 +290,7 @@ class _Allocator(C.Structure):
 
 
 assert C.sizeof(_ConnectionMessage) == 16 + 64 and C.sizeof(_ImageEvent) == 24 + 2 * 64 + 8 and C.sizeof(_DeviceInfo) == 44
+assert C.sizeof(_Bone) == 44 and C.sizeof(_Digit) == 184 and C.sizeof(_Palm) == 80 and C.sizeof(_Hand) == 1084 and C.sizeof(_TrackingEvent) == 48
 
 
 class BufferPool:
@@ -277,6 +340,371 @@ class LeapDeviceInfo:
     @property
     def type_name(self) -> str:
         return DEVICE_TYPES.get(self.type, f"device type 0x{self.type:x}")
+
+
+# --------------------------------------------------------------------------- #
+# Tracked hands in the device frame
+# --------------------------------------------------------------------------- #
+
+MAX_TRACKED_HANDS = 16                       # an event claiming more is garbage (a wrong layout), not a crowd
+MAX_JOINT_DISTANCE_MM = 3000.0               # the controller tracks to ~80 cm; anything farther is not a hand
+HAND_TYPE_NAMES = {0: "left", 1: "right"}
+FOREARM_STUB_MM = 70.0                       # how much forearm is kept past the wrist before projecting
+
+
+@dataclass(frozen=True)
+class DeviceHand:
+    """One LeapC hand in the device frame: millimetres, x along the long axis, y up, z toward the performer.
+
+    ``joints`` (``N_JOINTS x 3``), ``widths_mm`` (``N_WIDTHS``, diameters) and
+    ``extended`` follow ``depth_bridge``'s skeleton layout: the palm, the
+    wrist (``arm.next_joint``), the elbow (``arm.prev_joint``), then per
+    finger the metacarpal's start, the knuckle, the two inter-phalangeal
+    joints and the tip; a finger's width is its proximal bone's.
+    """
+
+    id: int
+    type: str
+    confidence: float
+    grab_strength: float
+    pinch_strength: float
+    joints: np.ndarray
+    widths_mm: np.ndarray
+    extended: np.ndarray
+    palm_normal: tuple[float, float, float] = (0.0, -1.0, 0.0)
+    palm_direction: tuple[float, float, float] = (0.0, 0.0, -1.0)
+
+
+@dataclass(frozen=True)
+class TrackingFrame:
+    """One tracking event: ``timestamp_us`` is on LeapC's clock (``LeapGetNow``), the same as the image events'."""
+
+    timestamp_us: int
+    frame_id: int
+    framerate: float
+    hands: tuple[DeviceHand, ...]
+
+
+def _xyz(v: _Vector) -> tuple[float, float, float]:
+    return (float(v.x), float(v.y), float(v.z))
+
+
+def read_hand(hand: _Hand) -> DeviceHand | None:
+    """Copy a ``LEAP_HAND`` into a :class:`DeviceHand`, or ``None`` when its numbers cannot be a hand.
+
+    The guard (finite, within a few metres) is what keeps a wrong struct
+    layout or a stale pointer from turning into NaN on the wire.
+    """
+    joints = np.empty((N_JOINTS, 3), dtype=np.float64)
+    widths = np.empty(N_WIDTHS, dtype=np.float64)
+    extended = np.zeros(N_FINGERS, dtype=bool)
+    joints[JOINT_PALM] = _xyz(hand.palm.position)
+    joints[JOINT_WRIST] = _xyz(hand.arm.next_joint)
+    joints[JOINT_ELBOW] = _xyz(hand.arm.prev_joint)
+    widths[WIDTH_PALM], widths[WIDTH_ARM] = float(hand.palm.width), float(hand.arm.width)
+    for f in range(N_FINGERS):
+        digit = hand.digits[f]
+        bones = digit.bones
+        base = finger_joint(f, 0)
+        joints[base] = _xyz(bones[0].prev_joint)
+        joints[base + 1] = _xyz(bones[1].prev_joint)
+        joints[base + 2] = _xyz(bones[2].prev_joint)
+        joints[base + 3] = _xyz(bones[3].prev_joint)
+        joints[base + 4] = _xyz(bones[3].next_joint)
+        widths[WIDTH_FINGERS + f] = float(bones[1].width)
+        extended[f] = bool(digit.is_extended)
+    scalars = (float(hand.confidence), float(hand.grab_strength), float(hand.pinch_strength))
+    if not (np.isfinite(joints).all() and np.isfinite(widths).all() and all(np.isfinite(scalars))):
+        return None
+    if np.abs(joints).max() > MAX_JOINT_DISTANCE_MM or widths.min() < 0 or widths.max() > 500.0:
+        return None
+    return DeviceHand(
+        id=int(hand.id), type=HAND_TYPE_NAMES.get(int(hand.type), "unknown"),
+        confidence=min(1.0, max(0.0, scalars[0])), grab_strength=min(1.0, max(0.0, scalars[1])), pinch_strength=min(1.0, max(0.0, scalars[2])),
+        joints=joints, widths_mm=widths, extended=extended, palm_normal=_xyz(hand.palm.normal), palm_direction=_xyz(hand.palm.direction),
+    )
+
+
+def read_tracking_event(event: _TrackingEvent) -> TrackingFrame:
+    """Copy a ``LEAP_TRACKING_EVENT`` (the memory is LeapC's until the next poll) into a :class:`TrackingFrame`."""
+    count = int(event.nHands)
+    hands: list[DeviceHand] = []
+    if 0 < count <= MAX_TRACKED_HANDS and event.pHands:
+        for i in range(count):
+            hand = read_hand(event.pHands[i])
+            if hand is not None:
+                hands.append(hand)
+    return TrackingFrame(int(event.info.timestamp), int(event.info.frame_id), float(event.framerate), tuple(hands))
+
+
+# --------------------------------------------------------------------------- #
+# Projecting the skeleton into the depth image
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class HandFrame:
+    """One way the device frame can sit behind the rectified view.
+
+    The depth image is the rectified view of one camera whose optical axis is
+    the device's up (``+y``): a device point ``p`` becomes ``q = p - origin``
+    with the reference camera at ``x = origin_sign * baseline / 2``, its depth
+    is ``q.y``, and the view's ray slopes are ``tx = u_sign * q[u_axis] /
+    depth`` and ``ty = v_sign * q[v_axis] / depth`` where ``u_axis`` is the
+    device x (0) or z (2) and ``v_axis`` the other. LeapC does not say which
+    signs its rectilinear frame uses, hence :data:`HAND_FRAMES`, the sixteen
+    candidates. Only ``u`` along ``x`` with the reference camera on the low-u
+    side (``origin_sign == -u_sign``) can give positive disparities, so if
+    the scan works those four are the real contenders; the others are kept so
+    the detector can say so rather than assume it. ``--swap-cameras`` makes
+    the other camera the reference (:meth:`reference_sign`).
+    """
+
+    u_axis: int
+    u_sign: int
+    v_axis: int
+    v_sign: int
+    origin_sign: int
+
+    def __post_init__(self) -> None:
+        if {self.u_axis, self.v_axis} != {0, 2} or abs(self.u_sign) != 1 or abs(self.v_sign) != 1 or abs(self.origin_sign) != 1:
+            raise ValueError(f"bad hand frame {self}")
+
+    @property
+    def name(self) -> str:
+        sign = {1: "+", -1: "-"}
+        return f"u{sign[self.u_sign]}{'xyz'[self.u_axis]}_v{sign[self.v_sign]}{'xyz'[self.v_axis]}_ref{sign[self.origin_sign]}"
+
+    @property
+    def plausible(self) -> bool:
+        """Consistent with a working stereo pair: ``u`` along the baseline, reference camera on the low-``u`` side."""
+        return self.u_axis == 0 and self.origin_sign == -self.u_sign
+
+    def reference_sign(self, swap: bool) -> int:
+        return -self.origin_sign if swap else self.origin_sign
+
+    def device_to_camera(self, points: np.ndarray, ref_sign: int, baseline_mm: float) -> np.ndarray:
+        """Device points ``(N, 3)`` -> camera coordinates ``(a, b, depth)`` with ``tx = a / depth``, ``ty = b / depth``."""
+        q = np.asarray(points, dtype=np.float64).reshape(-1, 3) - np.array([ref_sign * baseline_mm / 2.0, 0.0, 0.0])
+        return np.stack([self.u_sign * q[:, self.u_axis], self.v_sign * q[:, self.v_axis], q[:, 1]], axis=-1)
+
+    def camera_to_device(self, camera: np.ndarray, ref_sign: int, baseline_mm: float) -> np.ndarray:
+        """Inverse of :meth:`device_to_camera`."""
+        cam = np.asarray(camera, dtype=np.float64).reshape(-1, 3)
+        q = np.empty_like(cam)
+        q[:, self.u_axis] = self.u_sign * cam[:, 0]
+        q[:, self.v_axis] = self.v_sign * cam[:, 1]
+        q[:, 1] = cam[:, 2]
+        return q + np.array([ref_sign * baseline_mm / 2.0, 0.0, 0.0])
+
+
+def _hand_frames() -> tuple[HandFrame, ...]:
+    frames = [
+        HandFrame(u_axis, u_sign, 2 - u_axis, v_sign, origin_sign)
+        for u_axis in (0, 2) for u_sign in (1, -1) for v_sign in (-1, 1) for origin_sign in (-1, 1)
+    ]
+    # Plausible ones first (they win ties), the right-handed u+x/v-z default at the head.
+    frames.sort(key=lambda f: (not f.plausible, f.u_sign < 0, f.v_sign > 0, f.origin_sign > 0, f.u_axis))
+    return tuple(frames)
+
+
+#: Every candidate convention, most plausible first.
+HAND_FRAMES: tuple[HandFrame, ...] = _hand_frames()
+HAND_FRAME_BY_NAME: dict[str, HandFrame] = {f.name: f for f in HAND_FRAMES}
+HAND_FRAME_NAMES: tuple[str, ...] = tuple(HAND_FRAME_BY_NAME)
+DEFAULT_HAND_FRAME = HAND_FRAMES[0].name  # u+x_v-z_ref-: a right-handed camera frame looking up
+
+
+def project_hand_points(points: np.ndarray, frame: HandFrame, view: ls.RectifiedView, baseline_mm: float, swap: bool = False, orient: str = "none") -> np.ndarray:
+    """Device-frame points ``(N, 3)`` mm -> ``(u, v, depth)`` in the depth image.
+
+    ``u``/``v`` are continuous pixel coordinates with integer values at pixel
+    centres (:meth:`leap_stereo.RectifiedView.ray_to_pixel`), reoriented like
+    the image; ``depth`` is millimetres along the optical axis. Points at or
+    below the device plane cannot be projected and get NaN ``u``/``v``.
+    """
+    cam = frame.device_to_camera(points, frame.reference_sign(swap), baseline_mm)
+    depth = cam[:, 2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        safe = np.where(depth > 1e-6, depth, np.nan)
+        u, v = view.ray_to_pixel(cam[:, 0] / safe, cam[:, 1] / safe)
+    u, v = ls.reorient_points(u, v, view.width, view.height, orient)
+    return np.stack([u, v, depth], axis=-1)
+
+
+def trim_forearm(wrist: np.ndarray, elbow: np.ndarray, stub_mm: float = FOREARM_STUB_MM) -> np.ndarray:
+    """The elbow moved to ``stub_mm`` past the wrist along the forearm (the browser only wants a stub)."""
+    direction = np.asarray(elbow, dtype=np.float64) - np.asarray(wrist, dtype=np.float64)
+    length = float(np.linalg.norm(direction))
+    if length <= stub_mm:
+        return np.asarray(elbow, dtype=np.float64)
+    return np.asarray(wrist, dtype=np.float64) + direction * (stub_mm / length)
+
+
+def joint_hits(projected: np.ndarray, depth: np.ndarray, tolerance_mm: float) -> int:
+    """How many projected joints ``(u, v, depth)`` land on a pixel of ``depth`` holding a measurement within ``tolerance_mm``."""
+    h, w = depth.shape
+    u, v, d = projected[:, 0], projected[:, 1], projected[:, 2]
+    ok = np.isfinite(u) & np.isfinite(v) & (d > 0)
+    ui, vi = np.rint(u[ok]).astype(np.int64), np.rint(v[ok]).astype(np.int64)
+    inside = (ui >= 0) & (ui < w) & (vi >= 0) & (vi < h)
+    z = depth[vi[inside], ui[inside]].astype(np.float64)
+    return int(((z > 0) & (np.abs(z - d[ok][inside]) <= tolerance_mm)).sum())
+
+
+#: The joints the detector scores: everything but the elbow, which is often above the box or out of view.
+SCORED_JOINTS = np.array([JOINT_PALM, JOINT_WRIST, *range(FINGER_JOINTS, N_JOINTS)])
+
+
+class HandFrameDetector:
+    """Picks the :class:`HandFrame` by scoring every candidate against the scan.
+
+    On each frame that has both a tracked hand and depth, every candidate
+    projects the hand's joints (palm, wrist, 25 finger joints) and scores the
+    fraction that land on a depth pixel within ``tolerance_mm`` of the joint's
+    own depth: the right convention puts the skeleton on the scanned hand,
+    the others put it beside, mirrored or transposed. Hits accumulate over
+    frames (a frame where no candidate scores is uninformative and skipped)
+    and the winner is locked once ``min_frames`` have been scored, it hits
+    at least ``min_score`` and leads the runner-up by ``min_lead``. Until
+    then ``best`` is the provisional leader (plausible candidates win ties).
+    """
+
+    def __init__(
+        self, candidates: Sequence[HandFrame] = HAND_FRAMES, tolerance_mm: float = 30.0,
+        min_frames: int = 5, min_score: float = 0.5, min_lead: float = 0.15,
+    ) -> None:
+        if not candidates:
+            raise ValueError("need at least one candidate")
+        self.candidates = tuple(candidates)
+        self.tolerance_mm, self.min_frames, self.min_score, self.min_lead = float(tolerance_mm), int(min_frames), float(min_score), float(min_lead)
+        self.hits = np.zeros(len(self.candidates), dtype=np.int64)
+        self.total = 0
+        self.frames = 0
+        self.locked: HandFrame | None = None
+        self.locked_after = 0
+
+    @property
+    def scores(self) -> np.ndarray:
+        return self.hits / max(self.total, 1)
+
+    @property
+    def best(self) -> HandFrame:
+        if self.locked is not None:
+            return self.locked
+        return self.candidates[int(np.argmax(self.scores))]  # argmax takes the first of equals: the most plausible
+
+    def observe(self, depth: np.ndarray, project: Callable[[HandFrame], np.ndarray]) -> HandFrame | None:
+        """Score one frame; ``project(candidate)`` returns the ``(N, 3)`` image-frame joints. Returns the frame if it just locked."""
+        if self.locked is not None:
+            return None
+        frame_hits = np.array([joint_hits(project(c), depth, self.tolerance_mm) for c in self.candidates], dtype=np.int64)
+        if frame_hits.max() == 0:
+            return None
+        self.hits += frame_hits
+        self.total += int(project(self.candidates[0]).shape[0])
+        self.frames += 1
+        if self.frames < self.min_frames:
+            return None
+        order = np.argsort(-self.scores, kind="stable")
+        best, second = float(self.scores[order[0]]), float(self.scores[order[1]]) if len(order) > 1 else 0.0
+        if best >= self.min_score and best - second >= self.min_lead:
+            self.locked, self.locked_after = self.candidates[int(order[0])], self.frames
+            return self.locked
+        return None
+
+    def describe(self) -> str:
+        if self.locked is not None:
+            return f"{self.locked.name} (auto, locked after {self.locked_after} frames at {self.scores.max():.2f})"
+        if self.frames == 0:
+            return f"{self.best.name} (auto, nothing scored yet)"
+        order = np.argsort(-self.scores, kind="stable")
+        runner = f" vs {self.candidates[int(order[1])].name} {self.scores[order[1]]:.2f}" if len(order) > 1 else ""
+        return f"{self.best.name} (auto, leading {self.scores[order[0]]:.2f}{runner} after {self.frames} frames)"
+
+    def table(self) -> str:
+        """Every candidate's score, best first, for ``--dump-images``."""
+        order = np.argsort(-self.scores, kind="stable")
+        lines = [f"hand frame candidates after {self.frames} scored frames ({self.total} joints):"]
+        for i in order:
+            c = self.candidates[int(i)]
+            mark = " <- locked" if c is self.locked else (" <- leading" if c is self.best else "")
+            lines.append(f"  {c.name:<16} {self.scores[i]:6.3f}  {int(self.hits[i]):5d} hits{'' if c.plausible else '  (implausible: no positive disparity)'}{mark}")
+        return "\n".join(lines)
+
+
+class HandProjector:
+    """Turns :class:`DeviceHand` records into :class:`TrackedHand` skeletons in one source's depth image.
+
+    Holds the view, baseline, camera order and orientation of the depth image
+    and the convention: fixed (``hand_frame`` a name) or ``"auto"`` with a
+    :class:`HandFrameDetector` fed by :meth:`resolve`. Per hand the forearm is
+    trimmed to a stub, the joints projected and each width converted to pixels
+    at its part's depth (``width * fx / depth``), so widths are perspective
+    units like the image. Cheap: a few numpy operations on 28 points per hand,
+    plus 16 more projections per frame while the detector is still scoring.
+    """
+
+    def __init__(self, view: ls.RectifiedView, baseline_mm: float, swap: bool = False, orient: str = "none", hand_frame: str = "auto", detector: HandFrameDetector | None = None) -> None:
+        self.view, self.baseline_mm, self.swap, self.orient = view, float(baseline_mm), bool(swap), orient
+        self.fixed: HandFrame | None = None
+        self.detector: HandFrameDetector | None = None
+        if hand_frame == "auto":
+            self.detector = detector or HandFrameDetector()
+        elif hand_frame in HAND_FRAME_BY_NAME:
+            self.fixed = HAND_FRAME_BY_NAME[hand_frame]
+        else:
+            raise ValueError(f"unknown hand frame {hand_frame!r}; use 'auto' or one of {', '.join(HAND_FRAME_NAMES)}")
+
+    @property
+    def frame(self) -> HandFrame:
+        if self.fixed is not None:
+            return self.fixed
+        assert self.detector is not None
+        return self.detector.best
+
+    @property
+    def locked(self) -> bool:
+        return self.fixed is not None or (self.detector is not None and self.detector.locked is not None)
+
+    def project(self, points: np.ndarray, frame: HandFrame | None = None) -> np.ndarray:
+        return project_hand_points(points, frame or self.frame, self.view, self.baseline_mm, self.swap, self.orient)
+
+    def to_image_hand(self, hand: DeviceHand, frame: HandFrame | None = None) -> TrackedHand | None:
+        joints = hand.joints.copy()
+        joints[JOINT_ELBOW] = trim_forearm(joints[JOINT_WRIST], joints[JOINT_ELBOW])
+        image = self.project(joints, frame)
+        if not np.isfinite(image).all() or (image[:, 2] <= 0).any():
+            return None  # part of the hand below the device plane: not a hand this camera can see
+        depth_of_part = np.empty(N_WIDTHS, dtype=np.float64)
+        depth_of_part[WIDTH_PALM], depth_of_part[WIDTH_ARM] = image[JOINT_PALM, 2], image[JOINT_WRIST, 2]
+        for f in range(N_FINGERS):
+            start = finger_joint(f, 0)
+            depth_of_part[WIDTH_FINGERS + f] = image[start:start + JOINTS_PER_FINGER, 2].mean()
+        widths_px = hand.widths_mm * self.view.fx / depth_of_part
+        return TrackedHand(
+            id=hand.id, type=hand.type, joints=image, widths_px=widths_px, extended=hand.extended.copy(),
+            confidence=hand.confidence, grab_strength=hand.grab_strength, pinch_strength=hand.pinch_strength, has_elbow=True,
+        )
+
+    def resolve(self, hands: Sequence[DeviceHand], depth: np.ndarray) -> tuple[TrackedHand, ...]:
+        """Score the detector on this frame (while unlocked) and project every hand with the current convention."""
+        if not hands:
+            return ()
+        if self.detector is not None and self.detector.locked is None:
+            scored = np.concatenate([h.joints[SCORED_JOINTS] for h in hands])
+            locked = self.detector.observe(depth, lambda frame: self.project(scored, frame))
+            if locked is not None:
+                log.info("hand frame locked: %s", self.detector.describe())
+        frame = self.frame
+        out = [self.to_image_hand(h, frame) for h in hands]
+        return tuple(h for h in out if h is not None)
+
+    def describe(self) -> str:
+        if self.fixed is not None:
+            return f"{self.fixed.name} (fixed)"
+        assert self.detector is not None
+        return self.detector.describe()
 
 
 # --------------------------------------------------------------------------- #
@@ -453,17 +881,22 @@ class StereoPair:
     frame_id: int
     timestamp: float  # seconds on time.perf_counter()'s clock
     seq: int
+    timestamp_us: int = 0  # LeapC's clock, to pair with tracking events
 
 
 class LeapStereoSource(FrameSource):
-    """Depth frames from the controller's stereo infrared images via LeapC.
+    """Depth frames from the controller's stereo infrared images via LeapC, with its hand skeletons.
 
     ``start()`` loads the library, installs the allocator, opens the
     connection and starts a daemon thread that polls it; ``read()`` waits for
     the newest stereo pair, rectifies it (maps rebuilt whenever the image
     size or ``matrix_version`` changes), runs :class:`leap_stereo.StereoDepth`
     and returns a :class:`DepthFrame` at most ``fps`` times per second (older
-    pairs are skipped). If no image arrives within ``stall_after`` seconds the
+    pairs are skipped). Tracking events (no extra policy needed) are kept in
+    a short deque; the one nearest the pair's timestamp, within
+    ``tracking_window_s``, lends its hands, which :class:`HandProjector` puts
+    into the depth image (``hand_frame``: ``"auto"`` or a convention name).
+    If no image arrives within ``stall_after`` seconds the
     stall is logged with the fix; after ``restart_after`` seconds ``read()``
     raises so the server reports it to the browser and retries. A poll thread
     that never returns (the 5.0-preview stall) is left alone rather than
@@ -471,14 +904,18 @@ class LeapStereoSource(FrameSource):
     """
 
     name = "leap"
+    skeleton = True
 
     def __init__(
         self, dll_path: str | None = None, view: ls.RectifiedView | None = None, params: ls.StereoParams | None = None,
         swap: bool = False, orient: str = "none", fps: float = 30.0, stall_after: float = 3.0, restart_after: float = 20.0,
         poll_timeout_ms: int = 100, sample_step: int = 4, baseline_mm: float | None = None,
+        hand_frame: str = "auto", tracking_window_s: float = 0.05,
     ) -> None:
         if orient not in ls.ORIENTATIONS:
             raise ValueError(f"orient must be one of {ls.ORIENTATIONS}")
+        if hand_frame != "auto" and hand_frame not in HAND_FRAME_BY_NAME:
+            raise ValueError(f"unknown hand frame {hand_frame!r}; use 'auto' or one of {', '.join(HAND_FRAME_NAMES)}")
         self.dll_path = dll_path
         self.view = view or ls.RectifiedView()
         self.params = params or ls.StereoParams()
@@ -487,6 +924,13 @@ class LeapStereoSource(FrameSource):
         self.stall_after, self.restart_after = float(stall_after), float(restart_after)
         self.poll_timeout_ms, self.sample_step = int(poll_timeout_ms), int(sample_step)
         self.forced_baseline_mm = baseline_mm
+        self.hand_frame = hand_frame
+        self.tracking_window_us = int(tracking_window_s * 1e6)
+        self.projector: HandProjector | None = None
+        self._tracking: deque[TrackingFrame] = deque(maxlen=64)  # ~0.25 s at the service's tracking rate
+        self.tracking_frames = 0
+        self.last_tracking: TrackingFrame | None = None
+        self.last_hands: tuple[TrackedHand, ...] = ()
 
         self.lib: LeapC | None = None
         self.pool = BufferPool()
@@ -586,6 +1030,9 @@ class LeapStereoSource(FrameSource):
             if not layout_logged:
                 layout_logged = True
                 log.info("LEAP_CONNECTION_MESSAGE is %d bytes (%s device_id field)", msg.size, "with" if msg.size >= 20 else "without")
+                if msg.size not in (16, 20):
+                    log.warning("unexpected LEAP_CONNECTION_MESSAGE size %d: this LeapC may not be packed like LeapC.h (#pragma pack(1)); "
+                                "tracking structs (LEAP_HAND 1084 bytes) could be misread, so skeletons are sanity-checked before use", msg.size)
             try:
                 self._handle(msg)
             except Exception as exc:  # noqa: BLE001 - keep polling, surface the error to read()
@@ -602,6 +1049,8 @@ class LeapStereoSource(FrameSource):
                 self._on_image(C.cast(msg.pointer, C.POINTER(_ImageEvent)).contents)
             return
         if kind == EVENT_TRACKING:
+            if msg.pointer:
+                self._on_tracking(C.cast(msg.pointer, C.POINTER(_TrackingEvent)).contents)
             return
         if n == 1:
             log.info("LeapC event %s", name)
@@ -686,11 +1135,31 @@ class LeapStereoSource(FrameSource):
         stamp = received - (now_us - int(event.info.timestamp)) / 1e6 if now_us is not None else received
         with self._cond:
             self._seq += 1
-            self._latest = StereoPair(images[0], images[1], int(event.image[0].matrix_version), int(event.info.frame_id), stamp, self._seq)
+            self._latest = StereoPair(images[0], images[1], int(event.image[0].matrix_version), int(event.info.frame_id), stamp, self._seq, int(event.info.timestamp))
             if self._seq == 1:
                 self.image_size = (images[0].shape[1], images[0].shape[0])
                 log.info("LeapC images: %dx%d, format 0x%x, matrix_version %d", images[0].shape[1], images[0].shape[0], int(event.image[0].properties.format), int(event.image[0].matrix_version))
             self._cond.notify_all()
+
+    def _on_tracking(self, event: _TrackingEvent) -> None:
+        frame = read_tracking_event(event)
+        with self._cond:
+            self._tracking.append(frame)
+            self.tracking_frames += 1
+            self.last_tracking = frame
+            first = self.tracking_frames == 1
+        if first:
+            log.info("LeapC tracking: first frame (id %d, %d hand(s), %.0f fps): hand skeletons will ride along with the scan", frame.frame_id, len(frame.hands), frame.framerate)
+
+    def _hands_at(self, timestamp_us: int) -> tuple[DeviceHand, ...]:
+        """The hands of the tracking frame nearest ``timestamp_us`` (LeapC clock), if one is within the window."""
+        with self._cond:
+            if not self._tracking:
+                return ()
+            nearest = min(self._tracking, key=lambda f: abs(f.timestamp_us - timestamp_us))
+        if abs(nearest.timestamp_us - timestamp_us) > self.tracking_window_us:
+            return ()
+        return nearest.hands
 
     # ---- consumer side ---------------------------------------------------- #
 
@@ -699,7 +1168,11 @@ class LeapStereoSource(FrameSource):
         policy = f"0x{self.policy:x}" if self.policy is not None else "not granted"
         device = f"{self.device_info.type_name} {self.device_info.serial}" if self.device_info else "none"
         counts = ", ".join(f"{k}={v}" for k, v in sorted(dict(self.events).items()))  # copy: the poll thread keeps adding keys
-        return f"connected={self.connected}, device={device}, policy={policy}, images={self._seq}, events: {counts or 'none'}"
+        newest = self.last_tracking
+        tracking = f"{self.tracking_frames} frames, {len(newest.hands) if newest else 0} hand(s) in the newest"
+        hand_frame = self.projector.describe() if self.projector is not None else f"{self.hand_frame} (pending)"
+        return (f"connected={self.connected}, device={device}, policy={policy}, images={self._seq}, tracking={tracking}, "
+                f"hand frame={hand_frame}, events: {counts or 'none'}")
 
     def _wait_for_pair(self) -> StereoPair:
         waited_from = time.monotonic()
@@ -759,6 +1232,11 @@ class LeapStereoSource(FrameSource):
             self.stereo = ls.StereoDepth(baseline, self.view.fx, self.params, self.swap)
             log.info("stereo matcher %s: baseline %.1f mm, f %.1f px, %d disparities (near plane %.0f mm), swap=%s",
                      self.stereo.matcher_name, baseline, self.view.fx, self.stereo.num_disparities, self.params.min_depth_mm, self.swap)
+        if self.projector is None:
+            self.projector = HandProjector(self.view, baseline, self.swap, self.orient, self.hand_frame)
+            log.info("hand skeletons projected with hand frame %s", self.projector.describe())
+        else:
+            self.projector.baseline_mm = baseline  # the detector's tally survives a baseline correction
 
     def _pace(self) -> None:
         if self.fps and self._last_return is not None:
@@ -773,12 +1251,13 @@ class LeapStereoSource(FrameSource):
         self._pace()
         pair = self._wait_for_pair()
         self._ensure_pipeline(pair)
-        assert self.rectifier is not None and self.stereo is not None
+        assert self.rectifier is not None and self.stereo is not None and self.projector is not None
         left, right = self.rectifier.rectify_pair(pair.left, pair.right)
         depth = ls.reorient(self.stereo.compute(left, right), self.orient)
-        self.last_pair, self.last_rectified, self.last_depth = pair, (left, right), depth
+        hands = self.projector.resolve(self._hands_at(pair.timestamp_us), depth)
+        self.last_pair, self.last_rectified, self.last_depth, self.last_hands = pair, (left, right), depth, hands
         self._last_return = time.monotonic()
-        return DepthFrame(depth, pair.timestamp)
+        return DepthFrame(depth, pair.timestamp, hands)
 
     def frames(self) -> Iterator[DepthFrame]:
         """Depth frames forever (``start()`` first)."""
@@ -792,25 +1271,34 @@ class LeapStereoSource(FrameSource):
 
 
 class LeapSyntheticSource(FrameSource):
-    """The whole Leap pipeline (raw fisheye pair -> rectify -> match -> depth) on a rendered scene.
+    """The whole Leap pipeline (raw fisheye pair -> rectify -> match -> depth, plus the skeleton) on a rendered scene.
 
     :func:`leap_stereo.hand_shapes` scripts a fist and forearm above the
     device; :class:`leap_stereo.FisheyeModel` plays the raw cameras and
-    calibration. ``render(t)`` is a pure function of script time (tests);
-    ``read()`` paces itself to ``fps`` like the plain synthetic source.
+    calibration. The skeleton :func:`leap_stereo.hand_skeleton` lays on those
+    surfaces is expressed in the device frame under ``true_frame`` (the
+    convention the "service" is pretending to use) and then goes through the
+    same :class:`HandProjector` as live hands, so ``hand_frame="auto"`` has a
+    positive control: the detector must find ``true_frame`` again.
+    ``render(t)`` is a pure function of script time (tests); ``read()`` paces
+    itself to ``fps`` like the plain synthetic source.
     """
 
     name = "leap-synthetic"
+    skeleton = True
 
     def __init__(
         self, view: ls.RectifiedView | None = None, params: ls.StereoParams | None = None, swap: bool = False,
         orient: str = "none", fps: float = 30.0, paced: bool = True, raw_model: ls.FisheyeModel | None = None,
         baseline_mm: float = ls.CONTROLLER_BASELINE_MM, speed: float = 1.0, absences: bool = True, sample_step: int = 4,
+        hand_frame: str = "auto", true_frame: str = DEFAULT_HAND_FRAME, skeletons: bool = True,
     ) -> None:
         if orient not in ls.ORIENTATIONS:
             raise ValueError(f"orient must be one of {ls.ORIENTATIONS}")
         if fps <= 0:
             raise ValueError("fps must be positive")
+        if true_frame not in HAND_FRAME_BY_NAME:
+            raise ValueError(f"unknown true hand frame {true_frame!r}; one of {', '.join(HAND_FRAME_NAMES)}")
         self.view = view or ls.RectifiedView()
         self.params = params or ls.StereoParams()
         self.swap, self.orient, self.fps, self.paced = bool(swap), orient, float(fps), paced
@@ -818,17 +1306,36 @@ class LeapSyntheticSource(FrameSource):
         self.baseline_mm, self.speed, self.absences = float(baseline_mm), float(speed), absences
         self.rectifier = ls.Rectifier(self.raw_model.ray_to_pixel, self.raw_model.width, self.raw_model.height, self.view, sample_step=sample_step)
         self.stereo = ls.StereoDepth(self.baseline_mm, self.view.fx, self.params, self.swap)
+        self.projector = HandProjector(self.view, self.baseline_mm, self.swap, self.orient, hand_frame)
+        self.true_frame = HAND_FRAME_BY_NAME[true_frame]
+        self.skeletons = bool(skeletons)
         self._origin: float | None = None
         self._next_due = 0.0
         self.last_pair: tuple[np.ndarray, np.ndarray] | None = None
         self.last_rectified: tuple[np.ndarray, np.ndarray] | None = None
         self.last_depth: np.ndarray | None = None
+        self.last_hands: tuple[TrackedHand, ...] = ()
 
     def start(self) -> None:
         self._origin = None
 
     def scene(self, t: float) -> ls.SyntheticStereoScene:
         return ls.SyntheticStereoScene(ls.hand_shapes(t, self.absences), self.baseline_mm)
+
+    @property
+    def reference_camera(self) -> int:
+        """The camera whose view the depth image is in: the matcher's first image."""
+        return ls.CAMERA_RIGHT if self.swap else ls.CAMERA_LEFT
+
+    def device_hands(self, t: float) -> tuple[DeviceHand, ...]:
+        """The scripted skeleton as LeapC would report it under ``true_frame``: device millimetres."""
+        skeleton = ls.hand_skeleton(t, self.absences)
+        if skeleton is None:
+            return ()
+        camera = skeleton.points - self.scene(t).camera_origin(self.reference_camera)  # the scene frame IS the reference camera's frame
+        joints = self.true_frame.camera_to_device(camera, self.true_frame.reference_sign(self.swap), self.baseline_mm)
+        hand = DeviceHand(id=1, type="right", confidence=1.0, grab_strength=1.0, pinch_strength=0.0, joints=joints, widths_mm=skeleton.widths_mm.copy(), extended=skeleton.extended.copy())
+        return (hand,)
 
     def render(self, t: float) -> np.ndarray:
         """Depth image (uint16 mm, reoriented) at script time ``t``; the raw and rectified pairs are kept in ``last_*``."""
@@ -837,6 +1344,17 @@ class LeapSyntheticSource(FrameSource):
         depth = ls.reorient(self.stereo.compute(left, right), self.orient)
         self.last_pair, self.last_rectified, self.last_depth = (raw_left, raw_right), (left, right), depth
         return depth
+
+    def tracked_hands(self, t: float, depth: np.ndarray) -> tuple[TrackedHand, ...]:
+        """The skeleton at ``t`` projected into ``depth``'s frame (scoring the detector on the way while it is unlocked)."""
+        hands = self.projector.resolve(self.device_hands(t), depth)
+        self.last_hands = hands
+        return hands
+
+    def frame_at(self, t: float, timestamp: float | None = None) -> DepthFrame:
+        depth = self.render(t)
+        hands = self.tracked_hands(t, depth) if self.skeletons else None
+        return DepthFrame(depth, t if timestamp is None else timestamp, hands)
 
     def read(self) -> DepthFrame:
         now = time.perf_counter()
@@ -848,7 +1366,7 @@ class LeapSyntheticSource(FrameSource):
             now = time.perf_counter()
         period = 1.0 / self.fps
         self._next_due = max(self._next_due, now - period) + period
-        return DepthFrame(self.render((now - self._origin) * self.speed), now)
+        return self.frame_at((now - self._origin) * self.speed, now)
 
 
 # --------------------------------------------------------------------------- #
@@ -903,9 +1421,19 @@ def dump_images(source: LeapStereoSource | LeapSyntheticSource, count: int, out_
                 hint = " <- the OTHER camera order puts far more pixels in the box: " + ("drop" if stereo.swap else "add") + " --swap-cameras"
             log.info("frame %d: %dx%d, %d valid px, %d in [%.0f, %.0f] mm (swapped order: %d)%s, left mean %.1f",
                      i, depth.shape[1], depth.shape[0], valid, inbox, near_mm, far_mm, inbox_other, hint, float(left.mean()))
+            hands = frame.hands or ()
+            if hands:
+                on_scan = sum(joint_hits(h.joints[SCORED_JOINTS], depth, 30.0) for h in hands)
+                log.info("frame %d: %d tracked hand(s), %d of %d joints on a scan pixel within 30 mm, hand frame %s",
+                         i, len(hands), on_scan, len(hands) * len(SCORED_JOINTS), source.projector.describe() if source.projector else "n/a")
             written += 1
     finally:
         source.stop()
+    projector = source.projector
+    if projector is not None and projector.detector is not None:
+        log.info("%s", projector.detector.table())
+    elif projector is not None:
+        log.info("hand frame %s", projector.describe())
     log.info("wrote %d frame(s) to %s", written, out_dir)
     return written
 
@@ -923,6 +1451,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-intensity", type=int, default=16, help="ignore IR pixels darker than this, 0..255 (default: %(default)s)")
     p.add_argument("--swap-cameras", action="store_true", help="exchange the cameras before matching")
     p.add_argument("--orient", choices=ls.ORIENTATIONS, default="none", help="rotate/flip the depth image (default: none)")
+    p.add_argument("--hand-frame", default="auto", metavar="MODE", help="device-to-image convention for the hand skeleton: auto (default, prints the candidate table) or one of " + ", ".join(HAND_FRAME_NAMES))
     p.add_argument("--fps", type=float, default=30.0, help="frame pacing (default: %(default)s)")
     p.add_argument("--timeout", type=float, default=40.0, metavar="S", help="hard exit after this many seconds, in case LeapC stalls (default: %(default)s)")
     p.add_argument("--log-level", default="info", choices=("debug", "info", "warning", "error"))
@@ -945,14 +1474,14 @@ def main(argv: list[str] | None = None) -> int:
     view = ls.RectifiedView.from_fov(args.view[0], args.view[1], args.fov)
     params = ls.StereoParams(min_depth_mm=args.near * 1000.0, min_intensity=args.min_intensity)
     source: LeapStereoSource | LeapSyntheticSource
-    if args.synthetic:
-        source = LeapSyntheticSource(view, params, args.swap_cameras, args.orient, fps=args.fps, paced=False)
-    else:
-        source = LeapStereoSource(args.leapc, view, params, args.swap_cameras, args.orient, fps=args.fps)
     code = 0
     try:
+        if args.synthetic:
+            source = LeapSyntheticSource(view, params, args.swap_cameras, args.orient, fps=args.fps, paced=False, hand_frame=args.hand_frame)
+        else:
+            source = LeapStereoSource(args.leapc, view, params, args.swap_cameras, args.orient, fps=args.fps, hand_frame=args.hand_frame)
         dump_images(source, args.dump_images, args.out, args.near * 1000.0, args.far * 1000.0)
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         log.error("%s", exc)
         code = 1
     sys.stderr.flush()

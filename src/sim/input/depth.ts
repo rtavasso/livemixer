@@ -43,7 +43,7 @@ export class DepthBridgeSource implements InputSource {
       const receivedAtMs = this.now();
       try {
         const message = parseBridgeMessage(event.data);
-        if (message.type === 'hello') { this.hello = message; this.state = { state: 'running', message: `Bridge "${message.source}" ready${message.fps ? ` at ${message.fps} fps` : ''}.` }; return; }
+        if (message.type === 'hello') { this.hello = message; this.state = { state: 'running', message: `Bridge "${message.source}" ready${message.fps ? ` at ${message.fps} fps` : ''}${message.skeleton ? ', with hand skeletons' : ''}.` }; return; }
         if (message.type === 'status') { this.state = { state: message.level === 'error' ? 'error' : 'running', message: `Bridge: ${message.message}` }; return; }
         if (message.seq <= this.lastSequence) return; // duplicate or reordered; the tracker would drop it too
         this.lastSequence = message.seq; this.received++;
