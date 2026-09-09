@@ -37,7 +37,7 @@ export const settingsSchema = z.object({
   }).default({}),
   depth: z.object({ url: z.string().default('ws://127.0.0.1:8765') }).default({}),
   leap: z.object({ url: z.string().default('ws://127.0.0.1:6437/v6.json'), box: leapBoxSchema.default(DEFAULT_LEAP_BOX) }).default({}),
-  synthetic: z.object({ hands: z.union([z.literal(1), z.literal(2)]).default(1), speed: z.number().min(.1).max(5).default(1) }).default({}),
+  synthetic: z.object({ hands: z.union([z.literal(1), z.literal(2)]).default(1), speed: z.number().min(.1).max(5).default(1), surface: z.boolean().default(true) }).default({}),
 }).strict();
 export type Settings = z.infer<typeof settingsSchema>;
 

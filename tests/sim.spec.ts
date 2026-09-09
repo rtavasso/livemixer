@@ -99,11 +99,13 @@ test('leap source tracks a hand from a fake Leap Motion service (v6 WebSocket pr
   // A stand-in for the Leap service: greets, then streams frames of a right hand sweeping to the performer's right and closing.
   const clients = new Set<SinkClient>();
   let frameId = 0;
-  const sink = await createTelemetrySink({ port: 0, onOpen: client => { clients.add(client); client.send({ serviceVersion: 'fake', version: 6 }); } });
-  const started = performance.now();
+  // The performance timeline starts when the page connects, so a slow page load under CI load cannot miss the open-hand phase.
+  let started = Infinity;
+  const sink = await createTelemetrySink({ port: 0, onOpen: client => { clients.add(client); started = Math.min(started, performance.now()); client.send({ serviceVersion: 'fake', version: 6 }); } });
   const timer = setInterval(() => {
+    if (!clients.size) return;
     const t = (performance.now() - started) / 1000; frameId++;
-    const x = -100 + Math.min(200, t * 200), grab = Math.min(1, Math.max(0, t - 1.5));
+    const x = -100 + Math.min(200, t * 200), grab = Math.min(1, Math.max(0, t - 2.5));
     const frame = {
       currentFrameRate: 100, id: frameId, timestamp: Math.round(performance.now() * 1000), // real microsecond timestamps, like the service
       hands: [{ id: 7, type: 'right', confidence: 1, grabStrength: grab, pinchStrength: 0, palmPosition: [x, 220, -30], palmVelocity: [200, 0, 0] }],
@@ -124,7 +126,8 @@ test('leap source tracks a hand from a fake Leap Motion service (v6 WebSocket pr
     expect(early.points).toBe(6); expect(early.openness).toBeCloseTo(1, 1); expect(early.vx).toBeGreaterThan(0);
     await page.waitForFunction(() => { const h = window.livemixerSim.host.state().tracked.hands[0]; return !!h && h.openness < .2; }, null, { timeout: 15_000 });
     const late = await page.evaluate(() => { const s = window.livemixerSim.host.state(); return { x: s.tracked.hands[0].position.x, stats: s.tracked.stats, status: s.source?.status().state }; });
-    expect(late.x).toBeGreaterThan(.8); expect(late.stats.leapHands).toBe(1); expect(late.status).toBe('running');
+    const expectX = (100 - DEFAULT_LEAP_BOX.x[0]) / (DEFAULT_LEAP_BOX.x[1] - DEFAULT_LEAP_BOX.x[0]); // the hand stops at +100 mm
+    expect(late.x).toBeGreaterThan(expectX - .08); expect(late.x).toBeLessThan(expectX + .08); expect(late.stats.leapHands).toBe(1); expect(late.status).toBe('running');
     await expect(page.locator('#overlay')).toContainText('Leap');
     expect(errors).toEqual([]);
   } finally { clearInterval(timer); for (const c of clients) c.close(); await sink.close(); }

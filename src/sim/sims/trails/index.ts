@@ -5,44 +5,61 @@
  * fade; with nobody there the picture returns to true black. Drawing with a
  * slow luminous brush in a dark room: calm, high dynamic range, never garish.
  *
- * The strokes are laid down where the hand is IN the volume: each segment has
- * 3D endpoints in world units and is projected through the shared window
- * camera onto the glass before it is deposited, so a stroke deeper in is
- * smaller, drawn toward the centre, dimmer and a touch cooler (aerial
- * perspective), and a soft pool of light on the floor beneath it, rising
- * toward the horizon with depth, makes the position readable. Sparkles live
- * in the volume too and are projected by the same camera in their vertex
- * shader.
+ * The whole body paints, at whatever fidelity the source knows it:
+ *  - a depth-camera scan (`input.surface`) paints wherever the shell moved
+ *    since the last step, each changed cell a dot at its 3D position, so a
+ *    moving hand leaves a trail the shape of its silhouette and a still one
+ *    leaves nothing;
+ *  - a skeleton (`hand.capsules`) paints a stroke per capsule over the area
+ *    it swept: fingertips leave thin bright lines, the palm a broad soft one,
+ *    a fist one compact blob, and a full hand is normalised so it is not
+ *    dozens of times brighter than the sphere it replaces;
+ *  - a bare position paints with the single brush it always did.
+ * Strokes are laid down where the body is IN the volume: every end is
+ * projected through the shared window camera onto the glass before it is
+ * deposited, so a stroke deeper in is smaller, drawn toward the centre, dimmer
+ * and a touch cooler (aerial perspective), and a soft pool of light on the
+ * floor beneath the hand makes its position readable. Sparkles are shed from
+ * fingertips (or the scan's silhouette edge) and live in the volume too. A
+ * very faint ghost of the solid itself shows the performer what is painting.
  *
  * Pipeline per display frame (all GPU work happens in `render`; `step` is
  * CPU-only and deterministic):
  *   0. probe collect — drain any 16×16 probe readbacks whose fence has
  *                      signalled (queued a frame or two ago) into signals.
- *   1. accumulate    — full-res: old × decay − floor, plus this frame's stroke
- *                      segments (distance-to-segment brush, saturating deposit)
- *                      and their floor pools in the alpha channel.
- *   2. bloom         — quarter-res prefilter, separable blur (3 small passes).
- *   3. composite     — full-res: exposure, bloom, floor pool gated by presence,
- *                      ACES tone-map, gamma, grain, then sparkles as additive
- *                      point sprites on top.
- *   4. probe queue   — 16×16 reduction of the accumulation, read into a fresh
+ *   1. decay         — full-res: old × decay − floor.
+ *   2. strokes       — instanced quads, additive: each sweep covers only its
+ *                      projected extent plus the brush radius; the saturating
+ *                      deposit reads the decayed previous frame. Then the
+ *                      floor pools the same way into the alpha channel.
+ *   3. bloom         — quarter-res prefilter, separable blur (3 small passes).
+ *   4. composite     — full-res: exposure, bloom, floor pool gated by presence,
+ *                      ACES tone-map, gamma, grain; then sparkles as additive
+ *                      point sprites and the ghost as ray-marched quads.
+ *   5. probe queue   — 16×16 reduction of the accumulation, read into a fresh
  *                      pixel-pack buffer behind a fence; never waited on.
  * Two full-res passes plus small ones; `low` quality halves the buffers.
  */
 import { defineSimulation, type SimInput } from '../../core/types';
-import { approach, clamp01 } from '../../core/math';
+import { approach, clamp01, hsv } from '../../core/math';
 import { windowCamera } from '../../core/camera';
 import { Noise } from '../../core/noise';
 import { Fbo, PingPong, bindScreen, pickFormat } from '../../gl/fbo';
 import { Program } from '../../gl/program';
 import { blit, drawQuad, quadProgram } from '../../gl/quad';
-import { BLUR_FS, COMPOSITE_FS, DOWNSAMPLE_FS, POINTS_FS, POINTS_VS, PROBE_FS, accumulateShader } from './shaders';
+import { MAX_HAND_BOUNDS, createPackedHands, packHands } from '../../gl/hand';
+import { SurfaceTexture } from '../../gl/surface';
+import { BLUR_FS, COMPOSITE_FS, DECAY_FS, DOWNSAMPLE_FS, GHOST_FS, GHOST_VS, POINTS_FS, POINTS_VS, POOL_FS, POOL_VS, PROBE_FS, STROKE_FS, STROKE_VS } from './shaders';
 import {
-  HEAD_K, InkDepth, SparkleField, StrokeTracker, decayFor, depthAttenuation, floorColour, floorFor, hueWander, inkTarget, projectFloorPool, projectSegment,
-  reduceProbe, sparkColour, sparkleRate, type StrokeSegment,
+  HEAD_K, InkDepth, SparkleField, StrokeTracker, SurfacePainter, createScanStrokes, decayFor, depthAttenuation, floorColour, floorFor, hueWander, inkTarget, paintingStrokes,
+  projectFloorPool, projectSweep, reduceProbe, scanBounds, sparkColour, sparkleRate, type CapsuleStroke, type StrokeSegment,
 } from './logic';
 
-const MAX_SEGMENTS = 32;
+/** Sweeps drawn per frame at most (a scan can change a few hundred cells per step; several steps may share a frame). */
+const MAX_STROKES = 1024;
+/** Floor pools per frame at most: one per hand per step. */
+const MAX_POOLS = 16;
+const FLOATS_PER_STROKE = 12, FLOATS_PER_POOL = 4, FLOATS_PER_BOUND = 4;
 const PROBE_SIZE = 16;
 /** Normalised accumulation → HDR before tone-mapping: 1.0 stored reads as a warm white. */
 const EXPOSURE = 3;
@@ -62,17 +79,18 @@ const GRAIN_PERIOD = 100;
 export default defineSimulation({
   id: 'trails',
   title: 'Afterglow',
-  description: 'Black; a present hand leaves slowly fading trails of light in the volume, like drawing with a slow luminous brush in a dark room.',
+  description: 'Black; a present hand leaves slowly fading trails of light in the volume, like drawing with a slow luminous brush in a dark room. A scanned or skeletal hand paints with its whole shape.',
   params: {
     lifetime: { kind: 'number', default: 4, min: .3, max: 20, step: .1, unit: 's', label: 'Lifetime', description: 'Seconds a fresh stroke takes to fade back to black.' },
-    brushSize: { kind: 'number', default: .065, min: .01, max: .2, step: .005, label: 'Brush size', description: 'Brush radius in uniform units (canvas height = 1) for a typical hand at the glass; scales with the hand blob and a little with speed, and shrinks with perspective deeper in (about 0.05 mid-volume).' },
+    brushSize: { kind: 'number', default: .065, min: .01, max: .2, step: .005, label: 'Brush size', description: 'Brush radius in uniform units (canvas height = 1) for a bare hand position at the glass; scales with the hand blob and a little with speed, and shrinks with perspective deeper in. A solid hand paints with its own thickness (each bone or scan cell), scaled by this relative to the default 0.065.' },
     brightness: { kind: 'number', default: 1, min: 0, max: 3, step: .05, label: 'Brightness', description: 'How much light each stroke deposits. Overlapping strokes bloom toward white.' },
     hue: { kind: 'number', default: .055, min: 0, max: 1, step: .005, label: 'Hue', description: 'Base hue of the light: 0 red, 0.33 green, 0.66 blue.' },
     hueDrift: { kind: 'number', default: .02, min: 0, max: .2, step: .001, unit: 'Hz', label: 'Hue drift', description: 'How fast the hue wanders (at most ±0.08 around the base hue, so the palette stays coherent).' },
     saturation: { kind: 'number', default: .55, min: 0, max: 1, step: .01, label: 'Saturation', description: 'Colour saturation of the stroke edges; the core always reads warm-white.' },
     depthFade: { kind: 'number', default: .6, min: 0, max: 1, step: .01, label: 'Depth fade', description: 'Aerial perspective: how much strokes laid down deeper in the volume dim and cool (perspective already makes them smaller and draws them toward the centre). Also fogs deep sparkles.' },
-    floor: { kind: 'number', default: .8, min: 0, max: 2, step: .05, label: 'Floor light', description: 'Brightness of the soft pool of light a stroke casts on the floor of the volume, the depth cue; fades with presence.' },
-    sparkle: { kind: 'number', default: .35, min: 0, max: 1, step: .01, label: 'Sparkle', description: 'Amount of sparkles shed along the stroke.' },
+    floor: { kind: 'number', default: .8, min: 0, max: 2, step: .05, label: 'Floor light', description: 'Brightness of the soft pool of light a hand casts on the floor of the volume, the depth cue; fades with presence.' },
+    ghost: { kind: 'number', default: .35, min: 0, max: 1, step: .01, label: 'Ghost', description: 'Brightness of the faint translucent body that is painting: the scanned surface or the skeleton, ray-marched in the volume. Nothing for a bare position.' },
+    sparkle: { kind: 'number', default: .35, min: 0, max: 1, step: .01, label: 'Sparkle', description: 'Amount of sparkles shed from the fingertips (or the silhouette edge of a scan) along the stroke.' },
     drift: { kind: 'number', default: .4, min: 0, max: 1, step: .01, label: 'Drift', description: 'Wind strength on the sparkles (curl noise).' },
     bloom: { kind: 'number', default: .6, min: 0, max: 2, step: .01, label: 'Bloom', description: 'Glow spread around bright light.' },
     grain: { kind: 'number', default: .25, min: 0, max: 1, step: .01, label: 'Grain', description: 'Subtle film grain in lit areas.' },
@@ -93,7 +111,10 @@ export default defineSimulation({
     const capacity = ctx.quality === 'low' ? 600 : ctx.quality === 'medium' ? 1400 : 2000;
     const depth = ctx.depth, invDepth = 1 / Math.max(depth, 1e-6);
 
-    const accumulate = quadProgram(gl, accumulateShader(MAX_SEGMENTS), 'afterglow-accumulate');
+    const decay = quadProgram(gl, DECAY_FS, 'afterglow-decay');
+    const strokeProgram = new Program(gl, STROKE_VS, STROKE_FS, 'afterglow-strokes');
+    const poolProgram = new Program(gl, POOL_VS, POOL_FS, 'afterglow-pools');
+    const ghostProgram = new Program(gl, GHOST_VS, GHOST_FS, 'afterglow-ghost');
     const downsample = quadProgram(gl, DOWNSAMPLE_FS, 'afterglow-downsample');
     const blur = quadProgram(gl, BLUR_FS, 'afterglow-blur');
     const composite = quadProgram(gl, COMPOSITE_FS, 'afterglow-composite');
@@ -121,6 +142,27 @@ export default defineSimulation({
     }
     allocate(ctx.width, ctx.height);
 
+    // --- instanced geometry ---------------------------------------------
+    /** A VAO whose only attributes are per-instance vec4s read from one interleaved buffer; the quad corners come from gl_VertexID. */
+    function instanced(program: Program, names: string[], instances: number) {
+      const vao = gl.createVertexArray(), vbo = gl.createBuffer();
+      if (!vao || !vbo) throw new Error('Could not create instance buffers.');
+      const stride = names.length * 16;
+      gl.bindVertexArray(vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+      gl.bufferData(gl.ARRAY_BUFFER, instances * stride, gl.DYNAMIC_DRAW);
+      names.forEach((name, i) => { const loc = program.attribute(name); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 4, gl.FLOAT, false, stride, i * 16); gl.vertexAttribDivisor(loc, 1); });
+      gl.bindVertexArray(null); gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      return { vao, vbo, data: new Float32Array(instances * names.length * 4) };
+    }
+    const strokeGeo = instanced(strokeProgram, ['a_prev', 'a_curr', 'a_col'], MAX_STROKES);
+    const poolGeo = instanced(poolProgram, ['a_pool'], MAX_POOLS);
+    const ghostGeo = instanced(ghostProgram, ['a_bound'], MAX_HAND_BOUNDS);
+    function drawInstances(geo: { vao: WebGLVertexArrayObject; vbo: WebGLBuffer; data: Float32Array }, floats: number, count: number) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, geo.vbo); gl.bufferSubData(gl.ARRAY_BUFFER, 0, geo.data, 0, count * floats); gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      gl.bindVertexArray(geo.vao); gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count); gl.bindVertexArray(null);
+    }
+
     // --- sparkle geometry: world position, size, colour -------------------
     const FLOATS_PER_SPARK = 7;
     const vao = gl.createVertexArray(), vbo = gl.createBuffer();
@@ -136,27 +178,44 @@ export default defineSimulation({
     gl.enableVertexAttribArray(aCol); gl.vertexAttribPointer(aCol, 3, gl.FLOAT, false, stride, 16);
     gl.bindVertexArray(null); gl.bindBuffer(gl.ARRAY_BUFFER, null);
 
+    // --- the solid, for the ghost -----------------------------------------
+    const packed = createPackedHands();
+    const surfaceTexture = new SurfaceTexture(gl);
+
     // --- CPU state ------------------------------------------------------
     const strokes = new StrokeTracker();
+    const painter = new SurfacePainter();
+    const scan = createScanStrokes();
     const sparkles = new SparkleField(capacity);
     const inkDepth = new InkDepth();
     const hueNoise = new Noise(11);
-    const pending: StrokeSegment[] = [];
-    const segPos = new Float32Array(MAX_SEGMENTS * 4), segCol = new Float32Array(MAX_SEGMENTS * 4), segPool = new Float32Array(MAX_SEGMENTS * 4);
+    const stepStrokes: CapsuleStroke[] = [];
+    const pending: CapsuleStroke[] = [], pendingPools: StrokeSegment[] = [];
     let pendingDt = 0, time = 0, hue = 0, ink = 0, glow = 0, coverage = 0, presence = 0;
+    let hands: SimInput['hands'] = [], surface: SimInput['surface'] = null;
 
     return {
       step(input: SimInput, params) {
-        time = input.time; presence = input.presence;
+        time = input.time; presence = input.presence; hands = input.hands; surface = input.surface;
         hue = hueWander(params.hue, time, params.hueDrift, hueNoise);
-        const segments = strokes.update(input.hands, aspect, depth, input.dt, { brushSize: params.brushSize, brightness: params.brightness, saturation: params.saturation, hue, depthFade: params.depthFade });
-        let energy = 0;
+        const brush = { brushSize: params.brushSize, brightness: params.brightness, saturation: params.saturation, hue, depthFade: params.depthFade };
+        const segments = strokes.update(input.hands, aspect, depth, input.dt, brush);
+        // The scan paints when there is one, else the skeleton or the point brush; the hand-level segments still drive pool, ink, depth and the sparkle budget.
+        let scanned: typeof scan | null = null;
+        if (input.surface) scanned = painter.update(input.surface, segments, aspect, depth, brush, scan); else painter.reset();
+        const painting = paintingStrokes(scanned, segments, stepStrokes);
+        if (pending.length + painting.length > MAX_STROKES) pending.splice(0, pending.length + painting.length - MAX_STROKES);
+        for (const s of painting) pending.push(s);
+        let energy = 0, budget = 0;
         for (const s of segments) {
-          if (pending.length >= MAX_SEGMENTS) pending.shift();
-          pending.push(s);
+          if (pendingPools.length >= MAX_POOLS) pendingPools.shift();
+          pendingPools.push(s);
           energy += s.amplitude;
-          if (params.sparkle > 0) sparkles.emit(s, params.sparkle * sparkleRate(s.length, s.radius, input.dt), sparkColour(s.r, s.g, s.b));
+          const rate = params.sparkle * sparkleRate(s.length, s.radius, input.dt);
+          if (scanned) budget += rate;
+          else if (rate > 0) sparkles.emitFrom(s.strokes, rate, sparkColour(s.r, s.g, s.b));
         }
+        if (scanned && budget > 0 && segments.length) sparkles.emitFrom(scanned.edges, budget, sparkColour(segments[0].r, segments[0].g, segments[0].b));
         ink = approach(ink, inkTarget(energy, input.dt), input.dt, energy > 0 ? .1 : .3);
         inkDepth.update(segments, input.dt);
         sparkles.step(input.dt, time, params.drift, aspect, depth);
@@ -181,30 +240,49 @@ export default defineSimulation({
           gl.deleteSync(fence); gl.deleteBuffer(buffer);
         }
         const elapsed = pendingDt;
-        if (elapsed > 0 || pending.length) {
-          // 1. Decay, then deposit this frame's segments projected onto the glass, and their floor pools.
-          const count = Math.min(MAX_SEGMENTS, pending.length);
-          for (let i = 0; i < count; i++) {
-            const s = pending[i], p = projectSegment(s, camera), pool = projectFloorPool(s, camera);
-            segPos[i * 4] = p.ax; segPos[i * 4 + 1] = p.ay; segPos[i * 4 + 2] = p.bx; segPos[i * 4 + 3] = p.by;
-            segCol[i * 4] = s.r * s.amplitude; segCol[i * 4 + 1] = s.g * s.amplitude; segCol[i * 4 + 2] = s.b * s.amplitude; segCol[i * 4 + 3] = p.radius;
-            segPool[i * 4] = pool.x; segPool[i * 4 + 1] = pool.y; segPool[i * 4 + 2] = pool.rx; segPool[i * 4 + 3] = s.amplitude * pool.gain;
-          }
+        if (elapsed > 0 || pending.length || pendingPools.length) {
+          const decayBy = decayFor(elapsed, params.lifetime), floorBy = floorFor(params.lifetime, hdr) * elapsed;
+          // 1. Decay the previous frame.
           accum.write.bind();
-          accumulate.use().texture('u_prev', accum.read.texture, 0)
-            .f1('u_decay', decayFor(elapsed, params.lifetime)).f1('u_floor', floorFor(params.lifetime, hdr) * elapsed)
-            .f1('u_aspect', aspect).f1('u_headK', HEAD_K).f1('u_eye', camera.eye).i1('u_count', count)
-            .f4v('u_segPos', segPos).f4v('u_segCol', segCol).f4v('u_segPool', segPool);
+          decay.use().texture('u_prev', accum.read.texture, 0).f1('u_decay', decayBy).f1('u_floor', floorBy);
           drawQuad(gl);
-          accum.swap(); pendingDt = 0; pending.length = 0;
-          // 2. Bloom at quarter resolution.
+          // 2. This frame's sweeps, projected onto the glass, then the floor pools; both saturate against the decayed previous frame.
+          const count = Math.min(MAX_STROKES, pending.length), pools = Math.min(MAX_POOLS, pendingPools.length);
+          if (count || pools) {
+            gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+            if (count) {
+              const d = strokeGeo.data;
+              for (let i = 0; i < count; i++) {
+                const s = pending[i], p = projectSweep(s, camera), o = i * FLOATS_PER_STROKE;
+                d[o] = p.ax0; d[o + 1] = p.ay0; d[o + 2] = p.bx0; d[o + 3] = p.by0;
+                d[o + 4] = p.ax1; d[o + 5] = p.ay1; d[o + 6] = p.bx1; d[o + 7] = p.by1;
+                d[o + 8] = s.r * s.amplitude; d[o + 9] = s.g * s.amplitude; d[o + 10] = s.b * s.amplitude; d[o + 11] = p.radius;
+              }
+              strokeProgram.use().texture('u_prev', accum.read.texture, 0).f2('u_texel', 1 / accum.width, 1 / accum.height)
+                .f1('u_decay', decayBy).f1('u_floor', floorBy).f1('u_headK', HEAD_K).f1('u_aspect', aspect);
+              drawInstances(strokeGeo, FLOATS_PER_STROKE, count);
+            }
+            if (pools) {
+              const d = poolGeo.data;
+              for (let i = 0; i < pools; i++) {
+                const s = pendingPools[i], pool = projectFloorPool(s, camera), o = i * FLOATS_PER_POOL;
+                d[o] = pool.x; d[o + 1] = pool.y; d[o + 2] = pool.rx; d[o + 3] = s.amplitude * pool.gain;
+              }
+              poolProgram.use().texture('u_prev', accum.read.texture, 0).f2('u_texel', 1 / accum.width, 1 / accum.height)
+                .f1('u_decay', decayBy).f1('u_floor', floorBy).f1('u_headK', HEAD_K).f1('u_aspect', aspect).f1('u_eye', camera.eye);
+              drawInstances(poolGeo, FLOATS_PER_POOL, pools);
+            }
+            gl.disable(gl.BLEND);
+          }
+          accum.swap(); pendingDt = 0; pending.length = 0; pendingPools.length = 0;
+          // 3. Bloom at quarter resolution.
           bloomA.bind();
           downsample.use().texture('u_src', accum.read.texture, 0).f2('u_texel', 1 / accum.width, 1 / accum.height).f1('u_exposure', EXPOSURE).f1('u_threshold', BLOOM_THRESHOLD);
           drawQuad(gl);
           bloomB.bind(); blur.use().texture('u_src', bloomA.texture, 0).f2('u_dir', 1 / bloomA.width, 0); drawQuad(gl);
           bloomA.bind(); blur.use().texture('u_src', bloomB.texture, 0).f2('u_dir', 0, 1 / bloomA.height); drawQuad(gl);
         }
-        // 3. Composite to the screen, then sparkles on top.
+        // 4. Composite to the screen, then sparkles and the ghost on top.
         bindScreen(gl, frame.width, frame.height);
         const [pr, pg, pb] = floorColour(hue, params.saturation);
         composite.use().texture('u_accum', accum.read.texture, 0).texture('u_bloom', bloomA.texture, 1)
@@ -226,7 +304,30 @@ export default defineSimulation({
           gl.bindVertexArray(vao); gl.drawArrays(gl.POINTS, 0, sparkles.count); gl.bindVertexArray(null);
           gl.disable(gl.BLEND);
         }
-        // 4. Queue a probe readback for a later frame's signals, if a slot is free.
+        // The ghost of the solid that is painting: the scan when there is one, else the skeleton; nothing for a bare position.
+        if (params.ghost > 0) {
+          const bounds = ghostGeo.data;
+          let count = 0, mode = 0;
+          const scanReady = surface ? surfaceTexture.upload(surface) : false;
+          if (scanReady) {
+            const b = scanBounds(surface!, aspect);
+            if (b) { bounds[0] = b.x; bounds[1] = b.y; bounds[2] = 0; bounds[3] = b.r; count = 1; mode = 1; }
+          } else if (hands.some(h => h.capsules.length)) {
+            packHands(hands.filter(h => h.capsules.length), aspect, depth, packed);
+            bounds.set(packed.bounds.subarray(0, packed.boundCount * FLOATS_PER_BOUND)); count = packed.boundCount;
+          }
+          if (count) {
+            const [r, g, b] = hsv(hue, params.saturation, 1);
+            gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+            const program = ghostProgram.use().matrix4('u_matrix', camera.matrix).f1('u_aspect', aspect).f1('u_eye', camera.eye).f1('u_depth', depth)
+              .f1('u_ghost', params.ghost).i1('u_mode', mode).f3('u_color', r, g, b).i1('u_surfaceReady', mode);
+            if (mode === 1) program.texture('u_surface', surfaceTexture.texture, 0).f2('u_surfaceTexel', 1 / Math.max(1, surfaceTexture.width), 1 / Math.max(1, surfaceTexture.height)).f1('u_surfaceAspect', aspect).f1('u_surfaceDepth', depth);
+            else program.f4v('u_capsules', packed.capsules).i1('u_capsuleCount', packed.count).f4v('u_handBounds', packed.bounds).i1('u_handBoundCount', packed.boundCount);
+            drawInstances(ghostGeo, FLOATS_PER_BOUND, count);
+            gl.disable(gl.BLEND);
+          }
+        }
+        // 5. Queue a probe readback for a later frame's signals, if a slot is free.
         if (inFlight.length < MAX_IN_FLIGHT) {
           const buffer = gl.createBuffer();
           if (buffer) {
@@ -255,14 +356,15 @@ export default defineSimulation({
         const old = accum, oldA = bloomA, oldB = bloomB;
         allocate(width, height, old);
         old.dispose(); oldA.dispose(); oldB.dispose();
-        strokes.reset(); pending.length = 0;
+        strokes.reset(); painter.reset(); pending.length = 0; pendingPools.length = 0;
       },
 
       dispose() {
         for (const { buffer, fence } of inFlight) { gl.deleteSync(fence); gl.deleteBuffer(buffer); }
         inFlight.length = 0;
-        accumulate.dispose(); downsample.dispose(); blur.dispose(); composite.dispose(); probeProgram.dispose(); points.dispose();
-        accum.dispose(); bloomA.dispose(); bloomB.dispose(); probe.dispose();
+        decay.dispose(); strokeProgram.dispose(); poolProgram.dispose(); ghostProgram.dispose(); downsample.dispose(); blur.dispose(); composite.dispose(); probeProgram.dispose(); points.dispose();
+        accum.dispose(); bloomA.dispose(); bloomB.dispose(); probe.dispose(); surfaceTexture.dispose();
+        for (const geo of [strokeGeo, poolGeo, ghostGeo]) { gl.deleteVertexArray(geo.vao); gl.deleteBuffer(geo.vbo); }
         gl.deleteVertexArray(vao); gl.deleteBuffer(vbo);
       },
     };

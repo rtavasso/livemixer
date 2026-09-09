@@ -15,6 +15,32 @@ export const SOURCE_IDS: readonly SourceId[] = ['pointer', 'synthetic', 'webcam'
 
 export interface Box3 { min: Vec3; max: Vec3 }
 
+/**
+ * A solid segment: the volume within `radius` of the line a–b. Hands are built
+ * from these (finger bones, metacarpals, forearm) so simulations can collide
+ * with, occlude with, and draw a real 3D body rather than a point. Endpoints
+ * are in the same frame as the hand's `position`; `radius` follows the x axis
+ * of that frame (like `HandState.radius`).
+ */
+export interface Capsule { a: Vec3; b: Vec3; radius: number }
+
+/**
+ * Foreground occupancy of the tracked volume as voxels, from a depth camera
+ * bridge (everything within the depth range is "foreground"). Row-major with
+ * x fastest, then y, then z; in the source frame z index 0 is the NEAREST
+ * plane to the camera. Values 0..255 = fraction of the voxel filled.
+ */
+export interface VoxelGrid { nx: number; ny: number; nz: number; data: Uint8Array }
+
+/**
+ * The foreground as a depth SURFACE from a depth camera: the 3D scan of whatever is inside
+ * the box's depth range (background filtered out), seen from the camera. Row-major, row 0 =
+ * TOP (image order), u across. A byte is 0 where no foreground was seen, otherwise
+ * 1 + round(254 · w) with w the nearest foreground depth in the cell (0 = near plane,
+ * 1 = far plane). This is the representation to use when a real depth map is available.
+ */
+export interface DepthSurface { width: number; height: number; data: Uint8Array }
+
 /** One tracked hand (or any tracked blob) in the source frame. */
 export interface HandObservation {
   /** Stable while the source keeps tracking the same hand. */
@@ -31,6 +57,8 @@ export interface HandObservation {
   pinch?: number;
   /** Optional point set (landmarks, contour samples) in the source frame. */
   points?: Vec3[];
+  /** Optional solid shape of the hand (skeleton sources). Omit when only a position is known. */
+  capsules?: Capsule[];
 }
 
 /** Optional occupancy grid in the source frame. Row 0 is the TOP row (image order); column 0 is the left. */
@@ -44,6 +72,10 @@ export interface InputFrame {
   receivedAtMs: number;
   hands: HandObservation[];
   occupancy?: OccupancyGrid;
+  /** Optional 3D foreground occupancy from a depth camera bridge. */
+  voxels?: VoxelGrid;
+  /** Optional foreground depth surface (the scan) from a depth camera bridge. */
+  surface?: DepthSurface;
   /** Free-form source telemetry (fps, blob pixel counts, bridge latency). Forwarded to the audio side. */
   stats?: Record<string, number>;
 }
@@ -75,6 +107,12 @@ export interface HandState {
   /** Depth "push" amount: z position smoothed with a faster filter, for tap-like responses. */
   push: number;
   points: Vec3[];
+  /**
+   * The hand as a solid, in sim space: finger bones, metacarpals and forearm for skeleton
+   * sources; empty for sources that only know a position (use `position` + `radius` then).
+   * Moves with the smoothed `position` so it never jitters against it.
+   */
+  capsules: Capsule[];
 }
 
 export interface InputSourceStatus {

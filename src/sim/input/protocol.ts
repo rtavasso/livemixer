@@ -27,7 +27,7 @@
  * the Python bridge has a fixture test against the same sample messages.
  */
 import { z } from 'zod';
-import type { HandObservation, InputFrame, OccupancyGrid } from './types';
+import type { DepthSurface, HandObservation, InputFrame, OccupancyGrid, VoxelGrid } from './types';
 
 export const PROTOCOL_VERSION = 1;
 
@@ -45,6 +45,10 @@ export const bridgeHelloSchema = z.object({
   fps: z.number().positive().optional(),
   /** Occupancy grid size when the bridge sends one. */
   occupancy: z.object({ width: z.number().int().min(1).max(256), height: z.number().int().min(1).max(256) }).optional(),
+  /** Voxel grid size when the bridge sends a 3D foreground field: nx across, ny down, nz deep into the box. */
+  voxels: z.object({ nx: z.number().int().min(1).max(128), ny: z.number().int().min(1).max(128), nz: z.number().int().min(1).max(128) }).optional(),
+  /** Depth surface size when the bridge sends the foreground scan. */
+  surface: z.object({ width: z.number().int().min(1).max(512), height: z.number().int().min(1).max(512) }).optional(),
 }).strict();
 
 export const bridgeHandSchema = z.object({
@@ -69,6 +73,17 @@ export const bridgeFrameSchema = z.object({
   hands: z.array(bridgeHandSchema).max(16),
   /** Base64 of width*height bytes, row-major over the box (not the whole image), row 0 = top. */
   occupancy: z.string().optional(),
+  /**
+   * Base64 of nx*ny*nz bytes: the foreground (everything inside the depth range) as voxel fill
+   * fractions, x fastest, then y (top row first, like the image), then z (nearest plane first).
+   */
+  voxels: z.string().optional(),
+  /**
+   * Base64 of width*height bytes: the foreground depth surface, row-major over the box, row 0 =
+   * top. 0 = nothing seen in the cell; otherwise 1 + round(254 · w), w = nearest foreground depth
+   * (0 = near plane, 1 = far plane).
+   */
+  surface: z.string().optional(),
   stats: z.record(z.string(), unit).optional(),
 }).strict();
 
@@ -102,6 +117,25 @@ export function encodeOccupancy(grid: OccupancyGrid): string {
   return btoa(s);
 }
 
+export function decodeSurface(base64: string, width: number, height: number): DepthSurface {
+  const binary = atob(base64);
+  if (binary.length !== width * height) throw new Error(`Surface payload has ${binary.length} bytes; expected ${width * height}.`);
+  const data = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) data[i] = binary.charCodeAt(i);
+  return { width, height, data };
+}
+
+/** Byte → normalized depth w, or null for an empty cell. Inverse of the bridge's 1 + round(254·w). */
+export const surfaceByteToDepth = (value: number): number | null => value === 0 ? null : (value - 1) / 254;
+
+export function decodeVoxels(base64: string, nx: number, ny: number, nz: number): VoxelGrid {
+  const binary = atob(base64);
+  if (binary.length !== nx * ny * nz) throw new Error(`Voxel payload has ${binary.length} bytes; expected ${nx * ny * nz}.`);
+  const data = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) data[i] = binary.charCodeAt(i);
+  return { nx, ny, nz, data };
+}
+
 const v3 = (t: [number, number, number]) => ({ x: t[0], y: t[1], z: t[2] });
 
 /** Convert a validated bridge frame into the generic input contract. */
@@ -112,7 +146,9 @@ export function bridgeFrameToInput(frame: BridgeFrame, observedAtMs: number, rec
     openness: h.openness, pinch: h.pinch, points: h.points?.map(v3),
   }));
   const occupancy = frame.occupancy && hello?.occupancy ? decodeOccupancy(frame.occupancy, hello.occupancy.width, hello.occupancy.height) : undefined;
-  return { source: 'depth', sequence: frame.seq, observedAtMs, receivedAtMs, hands, occupancy, stats: frame.stats };
+  const voxels = frame.voxels && hello?.voxels ? decodeVoxels(frame.voxels, hello.voxels.nx, hello.voxels.ny, hello.voxels.nz) : undefined;
+  const surface = frame.surface && hello?.surface ? decodeSurface(frame.surface, hello.surface.width, hello.surface.height) : undefined;
+  return { source: 'depth', sequence: frame.seq, observedAtMs, receivedAtMs, hands, occupancy, voxels, surface, stats: frame.stats };
 }
 
 /**

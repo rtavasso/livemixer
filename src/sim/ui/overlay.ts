@@ -182,8 +182,9 @@ export class Overlay {
       nodes.push(el('div', { class: 'row' }, el('label', {}, 'Leap service WebSocket URL', url)));
       nodes.push(el('p', { class: 'hint' }, 'Physical box in millimetres from the device centre: x to your right, y up, z toward you. Read the palm position in the stats line to set it, then fine-tune with calibration.'));
       for (const axis of ['x', 'y', 'z'] as const) nodes.push(el('div', { class: 'row inline' }, el('label', {}, `${axis} min`, inputs[axis][0]), el('label', {}, `${axis} max`, inputs[axis][1])));
-      nodes.push(el('div', { class: 'row' }, el('button', { class: 'primary', onclick: apply }, 'Apply & reconnect')));
-      nodes.push(el('p', { class: 'hint' }, 'Needs "Allow Web Apps" enabled in the Leap Motion control panel (the service then listens on port 6437).'));
+      const ratio = () => (box.z[1] - box.z[0]) / Math.max(1, box.y[1] - box.y[0]);
+      nodes.push(el('div', { class: 'row' }, el('button', { class: 'primary', onclick: apply }, 'Apply & reconnect'), el('button', { title: 'Sets Volume depth to the box depth ÷ height so a solid hand keeps its proportions.', onclick: () => { this.host.setVolumeDepth(ratio()); this.host.warn(`Volume depth set to ${ratio().toFixed(2)} to match the Leap box.`); } }, `Match volume depth (${ratio().toFixed(2)})`)));
+      nodes.push(el('p', { class: 'hint' }, 'Needs "Allow Web Apps" enabled in the Leap Motion control panel (the service then listens on port 6437). Keep the box proportions like the display (width : height : depth ≈ aspect : 1 : volume depth) so the solid hand is not stretched.'));
     }
     if (s.sourceId === 'synthetic') {
       const hands = el('select'); hands.append(el('option', { value: '1' }, '1 hand'), el('option', { value: '2' }, '2 hands')); hands.value = String(settings.synthetic.hands);
@@ -305,8 +306,18 @@ export class Overlay {
     if (!ctx) return;
     const w = c.width, h = c.height;
     ctx.fillStyle = '#070908'; ctx.fillRect(0, 0, w, h);
+    const scan = s.tracked.surface;
+    if (scan) {
+      // The depth scan: nearer cells brighter.
+      const cw = w / scan.width, ch = h / scan.height;
+      for (let row = 0; row < scan.height; row++) for (let col = 0; col < scan.width; col++) {
+        const i = row * scan.width + col; if (!scan.mask[i]) continue;
+        const near = 1 - Math.min(1, Math.max(0, scan.z[i]));
+        ctx.fillStyle = `rgba(150, 200, 255, ${.15 + .7 * near})`; ctx.fillRect(col * cw, h - (row + 1) * ch, cw + .5, ch + .5);
+      }
+    }
     const occ = s.tracked.occupancy;
-    if (occ) {
+    if (occ && !scan) {
       const cw = w / occ.width, ch = h / occ.height;
       for (let row = 0; row < occ.height; row++) for (let col = 0; col < occ.width; col++) {
         const v = occ.data[row * occ.width + col]; if (v < 8) continue;
@@ -318,6 +329,10 @@ export class Overlay {
       // Front view: nearer hands (z → 0) draw larger, as the window camera would show them.
       const x = hand.position.x * w, y = (1 - hand.position.y) * h, size = 4 + 10 * (1 - hand.position.z);
       ctx.strokeStyle = 'rgba(185, 236, 128, .5)'; ctx.strokeRect(hand.extent.min.x * w, (1 - hand.extent.max.y) * h, (hand.extent.max.x - hand.extent.min.x) * w, (hand.extent.max.y - hand.extent.min.y) * h);
+      // The solid shape, when the source knows it: each capsule as a stroke of its own thickness.
+      ctx.strokeStyle = 'rgba(185, 236, 128, .8)'; ctx.lineCap = 'round';
+      for (const c of hand.capsules) { ctx.lineWidth = Math.max(1, c.radius * 2 * w); ctx.beginPath(); ctx.moveTo(c.a.x * w, (1 - c.a.y) * h); ctx.lineTo(c.b.x * w, (1 - c.b.y) * h); ctx.stroke(); }
+      ctx.lineWidth = 1;
       ctx.beginPath(); ctx.arc(x, y, size, 0, Math.PI * 2); ctx.fillStyle = `rgba(185, 236, 128, ${.4 + .6 * hand.openness})`; ctx.fill();
       ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + hand.velocity.x * w * .25, y - hand.velocity.y * h * .25); ctx.strokeStyle = '#e5e9e4'; ctx.stroke();
       ctx.fillStyle = '#9aa79e'; ctx.fillText(`#${hand.id}`, x + 8, y - 8);
@@ -328,8 +343,20 @@ export class Overlay {
     tc.fillStyle = '#070908'; tc.fillRect(0, 0, t.width, t.height);
     tc.strokeStyle = '#2c342f'; tc.strokeRect(.5, .5, t.width - 1, t.height - 1);
     tc.fillStyle = '#4a5a4c'; tc.fillText('glass', 4, t.height - 4); tc.fillText('back', 4, 10);
+    if (scan) {
+      // Top view of the scan: for each column, the nearest scanned depth.
+      tc.fillStyle = 'rgba(150, 200, 255, .8)';
+      for (let col = 0; col < scan.width; col++) {
+        let nearest = Infinity;
+        for (let row = 0; row < scan.height; row++) { const i = row * scan.width + col; if (scan.mask[i]) nearest = Math.min(nearest, scan.z[i]); }
+        if (nearest !== Infinity) tc.fillRect(col * t.width / scan.width, (1 - nearest) * t.height - 1, t.width / scan.width + .5, 2);
+      }
+    }
     for (const hand of s.tracked.hands) {
       const x = hand.position.x * t.width, y = (1 - hand.position.z) * t.height;
+      tc.strokeStyle = 'rgba(185, 236, 128, .8)'; tc.lineCap = 'round';
+      for (const c of hand.capsules) { tc.lineWidth = Math.max(1, c.radius * 2 * t.width); tc.beginPath(); tc.moveTo(c.a.x * t.width, (1 - c.a.z) * t.height); tc.lineTo(c.b.x * t.width, (1 - c.b.z) * t.height); tc.stroke(); }
+      tc.lineWidth = 1;
       tc.beginPath(); tc.arc(x, y, 4, 0, Math.PI * 2); tc.fillStyle = `rgba(185, 236, 128, ${.4 + .6 * hand.openness})`; tc.fill();
       tc.beginPath(); tc.moveTo(x, y); tc.lineTo(x + hand.velocity.x * t.width * .25, y - hand.velocity.z * t.height * .25); tc.strokeStyle = '#e5e9e4'; tc.stroke();
     }

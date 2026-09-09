@@ -119,7 +119,7 @@ describe('hand tracker', () => {
 });
 
 describe('gestures', () => {
-  const hand = (over: Partial<HandState>): HandState => ({ id: 1, position: { x: .5, y: .5, z: .2 }, velocity: { x: 0, y: 0, z: 0 }, speed: 0, extent: { min: { x: .4, y: .4, z: .2 }, max: { x: .6, y: .6, z: .2 } }, radius: .1, openness: 1, pinch: 0, confidence: 1, ageMs: 0, staleMs: 0, push: .2, points: [], ...over });
+  const hand = (over: Partial<HandState>): HandState => ({ id: 1, position: { x: .5, y: .5, z: .2 }, velocity: { x: 0, y: 0, z: 0 }, speed: 0, extent: { min: { x: .4, y: .4, z: .2 }, max: { x: .6, y: .6, z: .2 } }, radius: .1, openness: 1, pinch: 0, confidence: 1, ageMs: 0, staleMs: 0, push: .2, points: [], capsules: [], ...over });
   const run = (script: (t: number) => HandState[] | null, untilMs: number, stepMs = 16) => {
     let memory = emptyGestureMemory(); const events: GestureEvent[] = [];
     for (let t = 0; t <= untilMs; t += stepMs) { const r = detectGestures(memory, script(t) ?? [], t); memory = r.memory; events.push(...r.events); }

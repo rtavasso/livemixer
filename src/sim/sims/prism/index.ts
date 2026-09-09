@@ -24,6 +24,17 @@
  * crosses it and whose interior is tinted by the light passing through. A
  * floor grid in the composite makes the volume readable.
  *
+ * Hands are bodies in the light plane (`solids.ts`): the depth scan when the
+ * source has one (the primary representation), otherwise the skeleton's
+ * capsules, become opaque occluders in the tracer's plane. A ray that meets
+ * one stops there, its energy is counted in the `occluded` signal, and the
+ * hit is drawn as a warm splash on the skin, so a second hand held into the
+ * fan throws a shadow through the spectrum and fingers slice it. The beam's
+ * own hand is the emitter: what lies within a palm's reach of its origin is
+ * passed through by a ray's first segment, and rays start just outside the
+ * palm. The solids themselves are drawn as faint ghosts at their real height
+ * (the scan marched as a thin shell, or the capsule field sphere-traced).
+ *
  * The camera is the window construction with the eye raised above the
  * volume (`geometry.ts`): the shared window camera sits at mid height and
  * would see the light plane edge-on.
@@ -39,16 +50,20 @@ import { defineSimulation, type SimInput, type Vec3 } from '../../core/types';
 import type { HandState } from '../../input/types';
 import { approach, clamp, clamp01 } from '../../core/math';
 import { bindScreen, Fbo, pickFormat } from '../../gl/fbo';
+import { createPackedHands, handSdfGlsl, packHands } from '../../gl/hand';
+import { SurfaceTexture, surfaceGlsl } from '../../gl/surface';
 import { GLSL_HEADER, Program } from '../../gl/program';
 import { drawQuad, quadProgram } from '../../gl/quad';
 import {
-  beamGain, beamWidth, FLOOR_LINE_GAIN, GLASS, idleOrbit, lightPlane, LINE, MAX_POLYGONS, MAX_SEGMENTS, MAX_VERTICES, nextRayBudget,
-  prismCentre, prismRadius, QUALITY, rayCount, SPLASH, TRACE_DEFAULTS, traceOptionsFor, type PlanePoint,
+  beamGain, beamWidth, CLEARANCE_MAX, FLOOR_LINE_GAIN, GHOST, GLASS, idleOrbit, lightPlane, LINE, MAX_OCCLUDER_GROUPS, MAX_OCCLUDERS, MAX_POLYGONS,
+  MAX_SEGMENTS, MAX_VERTICES, nextRayBudget, PALM_REACH, prismCentre, prismRadius, QUALITY, rayCount, SCAN_THICKNESS, SCAN_TOLERANCE, SKIN_SPLASH,
+  SPLASH, TOUCH_MARGIN, TRACE_DEFAULTS, traceOptionsFor, type PlanePoint,
 } from './config';
 import {
-  buildSpectrum, CAUCHY_B_GLASS, createPolygon, SEGMENT_STRIDE, setRegularPolygon, Tracer,
+  buildSpectrum, CAUCHY_B_GLASS, createPolygon, HIT_STRIDE, MAX_HITS, OccluderSet, SEGMENT_STRIDE, setRegularPolygon, Tracer,
   type BeamSource, type Polygon, type RawSignals, type Spectrum,
 } from './optics';
+import { addHandOccluders, addScanOccluders, type Emitter } from './solids';
 import { EYE_HEIGHT, faceBrightness, prismCamera, prismCorners, prismSilhouette } from './geometry';
 
 const TAU = Math.PI * 2;
@@ -144,6 +159,97 @@ void main() {
   float d2 = dot(v_uv, v_uv);
   float s = exp(-d2 * 3.0) * (1.0 - smoothstep(0.6, 1.0, d2));
   o = vec4(v_rgb * (v_int * s), 1.0);
+}`;
+
+// Splashes on skin: one disc per ray that ended on a solid, lying in the solid's tangent plane at the hit
+// (the tracer records the surface normal there), drawn with the wall splash's fragment shader.
+const SKIN_VS = `${GLSL_HEADER}
+layout(location = 0) in vec4 a_hit;   // x z nx nz: the point in the light plane and the normal's in-plane part
+layout(location = 1) in vec4 a_col;   // r g b intensity
+layout(location = 2) in vec2 a_h;     // plane height, the normal's vertical component
+uniform mat4 u_matrix;
+uniform float u_radius, u_gain;
+uniform vec3 u_tint;
+out vec2 v_uv; flat out vec3 v_rgb; flat out float v_int;
+void main() {
+  int id = gl_VertexID - (gl_VertexID / 6) * 6;
+  float a = (id == 1 || id == 2 || id == 4) ? 1.0 : -1.0;
+  float b = (id == 2 || id == 4 || id == 5) ? 1.0 : -1.0;
+  vec3 p = vec3(a_hit.x, a_h.x, a_hit.y);
+  vec3 n = normalize(vec3(a_hit.z, a_h.y, a_hit.w));
+  vec3 ref = abs(n.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+  vec3 u = normalize(cross(n, ref)), v = cross(n, u);
+  v_uv = vec2(a, b); v_rgb = a_col.rgb * u_tint; v_int = a_col.a * u_gain;
+  gl_Position = u_matrix * vec4(p + n * 0.003 + u * (u_radius * a) + v * (u_radius * b), 1.0);
+}`;
+
+// The solids themselves, as faint ghosts at their real height: the depth scan marched with the prism's camera
+// (only inside the scanned body's projected box), or the skeleton's capsule field sphere-traced where a ray meets a
+// hand's bounding sphere. Additive into the scene target, so the glow picks them up a little.
+const GHOST_FS = `${GLSL_HEADER}
+in vec2 v_uv; out vec4 o;
+uniform float u_aspect, u_depth, u_eye, u_eyeY, u_ghost;
+uniform vec3 u_color;
+uniform vec4 u_scanBox;               // ndc box of the scanned body: x0 y0 x1 y1 (empty when nothing is scanned)
+uniform vec3 u_scanZ;                 // world z range of the scanned body (front, back) and the shell's thickness
+${handSdfGlsl()}
+${surfaceGlsl()}
+vec3 handNormal(vec3 p) {
+  vec2 e = vec2(0.004, 0.0);
+  return normalize(vec3(handDistance(p + e.xyy) - handDistance(p - e.xyy), handDistance(p + e.yxy) - handDistance(p - e.yxy), handDistance(p + e.yyx) - handDistance(p - e.yyx)));
+}
+vec3 skin(vec3 n, vec3 rd, float depth01) {
+  float rim = pow(1.0 - abs(dot(n, -rd)), 2.5);
+  float lit = 0.75 + 0.25 * n.y;
+  return u_color * (${GHOST.base.toFixed(4)} * lit + ${GHOST.rim.toFixed(4)} * rim) * u_ghost / (1.0 + 0.9 * depth01);
+}
+bool inShell(vec3 p) {
+  vec2 xy = vec2(p.x / u_aspect, p.y);
+  if (xy.x < 0.0 || xy.x > 1.0 || xy.y < 0.0 || xy.y > 1.0) return false;
+  vec2 s = texture(u_surface, xy).rg;
+  float zs = s.r * u_depth;
+  return s.g > 0.5 && p.z >= zs && p.z <= zs + u_scanZ.z;
+}
+// March the ray through the scanned body's depth range until it is inside the shell (behind the scanned front, within its
+// thickness): the shell is a skin of the volume, not everything behind it, which matters from a raised eye.
+vec4 scanHit(vec3 ro, vec3 rd) {
+  if (rd.z <= 1e-5) return vec4(0.0);
+  float t0 = max(0.0, (u_scanZ.x - ro.z) / rd.z), t1 = (u_scanZ.y - ro.z) / rd.z;
+  if (t1 <= t0) return vec4(0.0);
+  float dt = (t1 - t0) / 48.0;
+  for (int i = 0; i <= 48; i++) {
+    vec3 p = ro + rd * (t0 + dt * float(i));
+    if (!inShell(p)) continue;
+    vec3 a = p - rd * dt, b = p;
+    for (int j = 0; j < 4; j++) { vec3 m = (a + b) * 0.5; if (inShell(m)) b = m; else a = m; }
+    return vec4(b, 1.0);
+  }
+  return vec4(0.0);
+}
+void main() {
+  vec2 ndc = v_uv * 2.0 - 1.0;
+  vec3 ro = vec3(u_aspect * 0.5, u_eyeY, -u_eye);
+  vec3 rd = normalize(vec3(ndc.x * u_aspect * 0.5, 0.5 + ndc.y * 0.5 - u_eyeY, u_eye));
+  vec3 light = vec3(0.0);
+  if (u_surfaceReady == 1 && all(greaterThanEqual(ndc, u_scanBox.xy)) && all(lessThanEqual(ndc, u_scanBox.zw))) {
+    vec4 hit = scanHit(ro, rd);
+    if (hit.w > 0.0) light += skin(surfaceNormal(vec2(hit.x / u_aspect, hit.y)), rd, clamp(hit.z / u_depth, 0.0, 1.0));
+  }
+  if (u_capsuleCount > 0) {
+    vec2 span = handBoundsHit(ro, rd);
+    if (span.y > max(span.x, 0.0)) {
+      float t = max(span.x, 0.0), tEnd = span.y, hit = -1.0;
+      for (int i = 0; i < 32; i++) {
+        vec3 q = ro + rd * t;
+        float d = handDistance(q);
+        if (d < 0.0015) { hit = t; break; }
+        t += max(d, 0.0025);
+        if (t > tEnd) break;
+      }
+      if (hit > 0.0) { vec3 q = ro + rd * hit; light += skin(handNormal(q), rd, clamp(q.z / u_depth, 0.0, 1.0)); }
+    }
+  }
+  o = vec4(light, 1.0);
 }`;
 
 // Glass faces: flat additive fills with a per-face brightness computed on the CPU.
@@ -246,14 +352,18 @@ void main() {
   o = vec4(srgb + (n - .5) / 255.0, 1.0);
 }`;
 
-/** A light source: position in the volume (uniform units), beam openness, presence weight, and the point in the plane it aims at. */
-interface Source { x: number; y: number; z: number; open: number; weight: number; aimX: number; aimZ: number }
+/** A light source: position in the volume (uniform units), beam openness, presence weight, the point in the plane it aims at, and the hand it belongs to (−1 for none). */
+interface Source { x: number; y: number; z: number; open: number; weight: number; aimX: number; aimZ: number; handId: number }
 
-/** GPU side of one beam: its own segment buffer, how many segments it holds, and the height of its light plane. */
-interface BeamSlot { vbo: WebGLBuffer; vao: WebGLVertexArrayObject; count: number; planeY: number }
+/** GPU side of one beam: its segment buffer and its skin-hit buffer, how many of each it holds, and the height of its light plane. */
+interface BeamSlot { vbo: WebGLBuffer; vao: WebGLVertexArrayObject; count: number; hitVbo: WebGLBuffer; hitVao: WebGLVertexArrayObject; hitCount: number; planeY: number }
 
 /** Cheap per-frame numbers for profiling; published on window.prismDiagnostics for tooling, never read by the simulation. */
-export interface PrismDiagnostics { traceMs: number; segments: number; rays: number; truncated: boolean }
+export interface PrismDiagnostics {
+  traceMs: number; segments: number; rays: number; truncated: boolean;
+  /** Solids in the last traced plane, rays that ended on one, whether they came from a depth scan, and the primary beam's plane and origin (sim space). */
+  occluders: number; hits: number; scanned: boolean; planeY: number; sourceX: number; sourceZ: number;
+}
 
 export default defineSimulation({
   id: 'prism',
@@ -281,6 +391,7 @@ export default defineSimulation({
     incidence: { min: 0, max: 1, description: 'Angle of incidence at first contact with glass, 0 = head-on, 1 = grazing; 0 while the beam passes over the glass.', smoothing: .15 },
     inside: { min: 0, max: 1, description: 'Fraction of traced segments that lie inside glass.', smoothing: .15 },
     elevation: { min: 0, max: 1, description: 'Height of the light plane: the hand\'s y in the volume, smoothed; 0.5 for the idle beam.', smoothing: .15 },
+    occluded: { min: 0, max: 1, description: 'Fraction of the launched beam energy stopped by a body in the light plane (a hand or the depth scan), across both beams, smoothed.', smoothing: .15 },
   },
   create(ctx) {
     const gl = ctx.gl;
@@ -291,7 +402,7 @@ export default defineSimulation({
     const polygons: Polygon[] = [createPolygon(MAX_VERTICES), createPolygon(MAX_VERTICES)];
     const activePolygons: Polygon[] = [];
     const noPolygons: Polygon[] = [];
-    const beamPool: BeamSource[] = [0, 1].map(() => ({ x: 0, y: 0, dirX: 1, dirY: 0, width: .03, intensity: 0, rays: 1, gain: 1 }));
+    const beamPool: BeamSource[] = [0, 1].map(() => ({ x: 0, y: 0, dirX: 1, dirY: 0, width: .03, intensity: 0, rays: 1, gain: 1, clearance: { x: 0, y: 0, radius: 0 } }));
     const beamList: BeamSource[] = [beamPool[0]];
     const polyUniform = new Float32Array(MAX_POLYGONS * MAX_VERTICES * 2);
     const polyCounts = new Int32Array(MAX_POLYGONS);
@@ -304,10 +415,13 @@ export default defineSimulation({
     const format = pickFormat(ctx.capabilities, ['rgba16f', 'rgba8']);
     const lineProgram = new Program(gl, LINE_VS, LINE_FS, 'prism-lines');
     const splashProgram = new Program(gl, SPLASH_VS, SPLASH_FS, 'prism-splash');
+    const skinProgram = new Program(gl, SKIN_VS, SPLASH_FS, 'prism-skin');
     const faceProgram = new Program(gl, FACE_VS, FACE_FS, 'prism-faces');
     const downsample = quadProgram(gl, DOWNSAMPLE_FS, 'prism-down');
     const blur = quadProgram(gl, BLUR_FS, 'prism-blur');
     const composite = quadProgram(gl, COMPOSITE_FS, 'prism-composite');
+    const ghost = quadProgram(gl, GHOST_FS, 'prism-ghost');
+    const surfaceTexture = new SurfaceTexture(gl);
 
     function buffer(bytes: number): WebGLBuffer {
       const b = gl.createBuffer();
@@ -320,14 +434,23 @@ export default defineSimulation({
       if (!v) throw new Error('Could not allocate a prism vertex array.');
       return v;
     }
-    /** One beam's segment buffer: attributes 0 and 1 per instance from the tracer's layout, attribute 2 left constant. */
+    /**
+     * One beam's buffers: segments (attributes 0 and 1 per instance from the tracer's layout, attribute 2 left constant)
+     * and skin hits (attributes 0, 1, 2 per instance from the tracer's hit layout).
+     */
     function beamSlot(): BeamSlot {
       const vbo = buffer(MAX_SEGMENTS * SEGMENT_STRIDE * 4), vao = vertexArray();
       gl.bindVertexArray(vao); gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
       gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 4, gl.FLOAT, false, SEGMENT_STRIDE * 4, 0); gl.vertexAttribDivisor(0, 1);
       gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 4, gl.FLOAT, false, SEGMENT_STRIDE * 4, 16); gl.vertexAttribDivisor(1, 1);
       gl.bindVertexArray(null); gl.bindBuffer(gl.ARRAY_BUFFER, null);
-      return { vbo, vao, count: 0, planeY: IDLE_HEIGHT };
+      const hitVbo = buffer(MAX_HITS * HIT_STRIDE * 4), hitVao = vertexArray();
+      gl.bindVertexArray(hitVao); gl.bindBuffer(gl.ARRAY_BUFFER, hitVbo);
+      gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 4, gl.FLOAT, false, HIT_STRIDE * 4, 0); gl.vertexAttribDivisor(0, 1);
+      gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 4, gl.FLOAT, false, HIT_STRIDE * 4, 16); gl.vertexAttribDivisor(1, 1);
+      gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 2, gl.FLOAT, false, HIT_STRIDE * 4, 32); gl.vertexAttribDivisor(2, 1);
+      gl.bindVertexArray(null); gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      return { vbo, vao, count: 0, hitVbo, hitVao, hitCount: 0, planeY: IDLE_HEIGHT };
     }
     const slots: BeamSlot[] = [beamSlot(), beamSlot()];
     const edgeVbo = buffer(edgeData.byteLength), edgeVao = vertexArray();
@@ -355,18 +478,26 @@ export default defineSimulation({
     allocate();
 
     // Simulation state. All motion is smoothed so nothing snaps when hands flicker.
-    const primary: Source = { x: 0, y: IDLE_HEIGHT, z: 0, open: IDLE_OPENNESS, weight: 0, aimX: 0, aimZ: 0 };
-    const second: Source = { x: 0, y: IDLE_HEIGHT, z: 0, open: IDLE_OPENNESS, weight: 0, aimX: 0, aimZ: 0 };
+    const primary: Source = { x: 0, y: IDLE_HEIGHT, z: 0, open: IDLE_OPENNESS, weight: 0, aimX: 0, aimZ: 0, handId: -1 };
+    const second: Source = { x: 0, y: IDLE_HEIGHT, z: 0, open: IDLE_OPENNESS, weight: 0, aimX: 0, aimZ: 0, handId: -1 };
     let time = 0, rotation = .3, orbit = 2.2, presence = 0;
     const idle: PlanePoint = { x: 0, z: 0 };
     let initialised = false, dirty = true;
     /** Fraction of the requested rays actually launched; lowered when a frame hits the segment cap. */
     let rayBudget = 1;
-    const diagnostics: PrismDiagnostics = { traceMs: 0, segments: 0, rays: 0, truncated: false };
+    // The solids: the tracked hands and the depth scan from the last step, the occluders built from them per light
+    // plane, and their GPU forms for the ghost pass (a scan texture, or packed capsules when there is no scan).
+    let hands: readonly HandState[] = [];
+    let surface: SimInput['surface'] = null;
+    const occluders = new OccluderSet(MAX_OCCLUDERS, MAX_OCCLUDER_GROUPS);
+    const emitter: Emitter = { x: 0, y: 0, z: 0, reach: PALM_REACH, touch: TOUCH_MARGIN };
+    const packed = createPackedHands();
+    const scanBox = new Float32Array([2, 2, -2, -2]), scanZ = new Float32Array([0, 0]);
+    const diagnostics: PrismDiagnostics = { traceMs: 0, segments: 0, rays: 0, truncated: false, occluders: 0, hits: 0, scanned: false, planeY: 0, sourceX: 0, sourceZ: 0 };
     const global = globalThis as { prismDiagnostics?: PrismDiagnostics };
     global.prismDiagnostics = diagnostics;
-    const raw: RawSignals = { spread: 0, hue: .3, brightness: 0, reflected: 0, incidence: 0, inside: 0 };
-    const smooth = { spread: 0, hue: .3, brightness: 0, reflected: 0, incidence: 0, inside: 0, elevation: IDLE_HEIGHT };
+    const raw: RawSignals = { spread: 0, hue: .3, brightness: 0, reflected: 0, incidence: 0, inside: 0, occluded: 0 };
+    const smooth = { spread: 0, hue: .3, brightness: 0, reflected: 0, incidence: 0, inside: 0, elevation: IDLE_HEIGHT, occluded: 0 };
 
     const centreA: PlanePoint = { x: 0, z: 0 }, centreB: PlanePoint = { x: 0, z: 0 };
     function placePrisms(twin: boolean) { prismCentre(0, twin, aspect, depth, centreA); prismCentre(1, twin, aspect, depth, centreB); }
@@ -437,13 +568,56 @@ export default defineSimulation({
       }
     }
 
-    /** Trace one beam into its slot and upload the segments. The light meets the glass only if its plane is within the prism's height. */
-    function traceBeam(slot: BeamSlot, beam: BeamSource, planeY: number, prismHeight: number, options: ReturnType<typeof traceOptionsFor>) {
+    /**
+     * The solids in one beam's light plane: the depth scan when there is one (the primary representation), otherwise
+     * every hand's capsules. The beam's own hand is the emitter: what lies within a palm's reach of it is passed through
+     * by the first segment, and the clearance disc (the palm's extent, capped) is where the rays start.
+     */
+    function buildOccluders(planeY: number, source: Source, beam: BeamSource) {
+      let own: HandState | undefined;
+      if (source.handId >= 0) for (const h of hands) if (h.id === source.handId) { own = h; break; }
+      const px = own ? own.position.x * aspect : source.x, pz = own ? own.position.z * depth : source.z;
+      emitter.x = px; emitter.y = planeY; emitter.z = pz; emitter.reach = PALM_REACH; emitter.touch = beam.width / 2 + TOUCH_MARGIN;
+      occluders.begin(planeY, px, pz);
+      if (surface) addScanOccluders(occluders, surface, planeY, aspect, depth, SCAN_THICKNESS, SCAN_TOLERANCE, own ? emitter : null);
+      else for (const hand of hands) addHandOccluders(occluders, hand, aspect, depth, own === hand ? emitter : null);
+      const clearance = beam.clearance!;
+      clearance.x = px; clearance.y = pz; clearance.radius = Math.min(CLEARANCE_MAX, occluders.palmReach);
+    }
+
+    /** The scanned body's box on the screen (ndc), from the scan's extent in sim space projected through the prism's camera, so the ghost pass marches only there. */
+    const corner: Vec3 = { x: 0, y: 0, z: 0 };
+    function scanBounds(field: NonNullable<SimInput['surface']>) {
+      let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
+      const w = field.width, hgt = field.height;
+      for (let row = 0; row < hgt; row++) for (let col = 0; col < w; col++) {
+        const i = row * w + col;
+        if (field.mask[i] === 0) continue;
+        if (col < x0) x0 = col; if (col + 1 > x1) x1 = col + 1; if (row < y0) y0 = row; if (row + 1 > y1) y1 = row + 1;
+        const z = field.z[i]; if (z < z0) z0 = z; if (z > z1) z1 = z;
+      }
+      if (x0 === Infinity) { scanBox[0] = scanBox[1] = 2; scanBox[2] = scanBox[3] = -2; scanZ[0] = scanZ[1] = 0; return; }
+      scanZ[0] = z0 * depth; scanZ[1] = Math.min(depth, (z1 + SCAN_THICKNESS) * depth);
+      let nx0 = Infinity, ny0 = Infinity, nx1 = -Infinity, ny1 = -Infinity;
+      for (let c = 0; c < 8; c++) {
+        corner.x = ((c & 1) ? x1 : x0) / w * aspect; corner.y = ((c & 2) ? y1 : y0) / hgt; corner.z = Math.min(depth, ((c & 4) ? z1 + SCAN_THICKNESS : z0) * depth);
+        const p = camera.project(corner);
+        if (p.x < nx0) nx0 = p.x; if (p.x > nx1) nx1 = p.x; if (p.y < ny0) ny0 = p.y; if (p.y > ny1) ny1 = p.y;
+      }
+      const pad = .02;
+      scanBox[0] = nx0 - pad; scanBox[1] = ny0 - pad; scanBox[2] = nx1 + pad; scanBox[3] = ny1 + pad;
+    }
+
+    /** Trace one beam into its slot and upload the segments and skin hits. The light meets the glass only if its plane is within the prism's height. */
+    function traceBeam(slot: BeamSlot, beam: BeamSource, source: Source, planeY: number, prismHeight: number, options: ReturnType<typeof traceOptionsFor>) {
+      buildOccluders(planeY, source, beam);
       beamList[0] = beam;
-      const stats = tracer.trace(planeY <= prismHeight ? activePolygons : noPolygons, beamList, options);
-      slot.count = stats.segments; slot.planeY = planeY;
+      const stats = tracer.trace(planeY <= prismHeight ? activePolygons : noPolygons, beamList, options, occluders);
+      slot.count = stats.segments; slot.hitCount = tracer.hitCount; slot.planeY = planeY;
       gl.bindBuffer(gl.ARRAY_BUFFER, slot.vbo);
       if (slot.count > 0) gl.bufferSubData(gl.ARRAY_BUFFER, 0, tracer.segments, 0, slot.count * SEGMENT_STRIDE);
+      gl.bindBuffer(gl.ARRAY_BUFFER, slot.hitVbo);
+      if (slot.hitCount > 0) gl.bufferSubData(gl.ARRAY_BUFFER, 0, tracer.hits, 0, slot.hitCount * HIT_STRIDE);
       gl.bindBuffer(gl.ARRAY_BUFFER, null);
       return stats;
     }
@@ -458,23 +632,29 @@ export default defineSimulation({
       const rays = rayCount(params.rays, quality, rayBudget);
       const options = traceOptionsFor(quality, spectrum, params, aspect, depth, CAUCHY_B_GLASS);
       const t0 = performance.now();
-      // The primary beam: the signals describe this one.
+      // The primary beam: the signals describe this one (except `occluded`, which counts both beams).
       fillBeam(beamPool[0], primary, params.idle + (1 - params.idle) * primary.weight, rays, params.beam, sceneHeight);
-      const a = traceBeam(slots[0], beamPool[0], primary.y, params.height, options);
-      let segments = a.segments, launched = a.rays, truncated = a.truncated;
+      const a = traceBeam(slots[0], beamPool[0], primary, primary.y, params.height, options);
+      let segments = a.segments, launched = a.rays, truncated = a.truncated, occludedEnergy = a.occluded, launchedEnergy = a.launched;
+      let solids = occluders.count, hits = tracer.hitCount;
       tracer.signals(raw);
       // A second hand carries its own beam in its own plane.
       if (second.weight > .01) {
         fillBeam(beamPool[1], second, second.weight, Math.max(4, Math.round(rays * .6)), params.beam, sceneHeight);
-        const b = traceBeam(slots[1], beamPool[1], second.y, params.height, options);
-        segments += b.segments; launched += b.rays; truncated = truncated || b.truncated;
-      } else slots[1].count = 0;
+        const b = traceBeam(slots[1], beamPool[1], second, second.y, params.height, options);
+        segments += b.segments; launched += b.rays; truncated = truncated || b.truncated; occludedEnergy += b.occluded; launchedEnergy += b.launched;
+        solids = Math.max(solids, occluders.count); hits += tracer.hitCount;
+      } else { slots[1].count = 0; slots[1].hitCount = 0; }
+      raw.occluded = launchedEnergy > 1e-9 ? clamp01(occludedEnergy / launchedEnergy) : 0;
       diagnostics.traceMs = performance.now() - t0; diagnostics.segments = segments; diagnostics.rays = launched; diagnostics.truncated = truncated;
+      diagnostics.occluders = solids; diagnostics.hits = hits; diagnostics.scanned = surface !== null;
+      diagnostics.planeY = primary.y; diagnostics.sourceX = primary.x / aspect; diagnostics.sourceZ = primary.z / depth;
       rayBudget = nextRayBudget(rayBudget, truncated);
     }
 
     const plane: Vec3 = { x: 0, y: 0, z: 0 };
     function updateSource(source: Source, hand: HandState | null, dt: number, radius: number, twin: boolean, rest: boolean) {
+      source.handId = hand ? hand.id : -1;
       if (hand) {
         lightPlane(hand.position, aspect, depth, plane);
         if (!initialised || (source.weight < .001 && !rest)) { source.x = plane.x; source.y = plane.y; source.z = plane.z; }
@@ -500,6 +680,7 @@ export default defineSimulation({
       smooth.incidence = approach(smooth.incidence, raw.incidence, dt, k);
       smooth.inside = approach(smooth.inside, raw.inside, dt, k);
       smooth.hue = approach(smooth.hue, raw.hue, dt, k);
+      smooth.occluded = approach(smooth.occluded, raw.occluded, dt, k);
       smooth.elevation = approach(smooth.elevation, primary.y, dt, k);
       for (const key of Object.keys(smooth) as (keyof typeof smooth)[]) smooth[key] = clamp01(smooth[key]);
     }
@@ -515,7 +696,7 @@ export default defineSimulation({
     return {
       step(input: SimInput, params) {
         const dt = input.dt;
-        time = input.time; presence = input.presence;
+        time = input.time; presence = input.presence; hands = input.hands; surface = input.surface;
         rotation += params.spin * dt;
         if (rotation > TAU) rotation -= TAU; else if (rotation < 0) rotation += TAU;
         placePrisms(params.twin);
@@ -539,12 +720,26 @@ export default defineSimulation({
         if (dirty) { traceScene(params); dirty = false; }
         if (!scene || !half || !quarterA || !quarterB || !wide) return;
 
-        // 1. Everything luminous, additively, into the half-float scene: glass faces, beams and their floor footprints, glass edges, wall splashes.
+        // 1. Everything luminous, additively, into the half-float scene: the ghost solids, glass faces, beams and their
+        //    floor footprints, glass edges, wall splashes, skin splashes.
         gl.bindBuffer(gl.ARRAY_BUFFER, edgeVbo); gl.bufferSubData(gl.ARRAY_BUFFER, 0, edgeData, 0, edgeCount * EDGE_STRIDE);
         gl.bindBuffer(gl.ARRAY_BUFFER, faceVbo); gl.bufferSubData(gl.ARRAY_BUFFER, 0, faceData, 0, faceVertexCount * FACE_STRIDE);
         gl.bindBuffer(gl.ARRAY_BUFFER, null);
         scene.clear(0, 0, 0, 1);
         gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+        // The scan is the solid when present; the skeleton ghost only draws without one.
+        const scanReady = surfaceTexture.upload(surface);
+        packHands(scanReady ? [] : hands, aspect, depth, packed);
+        if (scanReady && surface) scanBounds(surface);
+        if (scanReady || packed.count > 0) {
+          ghost.use().f1('u_aspect', aspect).f1('u_depth', depth).f1('u_eye', camera.eye).f1('u_eyeY', EYE_HEIGHT).f1('u_ghost', 1)
+            .f3('u_color', GHOST.color[0], GHOST.color[1], GHOST.color[2]).f4('u_scanBox', scanBox[0], scanBox[1], scanBox[2], scanBox[3])
+            .f3('u_scanZ', scanZ[0], scanZ[1], SCAN_THICKNESS * depth)
+            .f4v('u_capsules', packed.capsules).i1('u_capsuleCount', packed.count).f4v('u_handBounds', packed.bounds).i1('u_handBoundCount', packed.boundCount)
+            .texture('u_surface', surfaceTexture.texture, 0).i1('u_surfaceReady', scanReady ? 1 : 0)
+            .f2('u_surfaceTexel', 1 / Math.max(1, surfaceTexture.width), 1 / Math.max(1, surfaceTexture.height)).f1('u_surfaceAspect', aspect).f1('u_surfaceDepth', depth);
+          drawQuad(gl);
+        }
         faceProgram.use().matrix4('u_matrix', camera.matrix).f3('u_color', GLASS.color[0], GLASS.color[1], GLASS.color[2]);
         gl.bindVertexArray(faceVao);
         if (faceVertexCount > 0) gl.drawArrays(gl.TRIANGLES, 0, faceVertexCount);
@@ -563,6 +758,14 @@ export default defineSimulation({
           if (slot.count === 0) continue;
           gl.bindVertexArray(slot.vao); gl.vertexAttrib2f(2, slot.planeY, slot.planeY);
           gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, slot.count);
+        }
+        if (slots[0].hitCount + slots[1].hitCount > 0) {
+          skinProgram.use().matrix4('u_matrix', camera.matrix).f1('u_radius', SKIN_SPLASH.radius).f1('u_gain', SKIN_SPLASH.gain / (SKIN_SPLASH.radius * scene.height))
+            .f3('u_tint', SKIN_SPLASH.tint[0], SKIN_SPLASH.tint[1], SKIN_SPLASH.tint[2]);
+          for (const slot of slots) {
+            if (slot.hitCount === 0) continue;
+            gl.bindVertexArray(slot.hitVao); gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, slot.hitCount);
+          }
         }
         gl.bindVertexArray(null);
         gl.disable(gl.BLEND);
@@ -592,9 +795,10 @@ export default defineSimulation({
       dispose() {
         for (const f of [scene, half, quarterA, quarterB, wide]) f?.dispose();
         scene = half = quarterA = quarterB = wide = null;
-        for (const slot of slots) { gl.deleteBuffer(slot.vbo); gl.deleteVertexArray(slot.vao); }
+        for (const slot of slots) { gl.deleteBuffer(slot.vbo); gl.deleteVertexArray(slot.vao); gl.deleteBuffer(slot.hitVbo); gl.deleteVertexArray(slot.hitVao); }
         gl.deleteBuffer(edgeVbo); gl.deleteVertexArray(edgeVao); gl.deleteBuffer(faceVbo); gl.deleteVertexArray(faceVao);
-        lineProgram.dispose(); splashProgram.dispose(); faceProgram.dispose(); downsample.dispose(); blur.dispose(); composite.dispose();
+        lineProgram.dispose(); splashProgram.dispose(); skinProgram.dispose(); faceProgram.dispose(); downsample.dispose(); blur.dispose(); composite.dispose(); ghost.dispose();
+        surfaceTexture.dispose();
         if (global.prismDiagnostics === diagnostics) delete global.prismDiagnostics;
       },
     };

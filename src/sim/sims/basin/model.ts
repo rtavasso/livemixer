@@ -20,9 +20,9 @@
  * domain is exactly one uniform unit, so `bowl` is a radius in uniform units;
  * on a portrait display it shrinks so the bowl always fits.
  */
-import type { Quality } from '../../core/types';
-import type { HandState } from '../../input/types';
-import { clamp, clamp01, rng, smoothstep } from '../../core/math';
+import type { Quality, SurfaceField, Vec3 } from '../../core/types';
+import type { Capsule, HandState } from '../../input/types';
+import { approach, clamp, clamp01, rng, smoothstep } from '../../core/math';
 
 // ---------------------------------------------------------------------------
 // Quality → resources
@@ -72,20 +72,24 @@ export function simVelocityToGrid(v: { x: number; z: number }, aspect: number): 
 /** Splat radius bounds, grid uv: never below a few texels, never a wall. */
 const SPLAT_MIN = .035, SPLAT_MAX = .16;
 
+/** What the basin needs of a hand; `capsules` is the optional solid shape (empty or absent → a sphere). */
+export type BasinHand = Pick<HandState, 'position' | 'extent'> & { capsules?: readonly Capsule[] };
+
 /**
  * A conditioned hand in grid units: planar position and velocity, the footprint it makes on the
- * water, and its height against the surface. Writes into `out` when given (no allocation per step).
+ * water, and its height against the surface. For a solid hand `immersion` is the submerged share
+ * of its capsule length and `clearance` follows its lowest capsule; `extent`/`radius` describe the
+ * sphere fallback only. Writes into `out` when given (no allocation per step).
  */
-export function handToGrid(hand: Pick<HandState, 'position' | 'velocity' | 'radius' | 'extent'>, aspect: number, surface: number, out: GridHand = emptyGridHand()): GridHand {
+export function handToGrid(hand: BasinHand & Pick<HandState, 'velocity' | 'radius'>, aspect: number, surface: number, out: GridHand = emptyGridHand()): GridHand {
   const s = domainScale(aspect);
   out.x = (hand.position.x * aspect - aspect * .5) / s + .5; out.y = (hand.position.z - .5) / s + .5;
   out.vx = hand.velocity.x * aspect / s; out.vy = hand.velocity.z / s;
-  const half = handHalfHeight(hand), bottom = hand.position.y - half;
-  out.clearance = bottom - surface;
-  out.immersion = clamp01((surface - bottom) / (2 * half));
+  out.clearance = handClearance(hand, surface, aspect);
+  out.immersion = handImmersion(hand, surface, aspect);
   out.descent = Math.max(0, -hand.velocity.y);
   out.extent = clamp(hand.radius * aspect / s * .8, SPLAT_MIN, SPLAT_MAX);
-  out.radius = Math.max(SPLAT_MIN, out.extent * footprint(out.immersion));
+  out.radius = Math.max(SPLAT_MIN, out.extent * footprint(sphereImmersion(hand, surface)));
   return out;
 }
 
@@ -113,13 +117,48 @@ export const HAND_HALF_HEIGHT_MIN = .03, HAND_HALF_HEIGHT_MAX = .12;
 /** Vertical half-extent of a hand, uniform units, bounded so a point source still has a body and a spread hand is not a wall. */
 export const handHalfHeight = (hand: Pick<HandState, 'extent'>) => clamp((hand.extent.max.y - hand.extent.min.y) * .5, HAND_HALF_HEIGHT_MIN, HAND_HALF_HEIGHT_MAX);
 
-/** Height of the hand's underside above the surface, uniform units; ≤ 0 once it touches, −2·halfHeight when fully under. */
-export const handClearance = (hand: Pick<HandState, 'position' | 'extent'>, surface: number) => hand.position.y - handHalfHeight(hand) - surface;
-
-/** 0 with the underside above the surface … 1 with the whole hand under; linear in between. */
-export function handImmersion(hand: Pick<HandState, 'position' | 'extent'>, surface: number): number {
+/** Sphere immersion: 0 with the underside above the surface … 1 with the whole body under; linear in between. */
+export function sphereImmersion(hand: Pick<HandState, 'position' | 'extent'>, surface: number): number {
   const half = handHalfHeight(hand);
   return clamp01((surface - (hand.position.y - half)) / (2 * half));
+}
+
+/**
+ * The lowest point of the hand, sim x/z with its height in y: the deepest capsule underside of a
+ * solid hand, the sphere's underside otherwise. `aspect` turns capsule radii (sim x) into heights.
+ */
+export function handUnderside(hand: BasinHand, aspect = 1, out: Vec3 = { x: 0, y: 0, z: 0 }): Vec3 {
+  const caps = hand.capsules;
+  if (caps && caps.length) {
+    let best = Infinity;
+    for (let i = 0; i < caps.length; i++) {
+      const c = caps[i], ry = c.radius * aspect;
+      if (c.a.y - ry < best) { best = c.a.y - ry; out.x = c.a.x; out.y = best; out.z = c.a.z; }
+      if (c.b.y - ry < best) { best = c.b.y - ry; out.x = c.b.x; out.y = best; out.z = c.b.z; }
+    }
+    return out;
+  }
+  out.x = hand.position.x; out.y = hand.position.y - handHalfHeight(hand); out.z = hand.position.z;
+  return out;
+}
+const UNDERSIDE_SCRATCH: Vec3 = { x: 0, y: 0, z: 0 };
+
+/** Height of the hand's underside (its lowest point) above the surface, uniform units; ≤ 0 once it touches. */
+export const handClearance = (hand: BasinHand, surface: number, aspect = 1) => handUnderside(hand, aspect, UNDERSIDE_SCRATCH).y - surface;
+
+/**
+ * How much of the hand is under the surface, 0..1: for a solid hand the submerged share of its
+ * total capsule length (fingertips dipped in read small, a hand plunged to the wrist near 1), for
+ * a bare position the sphere's immersion.
+ */
+export function handImmersion(hand: BasinHand, surface: number, aspect = 1): number {
+  const caps = hand.capsules;
+  if (caps && caps.length) {
+    let wet = 0, total = 0;
+    for (let i = 0; i < caps.length; i++) { capsuleFootprint(caps[i], aspect, surface, FOOT_SCRATCH); wet += FOOT_SCRATCH.wet; total += FOOT_SCRATCH.length; }
+    if (total > 1e-9) return clamp01(wet / total);
+  }
+  return sphereImmersion(hand, surface);
 }
 
 /** How hard a hand grips the water: nothing above the surface, gently when a fingertip touches, fully once plunged. */
@@ -133,6 +172,334 @@ export function immersionSignal(hand: Pick<GridHand, 'x' | 'y' | 'immersion'>, b
   const dx = hand.x - .5, dy = hand.y - .5;
   const gate = 1 - smoothstep(bowl - .04, bowl + .04, Math.sqrt(dx * dx + dy * dy));
   return clamp01(hand.immersion * gate);
+}
+
+// ---------------------------------------------------------------------------
+// Solid hands. A skeleton source supplies capsules in sim space (the radius
+// follows sim x, so as a height it is radius × aspect). Seen from above, a
+// capsule projects onto the water plane as a stadium between its endpoints.
+// The part whose underside is below the surface is its FOOTPRINT: what stirs
+// the water and where the waterline ring sits, with the capsule's cross-
+// section at the surface as its radius. So five dipped fingertips make five
+// small stirs, a flat submerged palm one broad push, a plunged fist one round
+// one. The shadow is the union of the whole capsules, each endpoint displaced
+// and softened by its own height.
+// ---------------------------------------------------------------------------
+
+/** Stirring footprints per step (the advect pass): the nearest to the surface when a hand has more. */
+export const MAX_FOOTPRINTS = 24;
+/** Capsules the composite draws across all hands (a Leap hand has 20–21). */
+export const MAX_SHADOW_CAPSULES = 48;
+/** Smallest stirring footprint radius, grid uv: a few texels even on the low grid. */
+export const FOOT_MIN = .02;
+/** Shadow displacement per unit of height, grid uv (the window is up and to the left). Must match the composite. */
+export const LIGHT_SHIFT: readonly [number, number] = [.167, -.219];
+/** Shadow penumbra: base width plus growth per unit of height, grid uv. Must match the composite. */
+export const PENUMBRA_BASE = .012, PENUMBRA_PER_HEIGHT = .35;
+/** Relative endpoint motion (finger curl, hand rotation) is finite-differenced, capped (uv/s) and smoothed with this time constant. */
+export const REL_MOTION_TAU = .1, REL_MOTION_MAX = 2;
+
+export interface CapsuleFootprint {
+  /** The wet part of the axis on the water plane, grid uv. */
+  ax: number; ay: number; bx: number; by: number;
+  /** Cross-section at the surface, grid uv (never below FOOT_MIN). */
+  radius: number;
+  /** 0 with the underside touching the surface … 1 with the deepest axis point a radius under. */
+  immersion: number;
+  /** How far the capsule's highest point is below the surface; 0 while it pokes through. */
+  near: number;
+  /** Length of the axis itself under the surface, and the full axis length (uniform units on the screen). */
+  wet: number; length: number;
+}
+export const emptyFootprint = (): CapsuleFootprint => ({ ax: 0, ay: 0, bx: 0, by: 0, radius: 0, immersion: 0, near: 0, wet: 0, length: 0 });
+const FOOT_SCRATCH = emptyFootprint();
+
+/**
+ * A capsule's footprint on the water: false (with `wet` = 0) when its underside is above the
+ * surface. The axis is clipped to where the underside is under; the radius is the cross-section of
+ * the capsule at the surface (the full radius once the axis is under, shrinking to nothing as the
+ * underside lifts to it). `length` is always filled so callers can total the hand's capsule length.
+ */
+export function capsuleFootprint(c: Capsule, aspect: number, surface: number, out: CapsuleFootprint = emptyFootprint()): boolean {
+  const s = domainScale(aspect), ry = Math.max(c.radius * aspect, 1e-6);
+  const dx = (c.b.x - c.a.x) * aspect, dy = c.b.y - c.a.y, dz = c.b.z - c.a.z;
+  out.length = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  const hA = c.a.y - ry - surface, hB = c.b.y - ry - surface, hmin = Math.min(hA, hB), hmax = Math.max(hA, hB);
+  out.wet = 0; out.immersion = 0; out.near = 0; out.radius = 0;
+  if (hmin >= 0) return false;
+  // The wet part of the axis: all of it, or the part past the crossing.
+  let tA = 0, tB = 1;
+  if (hmax > 0) { const tc = -hA / (hB - hA); if (hA < 0) tB = tc; else tA = tc; }
+  const ax = (c.a.x * aspect - aspect * .5) / s + .5, ay = (c.a.z - .5) / s + .5;
+  const bx = (c.b.x * aspect - aspect * .5) / s + .5, by = (c.b.z - .5) / s + .5;
+  out.ax = ax + (bx - ax) * tA; out.ay = ay + (by - ay) * tA; out.bx = ax + (bx - ax) * tB; out.by = ay + (by - ay) * tB;
+  const hAxis = Math.max(hmin + ry, 0);
+  out.radius = Math.max(FOOT_MIN, c.radius * aspect / s * Math.sqrt(Math.max(0, 1 - (hAxis / ry) * (hAxis / ry))));
+  out.immersion = clamp01(-hmin / (2 * ry));
+  // The axis itself under the surface (for the hand's immersion): a fingertip touching counts for nothing yet.
+  const aAxis = hA + ry, bAxis = hB + ry;
+  if (Math.min(aAxis, bAxis) < 0) {
+    let uA = 0, uB = 1;
+    if (Math.max(aAxis, bAxis) > 0) { const tc = -aAxis / (bAxis - aAxis); if (aAxis < 0) uB = tc; else uA = tc; }
+    out.wet = (uB - uA) * out.length;
+  }
+  out.near = Math.max(0, -(hmax + 2 * ry));
+  return true;
+}
+
+/**
+ * This step's stirring footprints, packed for the advect pass: `seg` a.xy b.xy (grid uv), `vel` the
+ * velocity at a and at b (uv/s, stir gain applied; they differ when the hand rotates or its fingers
+ * move), `meta` radius, grip 0..1, radial press, 0. Allocates nothing per step.
+ */
+export class Footprints {
+  readonly seg = new Float32Array(MAX_FOOTPRINTS * 4);
+  readonly vel = new Float32Array(MAX_FOOTPRINTS * 4);
+  readonly meta = new Float32Array(MAX_FOOTPRINTS * 4);
+  count = 0;
+  private readonly scratch = new Float32Array(MAX_SHADOW_CAPSULES * 8);
+  private readonly order = new Int32Array(MAX_SHADOW_CAPSULES);
+  private readonly fp = emptyFootprint();
+
+  begin() { this.count = 0; }
+
+  /** The sphere fallback: one round footprint of the hand's `radius` once it grips the water. Returns the footprints added. */
+  addSphere(h: GridHand, stir: number, press: number): number {
+    const grip = stirStrength(h.immersion);
+    if (grip <= 0 || this.count >= MAX_FOOTPRINTS) return 0;
+    const o = this.count++ * 4;
+    this.seg[o] = h.x; this.seg[o + 1] = h.y; this.seg[o + 2] = h.x; this.seg[o + 3] = h.y;
+    this.vel[o] = h.vx * stir; this.vel[o + 1] = h.vy * stir; this.vel[o + 2] = h.vx * stir; this.vel[o + 3] = h.vy * stir;
+    this.meta[o] = h.radius; this.meta[o + 1] = grip; this.meta[o + 2] = press; this.meta[o + 3] = 0;
+    return 1;
+  }
+
+  /**
+   * Every capsule that touches the water, keeping the `budget` nearest the surface. Endpoint
+   * velocities are the hand's (vx, vy in grid uv/s) plus the relative endpoint motion in `rel`
+   * (4 floats per capsule, uv/s) when given. The hand's press is shared out over its footprints.
+   * Returns the footprints added.
+   */
+  addSolid(capsules: readonly Capsule[], aspect: number, surface: number, vx: number, vy: number, rel: Float32Array | null, budget: number, stir: number, press: number): number {
+    const fp = this.fp, sc = this.scratch, order = this.order;
+    const limit = Math.min(capsules.length, MAX_SHADOW_CAPSULES);
+    let n = 0;
+    for (let i = 0; i < limit; i++) {
+      if (!capsuleFootprint(capsules[i], aspect, surface, fp)) continue;
+      const o = n * 8;
+      sc[o] = fp.ax; sc[o + 1] = fp.ay; sc[o + 2] = fp.bx; sc[o + 3] = fp.by;
+      sc[o + 4] = fp.radius; sc[o + 5] = stirStrength(fp.immersion); sc[o + 6] = fp.near; sc[o + 7] = i;
+      // Insertion sort by `near`: the capsules at the surface come first.
+      let k = n;
+      while (k > 0 && sc[order[k - 1] * 8 + 6] > fp.near) { order[k] = order[k - 1]; k--; }
+      order[k] = n; n++;
+    }
+    const take = Math.min(n, budget, MAX_FOOTPRINTS - this.count);
+    if (take <= 0) return 0;
+    const share = press / take;
+    for (let k = 0; k < take; k++) {
+      const src = order[k] * 8, o = this.count++ * 4, ci = sc[src + 7] * 4;
+      this.seg[o] = sc[src]; this.seg[o + 1] = sc[src + 1]; this.seg[o + 2] = sc[src + 2]; this.seg[o + 3] = sc[src + 3];
+      const rax = rel ? rel[ci] : 0, ray = rel ? rel[ci + 1] : 0, rbx = rel ? rel[ci + 2] : 0, rby = rel ? rel[ci + 3] : 0;
+      this.vel[o] = (vx + rax) * stir; this.vel[o + 1] = (vy + ray) * stir; this.vel[o + 2] = (vx + rbx) * stir; this.vel[o + 3] = (vy + rby) * stir;
+      this.meta[o] = sc[src + 4]; this.meta[o + 1] = sc[src + 5]; this.meta[o + 2] = share; this.meta[o + 3] = 0;
+    }
+    return take;
+  }
+}
+
+/**
+ * One hand's solid on the water plane as the composite draws it: `seg` a.xy b.xy per capsule (grid
+ * uv), `meta` radius (uv), the underside clearance of a and of b (uniform units; < 0 in the water,
+ * so the shader can lean and soften the shadow per endpoint and find the wet part for the
+ * waterline ring), and a weight (negative: shadow only, no ring). Plus a bounding circle for the
+ * shader's early-out and the relative motion of the endpoints for the stirring. One per hand,
+ * kept after the hand leaves so its shadow can fade in place.
+ */
+export class SolidShadow {
+  readonly seg = new Float32Array(MAX_SHADOW_CAPSULES * 4);
+  readonly meta = new Float32Array(MAX_SHADOW_CAPSULES * 4);
+  count = 0;
+  /** Bounding circle on the plane, grid uv, covering shadow, penumbra and ring. */
+  cx = .5; cy = .5; bound = 0;
+  /** Relative endpoint velocity per capsule (ax, ay, bx, by), grid uv/s, smoothed. */
+  readonly rel = new Float32Array(MAX_SHADOW_CAPSULES * 4);
+  private readonly prev = new Float32Array(MAX_SHADOW_CAPSULES * 4);
+  private prevCount = -1;
+
+  /** The sphere fallback: a disc of the hand's full radius and a stub of forearm trailing toward the glass edge (shadow only). */
+  setSphere(h: GridHand, aspect: number) {
+    const s = this.seg, m = this.meta;
+    s[0] = h.x; s[1] = h.y; s[2] = h.x; s[3] = h.y;
+    m[0] = h.extent; m[1] = h.clearance; m[2] = h.clearance; m[3] = 1;
+    s[4] = h.x; s[5] = h.y; s[6] = h.x; s[7] = h.y - h.extent * 2.4;
+    m[4] = h.extent * .7; m[5] = h.clearance; m[6] = h.clearance; m[7] = -.5;
+    this.count = 2; this.prevCount = -1; this.rel.fill(0, 0, 8);
+    this.finish(domainScale(aspect));
+  }
+
+  /** A solid hand at grid position (hx, hy); `dt` > 0 lets the relative endpoint motion be tracked across steps. */
+  setSolid(capsules: readonly Capsule[], aspect: number, surface: number, hx: number, hy: number, dt: number) {
+    const s = domainScale(aspect), n = Math.min(capsules.length, MAX_SHADOW_CAPSULES);
+    const track = this.prevCount === n && dt > 0;
+    const k = track ? 1 - Math.exp(-dt / REL_MOTION_TAU) : 0;
+    const seg = this.seg, meta = this.meta, rel = this.rel, prev = this.prev;
+    for (let i = 0; i < n; i++) {
+      const c = capsules[i], ry = c.radius * aspect, o = i * 4;
+      const ax = (c.a.x * aspect - aspect * .5) / s + .5, ay = (c.a.z - .5) / s + .5;
+      const bx = (c.b.x * aspect - aspect * .5) / s + .5, by = (c.b.z - .5) / s + .5;
+      seg[o] = ax; seg[o + 1] = ay; seg[o + 2] = bx; seg[o + 3] = by;
+      meta[o] = c.radius * aspect / s; meta[o + 1] = c.a.y - ry - surface; meta[o + 2] = c.b.y - ry - surface; meta[o + 3] = 1;
+      const rax = ax - hx, ray = ay - hy, rbx = bx - hx, rby = by - hy;
+      if (track) {
+        rel[o] += (clamp((rax - prev[o]) / dt, -REL_MOTION_MAX, REL_MOTION_MAX) - rel[o]) * k;
+        rel[o + 1] += (clamp((ray - prev[o + 1]) / dt, -REL_MOTION_MAX, REL_MOTION_MAX) - rel[o + 1]) * k;
+        rel[o + 2] += (clamp((rbx - prev[o + 2]) / dt, -REL_MOTION_MAX, REL_MOTION_MAX) - rel[o + 2]) * k;
+        rel[o + 3] += (clamp((rby - prev[o + 3]) / dt, -REL_MOTION_MAX, REL_MOTION_MAX) - rel[o + 3]) * k;
+      } else { rel[o] = 0; rel[o + 1] = 0; rel[o + 2] = 0; rel[o + 3] = 0; }
+      prev[o] = rax; prev[o + 1] = ray; prev[o + 2] = rbx; prev[o + 3] = rby;
+    }
+    this.count = n; this.prevCount = n;
+    this.finish(s);
+  }
+
+  /** Bounding circle over the endpoints, undisplaced and shadow-displaced, padded by radius, penumbra and ring width. */
+  private finish(s: number) {
+    const seg = this.seg, meta = this.meta, n = this.count;
+    if (!n) { this.bound = 0; return; }
+    let cx = 0, cy = 0;
+    for (let i = 0; i < n; i++) {
+      const o = i * 4, hA = Math.max(meta[o + 1], 0) / s, hB = Math.max(meta[o + 2], 0) / s;
+      cx += 2 * (seg[o] + seg[o + 2]) + LIGHT_SHIFT[0] * (hA + hB); cy += 2 * (seg[o + 1] + seg[o + 3]) + LIGHT_SHIFT[1] * (hA + hB);
+    }
+    cx /= 4 * n; cy /= 4 * n;
+    let r = 0;
+    for (let i = 0; i < n; i++) {
+      const o = i * 4, rad = meta[o];
+      for (let e = 0; e < 2; e++) {
+        const x = seg[o + e * 2], y = seg[o + e * 2 + 1], h = Math.max(meta[o + 1 + e], 0);
+        const pad = rad + PENUMBRA_BASE + h * PENUMBRA_PER_HEIGHT + .04;
+        const dx = x - cx, dy = y - cy, sx = dx + LIGHT_SHIFT[0] * h / s, sy = dy + LIGHT_SHIFT[1] * h / s;
+        r = Math.max(r, Math.sqrt(dx * dx + dy * dy) + pad, Math.sqrt(sx * sx + sy * sy) + pad);
+      }
+    }
+    this.cx = cx; this.cy = cy; this.bound = r;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The scanned surface. A depth camera sees the performer from the FRONT, so
+// the scan is a height field of depth z over the front face: cell (x, y) → z.
+// Seen from above, that cell is a bit of solid at horizontal position (x, z)
+// (extending SCAN_THICKNESS behind the shell) at height y. Cells at or below
+// the water level are the wet footprint; every cell casts its shadow at its
+// (x, z), displaced and softened by its height. The GPU samples the field
+// column by column; the CPU measures it once per step for the velocity (how
+// the wet centroid moved), the descent (how the lowest point moved), the
+// immersion (the wet share of the scanned area) and a bounding circle.
+// ---------------------------------------------------------------------------
+
+/** How far behind the scanned shell the solid is assumed to extend, sim z units (≈ a hand's thickness in the Leap/depth box). */
+export const SCAN_THICKNESS = .12;
+
+export interface ScanMeasure {
+  /** Scanned cells, and those at or below the water level. */
+  total: number; wet: number;
+  /** Centroid of the wet cells on the water plane, grid uv. */
+  cx: number; cy: number;
+  /** Half-extent of the wet cells on the plane, grid uv, within the splat bounds (the press disc). */
+  wetRadius: number;
+  /** Height of the lowest scanned cell, sim y (1 when nothing is scanned). */
+  lowest: number;
+  /** Height range of the scanned cells, sim y, for the shader's row sampling. */
+  minY: number; maxY: number;
+  /** Bounding circle on the plane of every cell's solid and its shadow, grid uv. */
+  bx: number; by: number; bound: number;
+}
+export const emptyScanMeasure = (): ScanMeasure => ({ total: 0, wet: 0, cx: .5, cy: .5, wetRadius: SPLAT_MIN, lowest: 1, minY: 1, maxY: 0, bx: .5, by: .5, bound: 0 });
+
+/** Measure a scan against the water level. Writes into `out`; allocates nothing. */
+export function measureScan(field: SurfaceField, aspect: number, surface: number, out: ScanMeasure = emptyScanMeasure()): ScanMeasure {
+  const s = domainScale(aspect), W = field.width, H = field.height, thick = SCAN_THICKNESS / s;
+  let total = 0, wet = 0, cx = 0, cy = 0, lowest = 1, minY = 1, maxY = 0;
+  let wx0 = Infinity, wx1 = -Infinity, wy0 = Infinity, wy1 = -Infinity;
+  let bx0 = Infinity, bx1 = -Infinity, by0 = Infinity, by1 = -Infinity;
+  for (let row = 0; row < H; row++) {
+    const y = (row + .5) / H, h = Math.max(y - surface, 0), shiftX = LIGHT_SHIFT[0] * h / s, shiftY = LIGHT_SHIFT[1] * h / s;
+    const pad = PENUMBRA_BASE + h * PENUMBRA_PER_HEIGHT + .04;
+    for (let col = 0; col < W; col++) {
+      const i = row * W + col;
+      if (!field.mask[i]) continue;
+      const gx = ((col + .5) / W * aspect - aspect * .5) / s + .5, gy = (field.z[i] - .5) / s + .5;
+      total++;
+      if (y < lowest) lowest = y;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+      // The cell's solid spans gy … gy + thick; its shadow lands shifted by its height.
+      bx0 = Math.min(bx0, gx - pad, gx + shiftX - pad); bx1 = Math.max(bx1, gx + pad, gx + shiftX + pad);
+      by0 = Math.min(by0, gy - pad, gy + shiftY - pad); by1 = Math.max(by1, gy + thick + pad, gy + thick + shiftY + pad);
+      if (y <= surface) {
+        wet++; cx += gx; cy += gy + thick * .5;
+        wx0 = Math.min(wx0, gx); wx1 = Math.max(wx1, gx); wy0 = Math.min(wy0, gy); wy1 = Math.max(wy1, gy + thick);
+      }
+    }
+  }
+  out.total = total; out.wet = wet; out.lowest = lowest; out.minY = minY; out.maxY = maxY;
+  if (wet) { out.cx = cx / wet; out.cy = cy / wet; out.wetRadius = clamp(Math.max(wx1 - wx0, wy1 - wy0) * .5, SPLAT_MIN, SPLAT_MAX); }
+  else { out.cx = .5; out.cy = .5; out.wetRadius = SPLAT_MIN; }
+  if (total) { out.bx = (bx0 + bx1) * .5; out.by = (by0 + by1) * .5; out.bound = Math.sqrt((bx1 - bx0) * (bx1 - bx0) + (by1 - by0) * (by1 - by0)) * .5; }
+  else { out.bx = .5; out.by = .5; out.bound = 0; }
+  return out;
+}
+
+/** Cap on the scan's stirring velocity, grid uv/s, and the smoothing of its finite differences. */
+export const SCAN_VELOCITY_MAX = 3, SCAN_MOTION_TAU = .08;
+
+/**
+ * How the scan moves between steps: the wet centroid's velocity (the stirring velocity, grid uv/s)
+ * and the descent of the lowest scanned point (uniform units/s, 0 while rising), both smoothed.
+ * A wet footprint that has just appeared, or a scan that has just returned, starts from rest.
+ */
+export class ScanMotion {
+  vx = 0; vy = 0; descent = 0;
+  private prevCx = 0; private prevCy = 0; private prevWet = 0; private prevLowest = 1; private prevTotal = 0;
+  reset() { this.vx = 0; this.vy = 0; this.descent = 0; this.prevWet = 0; this.prevTotal = 0; }
+  update(m: ScanMeasure, dt: number) {
+    if (dt > 0 && m.wet && this.prevWet) {
+      this.vx = approach(this.vx, clamp((m.cx - this.prevCx) / dt, -SCAN_VELOCITY_MAX, SCAN_VELOCITY_MAX), dt, SCAN_MOTION_TAU);
+      this.vy = approach(this.vy, clamp((m.cy - this.prevCy) / dt, -SCAN_VELOCITY_MAX, SCAN_VELOCITY_MAX), dt, SCAN_MOTION_TAU);
+    } else { this.vx = 0; this.vy = 0; }
+    if (dt > 0 && m.total && this.prevTotal) this.descent = approach(this.descent, Math.max(0, (this.prevLowest - m.lowest) / dt), dt, SCAN_MOTION_TAU);
+    else this.descent = 0;
+    this.prevCx = m.cx; this.prevCy = m.cy; this.prevWet = m.wet; this.prevLowest = m.lowest; this.prevTotal = m.total;
+  }
+}
+
+/**
+ * A copy of the scan whose empty cells next to scanned ones carry their neighbours' depth, so a
+ * bilinear sample of the depth at a silhouette edge never blends toward the "nothing" value (1 =
+ * the back wall). The mask is shared, not copied. Returns `out`, re-created when the size changes.
+ */
+export function dilateScanDepth(field: SurfaceField, out: SurfaceField | null): SurfaceField {
+  const W = field.width, H = field.height;
+  if (!out || out.width !== W || out.height !== H) out = { width: W, height: H, z: new Float32Array(W * H), mask: field.mask };
+  out.mask = field.mask;
+  const z = out.z, src = field.z, mask = field.mask;
+  for (let row = 0; row < H; row++) for (let col = 0; col < W; col++) {
+    const i = row * W + col;
+    if (mask[i]) { z[i] = src[i]; continue; }
+    let sum = 0, n = 0;
+    for (let dr = -1; dr <= 1; dr++) {
+      const r = row + dr; if (r < 0 || r >= H) continue;
+      for (let dc = -1; dc <= 1; dc++) {
+        const c = col + dc; if (c < 0 || c >= W || (dr === 0 && dc === 0)) continue;
+        const j = r * W + c;
+        if (mask[j]) { sum += src[j]; n++; }
+      }
+    }
+    z[i] = n ? sum / n : 1;
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -397,14 +764,16 @@ export class DropScheduler {
     if (ctx.hands.length) this.lastHandTime = ctx.time;
     for (const hand of ctx.hands) {
       seen.add(hand.id);
-      const under = -handClearance(hand, ctx.surface);
+      // The underside is the hand's lowest point: the deepest capsule of a solid hand, the sphere's bottom otherwise.
+      const under = -handClearance(hand, ctx.surface, ctx.aspect);
       const s = this.wet.get(hand.id);
       if (!s) { this.wet.set(hand.id, { wet: under >= WET_BAND, lastMs: -Infinity }); continue; }
       if (!s.wet && under >= WET_BAND) {
         s.wet = true;
         const descent = -hand.velocity.y, plunge = descent >= PLUNGE_SPEED;
         if ((plunge || ctx.dropOnEnter) && ctx.time - s.lastMs >= PLUNGE_COOLDOWN) {
-          const p = simToGrid(hand.position, ctx.aspect);
+          // The bead lands where the hand went in: under its lowest point.
+          const p = simToGrid(handUnderside(hand, ctx.aspect, UNDERSIDE_SCRATCH), ctx.aspect);
           if (insideBowl(p, ctx.bowl)) {
             s.lastMs = ctx.time;
             drops.push(plunge ? this.make(p, ctx.bowl, ctx.palette, ctx.ink, 1.2, plungeImpulse(descent)) : this.make(p, ctx.bowl, ctx.palette, ctx.ink, .9, 0));

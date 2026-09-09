@@ -71,6 +71,21 @@ export interface OccupancyField {
   data: Uint8Array;
 }
 
+/**
+ * 3D foreground occupancy of the volume in sim space (from a depth camera):
+ * x fastest, then y, then z; z index 0 is at the glass. 0..255 = fraction filled.
+ */
+export interface VolumeField { nx: number; ny: number; nz: number; data: Uint8Array }
+
+/**
+ * The scanned foreground surface in sim space: for each cell of the front face (row 0 at
+ * the bottom, sim y = 0), the depth z (0 = glass … 1 = back wall) of the nearest foreground
+ * point seen from the front, and a mask (255 where something was scanned, 0 where nothing).
+ * Everything at that (x, y) deeper than z, up to a thickness the simulation chooses, can be
+ * treated as solid: the scan is a front surface, not a closed volume.
+ */
+export interface SurfaceField { width: number; height: number; z: Float32Array; mask: Uint8Array }
+
 export interface SimInput {
   /** Seconds since the simulation instance was created. */
   time: number;
@@ -88,6 +103,17 @@ export interface SimInput {
   activity: number;
   /** Optional occupancy of the tracked volume, in sim space. Present when the source provides it. */
   occupancy: OccupancyField | null;
+  /**
+   * Optional 3D foreground occupancy (depth cameras). Hands from skeleton sources carry their
+   * solid shape in `hands[i].capsules` instead; simulations should handle both and fall back to a
+   * sphere of `radius` at `position` when neither is present.
+   */
+  volume: VolumeField | null;
+  /**
+   * The scanned foreground surface (depth cameras): the primary 3D representation when a real
+   * depth map is available. Null for sources without one.
+   */
+  surface: SurfaceField | null;
 }
 
 // ---------------------------------------------------------------------------

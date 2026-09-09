@@ -1,5 +1,12 @@
-/** GLSL for Afterglow. All full-screen passes use the shared fullscreen-triangle vertex shader. */
+/**
+ * GLSL for Afterglow. Full-screen passes use the shared fullscreen-triangle
+ * vertex shader; strokes, floor pools and the ghost are instanced quads whose
+ * corners come from `gl_VertexID` and whose instance data arrive as
+ * attributes, so the fragment work stays proportional to what is painted.
+ */
 import { GLSL_HEADER } from '../../gl/program';
+import { handSdfGlsl } from '../../gl/hand';
+import { surfaceGlsl } from '../../gl/surface';
 
 const COMMON = `
 vec3 aces(vec3 x) { return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
@@ -7,56 +14,169 @@ float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 float peak(vec3 c) { return max(c.r, max(c.g, c.b)); }
 `;
 
-/**
- * Decay the previous frame, subtract the black floor, then deposit every
- * pending stroke segment with a distance-to-segment brush. Segments arrive
- * already projected onto the glass (uniform units, apparent radius), so this
- * pass is purely 2D. Deposits saturate against what is already there so
- * overlaps bloom toward white gracefully.
- *
- * The alpha channel is a second, monochrome accumulation: the pool of light
- * each segment casts on the floor of the volume, decayed the same way. The
- * composite colours it and gates it by presence.
- */
-export function accumulateShader(maxSegments: number) {
-  return `${GLSL_HEADER}${COMMON}
+/** Corner of a 4-vertex triangle strip from the vertex id: (0,0) (1,0) (0,1) (1,1). */
+const QUAD_CORNER = `vec2 quadCorner() { return vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1)); }`;
+
+/** Decay the previous frame and subtract the black floor. Strokes and pools are blended on top of the result. */
+export const DECAY_FS = `${GLSL_HEADER}
 in vec2 v_uv; out vec4 o;
-uniform sampler2D u_prev;
-uniform float u_decay, u_floor, u_aspect, u_headK, u_eye;
-uniform int u_count;
-uniform vec4 u_segPos[${maxSegments}];   // ax, ay, bx, by on the glass, uniform units
-uniform vec4 u_segCol[${maxSegments}];   // rgb premultiplied by amplitude, apparent radius
-uniform vec4 u_segPool[${maxSegments}];  // floor pool: cx, cy on the glass, apparent half-width, amplitude
+uniform sampler2D u_prev; uniform float u_decay, u_floor;
+void main() { o = max(texture(u_prev, v_uv) * u_decay - u_floor, 0.0); }`;
+
+/**
+ * One stroke per instance: a capsule that moved from a0–b0 to a1–b1 on the
+ * glass (uniform units, already projected), with the apparent brush radius.
+ * The quad covers the bounding box of the four ends plus the radius.
+ */
+export const STROKE_VS = `${GLSL_HEADER}
+in vec4 a_prev;   // a0.xy, b0.xy on the glass
+in vec4 a_curr;   // a1.xy, b1.xy
+in vec4 a_col;    // rgb premultiplied by amplitude, apparent radius
+flat out vec4 v_prev, v_curr, v_col;
+out vec2 v_p;
+uniform float u_aspect;
+${QUAD_CORNER}
 void main() {
-  vec4 old = max(texture(u_prev, v_uv) * u_decay - u_floor, 0.0);
-  vec2 p = vec2(v_uv.x * u_aspect, v_uv.y);
-  vec3 add = vec3(0.0);
-  float pool = 0.0;
-  for (int i = 0; i < ${maxSegments}; i++) {
-    if (i >= u_count) break;
-    vec4 s = u_segPos[i]; vec4 c = u_segCol[i];
-    vec2 ab = s.zw - s.xy;
-    float len2 = dot(ab, ab);
-    float t = len2 > 1e-10 ? clamp(dot(p - s.xy, ab) / len2, 0.0, 1.0) : 0.0;
-    float d = distance(p, s.xy + ab * t) / max(c.w, 1e-5);
-    if (d < 1.0) {
-      float w = 1.0 - d * d; w = w * w * w;
-      // Coloured brush plus a tighter warm-white core.
-      add += c.rgb * w + vec3(peak(c.rgb) * 0.35) * (w * w * w);
-    }
-    vec4 f = u_segPool[i];
-    // The pool lies on the floor (y = 0), whose screen height alone gives the perspective scale there: cy = (1 - scale) / 2.
-    // A disc on the floor is foreshortened to an ellipse scale / (2 eye) as tall as it is wide.
-    float scale = max(1.0 - 2.0 * f.y, 1e-3);
-    vec2 e = (p - f.xy) / vec2(max(f.z, 1e-5), max(f.z * 0.5 * scale / u_eye, 1e-5));
-    float d2 = dot(e, e);
-    if (d2 < 1.0) { float pw = 1.0 - d2; pool += f.w * pw * pw; }
-  }
-  float head = exp(-u_headK * peak(old.rgb));
-  float poolHead = exp(-u_headK * old.a);
-  o = vec4(old.rgb + add * head, old.a + pool * poolHead);
+  vec2 lo = min(min(a_prev.xy, a_prev.zw), min(a_curr.xy, a_curr.zw)) - a_col.w;
+  vec2 hi = max(max(a_prev.xy, a_prev.zw), max(a_curr.xy, a_curr.zw)) + a_col.w;
+  vec2 p = mix(lo, hi, quadCorner());
+  v_p = p; v_prev = a_prev; v_curr = a_curr; v_col = a_col;
+  gl_Position = vec4(p.x / u_aspect * 2.0 - 1.0, p.y * 2.0 - 1.0, 0.0, 1.0);
 }`;
+
+/**
+ * Deposit over the area the capsule swept: full brush inside the quad
+ * a0 b0 b1 a1 (both diagonals, so a rotating capsule leaves no hole), the
+ * soft brush kernel beyond its nearest edge, plus a tighter warm-white core.
+ * Deposits saturate against what is already there (the decayed previous
+ * frame, sampled here) so overlaps bloom toward white gracefully; the pass is
+ * blended additively onto the decayed buffer.
+ */
+export const STROKE_FS = `${GLSL_HEADER}${COMMON}
+flat in vec4 v_prev, v_curr, v_col;
+in vec2 v_p; out vec4 o;
+uniform sampler2D u_prev;
+uniform vec2 u_texel;
+uniform float u_decay, u_floor, u_headK;
+float segDist(vec2 p, vec2 a, vec2 b) {
+  vec2 ab = b - a; float l2 = dot(ab, ab);
+  float t = l2 > 1e-12 ? clamp(dot(p - a, ab) / l2, 0.0, 1.0) : 0.0;
+  return distance(p, a + ab * t);
 }
+float cross2(vec2 a, vec2 b) { return a.x * b.y - a.y * b.x; }
+bool insideTri(vec2 p, vec2 a, vec2 b, vec2 c) {
+  if (abs(cross2(b - a, c - a)) < 1e-9) return false;   // a degenerate triangle contains nothing: a point brush paints no plateau
+  float s1 = cross2(b - a, p - a), s2 = cross2(c - b, p - b), s3 = cross2(a - c, p - c);
+  return (s1 >= 0.0 && s2 >= 0.0 && s3 >= 0.0) || (s1 <= 0.0 && s2 <= 0.0 && s3 <= 0.0);
+}
+void main() {
+  vec2 a0 = v_prev.xy, b0 = v_prev.zw, a1 = v_curr.xy, b1 = v_curr.zw;
+  float d = 0.0;
+  if (!(insideTri(v_p, a0, b0, b1) || insideTri(v_p, a0, b1, a1) || insideTri(v_p, a0, b0, a1) || insideTri(v_p, b0, b1, a1)))
+    d = min(min(segDist(v_p, a0, b0), segDist(v_p, a1, b1)), min(segDist(v_p, a0, a1), segDist(v_p, b0, b1)));
+  d /= max(v_col.w, 1e-5);
+  if (d >= 1.0) discard;
+  float w = 1.0 - d * d; w = w * w * w;
+  vec3 add = v_col.rgb * w + vec3(peak(v_col.rgb) * 0.35) * (w * w * w);
+  vec3 old = max(texture(u_prev, gl_FragCoord.xy * u_texel).rgb * u_decay - u_floor, 0.0);
+  o = vec4(add * exp(-u_headK * peak(old)), 0.0);
+}`;
+
+/**
+ * Floor pools, one per instance: centre on the glass, apparent half-width and
+ * amplitude. The pool lies on the floor (y = 0), whose screen height alone
+ * gives the perspective scale there: cy = (1 − scale) / 2; a disc on the floor
+ * is foreshortened to an ellipse scale / (2 eye) as tall as it is wide.
+ */
+export const POOL_VS = `${GLSL_HEADER}
+in vec4 a_pool;   // cx, cy on the glass, apparent half-width, amplitude
+flat out vec4 v_pool; flat out float v_ry;
+out vec2 v_p;
+uniform float u_aspect, u_eye;
+${QUAD_CORNER}
+void main() {
+  float scale = max(1.0 - 2.0 * a_pool.y, 1e-3);
+  float ry = max(a_pool.z * 0.5 * scale / u_eye, 1e-5);
+  vec2 p = a_pool.xy + (quadCorner() * 2.0 - 1.0) * vec2(a_pool.z, ry);
+  v_p = p; v_pool = a_pool; v_ry = ry;
+  gl_Position = vec4(p.x / u_aspect * 2.0 - 1.0, p.y * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+/** The pool is a second, monochrome accumulation in the alpha channel, saturating like the colour. */
+export const POOL_FS = `${GLSL_HEADER}
+flat in vec4 v_pool; flat in float v_ry;
+in vec2 v_p; out vec4 o;
+uniform sampler2D u_prev;
+uniform vec2 u_texel;
+uniform float u_decay, u_floor, u_headK;
+void main() {
+  vec2 e = (v_p - v_pool.xy) / vec2(max(v_pool.z, 1e-5), v_ry);
+  float d2 = dot(e, e);
+  if (d2 >= 1.0) discard;
+  float pw = 1.0 - d2;
+  float old = max(texture(u_prev, gl_FragCoord.xy * u_texel).a * u_decay - u_floor, 0.0);
+  o = vec4(0.0, 0.0, 0.0, v_pool.w * pw * pw * exp(-u_headK * old));
+}`;
+
+/**
+ * The ghost: a quad over each hand's bounding sphere (or the scan's bounding
+ * circle at the glass), inside which the window camera's ray is marched
+ * against the solid. Drawn additively over the composited picture.
+ */
+export const GHOST_VS = `${GLSL_HEADER}
+in vec4 a_bound;  // world centre xyz, radius
+out vec2 v_ndc;
+uniform mat4 u_matrix;
+uniform float u_aspect, u_eye;
+${QUAD_CORNER}
+void main() {
+  vec4 clip = u_matrix * vec4(a_bound.xyz, 1.0);
+  vec2 c = clip.xy / max(clip.w, 1e-4);
+  float s = u_eye / (u_eye + max(a_bound.z - a_bound.w, 0.0));   // perspective scale at the sphere's nearest point
+  vec2 h = a_bound.w * s * 1.15 / vec2(u_aspect * 0.5, 0.5);
+  v_ndc = c + h * (quadCorner() * 2.0 - 1.0);
+  gl_Position = vec4(v_ndc, 0.0, 1.0);
+}`;
+
+/** Rim-lit, translucent: bright at grazing angles, quiet face-on, dimmer deeper in. Mode 1 marches the scanned surface, mode 0 the capsule field. */
+export const GHOST_FS = `${GLSL_HEADER}
+in vec2 v_ndc; out vec4 o;
+uniform float u_aspect, u_depth, u_eye, u_ghost;
+uniform int u_mode;
+uniform vec3 u_color;
+${handSdfGlsl()}
+${surfaceGlsl()}
+vec3 handNormal(vec3 p) {
+  vec2 e = vec2(0.004, 0.0);
+  return normalize(vec3(handDistance(p + e.xyy) - handDistance(p - e.xyy), handDistance(p + e.yxy) - handDistance(p - e.yxy), handDistance(p + e.yyx) - handDistance(p - e.yyx)));
+}
+void main() {
+  vec3 ro = vec3(u_aspect * 0.5, 0.5, -u_eye);
+  vec3 rd = normalize(vec3(v_ndc.x * u_aspect * 0.5, v_ndc.y * 0.5, u_eye));
+  vec3 q, n;
+  if (u_mode == 1) {
+    vec4 hit = surfaceHit(ro, rd, u_depth, 40);
+    if (hit.w < 0.5) discard;
+    q = hit.xyz; n = surfaceNormal(vec2(q.x / u_surfaceAspect, q.y));
+  } else {
+    vec2 span = handBoundsHit(ro, rd);
+    if (span.y <= max(span.x, 0.0)) discard;
+    float t = max(span.x, 0.0), tEnd = span.y, hit = -1.0;
+    for (int i = 0; i < 32; i++) {
+      vec3 p = ro + rd * t;
+      float d = handDistance(p);
+      if (d < 0.002) { hit = t; break; }
+      t += max(d, 0.003);
+      if (t > tEnd) break;
+    }
+    if (hit < 0.0) discard;
+    q = ro + rd * hit; n = handNormal(q);
+  }
+  float rim = pow(1.0 - abs(dot(n, -rd)), 2.0);
+  float depth01 = clamp(q.z / u_depth, 0.0, 1.0);
+  vec3 c = mix(u_color, vec3(1.0), 0.5) * (0.05 + 0.55 * rim) * u_ghost / (1.0 + 0.9 * depth01);
+  o = vec4(c, 0.0);
+}`;
 
 /** Sparkles: additive point sprites drawn over the composited picture. Positions are world units in the volume; the window camera projects them. */
 export const POINTS_VS = `${GLSL_HEADER}

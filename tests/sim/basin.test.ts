@@ -1,12 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import type { HandState } from '../../src/sim/input/types';
+import type { Capsule, HandState } from '../../src/sim/input/types';
+import type { SurfaceField } from '../../src/sim/core/types';
+import { IMAGE_MAPPING, mapSurface } from '../../src/sim/input/mapping';
+import { surfaceFromCapsules, syntheticHandCapsules } from '../../src/sim/input/synthetic';
 import {
-  CAUSTIC_LACUNARITY, CAUSTIC_PERIOD, CAUSTIC_RATES, DEFAULT_PALETTE, DRIFT_RATES, DropScheduler, HAND_HALF_HEIGHT_MAX, HAND_HALF_HEIGHT_MIN,
-  PACKED_DECAY_STRIDE, PACKED_FADE_STRIDE, PACKED_MIN_STEP, PACKED_VELOCITY_SCALE, PALETTES, PALETTE_NAMES, PLUNGE_COOLDOWN, PLUNGE_FULL, PLUNGE_SPEED,
-  PROBE_ENC, PROBE_SIZE, PROBE_SUB, SignalSmoother, WET_BAND,
-  bowlDistance, causticOffsets, clampToBowl, decodeProbe, decodeSigned, decodeUnsigned, dissipation, dissipationFloor, domainScale, driftPhases,
-  emptyGridHand, encodeSigned, encodeUnsigned, footprint, handClearance, handHalfHeight, handImmersion, handToGrid, immersionSignal, insideBowl,
-  measuresToSignals, plungeImpulse, probeWeights, resolvePalette, simToGrid, simVelocityToGrid, stirStrength, wrap,
+  CAUSTIC_LACUNARITY, CAUSTIC_PERIOD, CAUSTIC_RATES, DEFAULT_PALETTE, DRIFT_RATES, DropScheduler, FOOT_MIN, Footprints, HAND_HALF_HEIGHT_MAX, HAND_HALF_HEIGHT_MIN,
+  LIGHT_SHIFT, MAX_FOOTPRINTS, MAX_SHADOW_CAPSULES, PACKED_DECAY_STRIDE, PACKED_FADE_STRIDE, PACKED_MIN_STEP, PACKED_VELOCITY_SCALE, PALETTES, PALETTE_NAMES,
+  PENUMBRA_BASE, PENUMBRA_PER_HEIGHT, PLUNGE_COOLDOWN, PLUNGE_FULL, PLUNGE_SPEED, PROBE_ENC, PROBE_SIZE, PROBE_SUB, REL_MOTION_MAX, SCAN_THICKNESS,
+  SCAN_VELOCITY_MAX, ScanMotion, SignalSmoother, SolidShadow, WET_BAND,
+  bowlDistance, capsuleFootprint, causticOffsets, clampToBowl, decodeProbe, decodeSigned, decodeUnsigned, dilateScanDepth, dissipation, dissipationFloor,
+  domainScale, driftPhases, emptyGridHand, encodeSigned, encodeUnsigned, footprint, handClearance, handHalfHeight, handImmersion, handToGrid, handUnderside,
+  immersionSignal, insideBowl, measureScan, measuresToSignals, plungeImpulse, probeWeights, resolvePalette, simToGrid, simVelocityToGrid, sphereImmersion,
+  stirStrength, wrap,
 } from '../../src/sim/sims/basin/model';
 import { advectVelocity, composite } from '../../src/sim/sims/basin/shaders';
 
@@ -15,7 +20,7 @@ const SURFACE = .35;
 const hand = (id: number, x: number, z: number, y = .6, extra: Partial<HandState> = {}): HandState => ({
   id, position: { x, y, z }, velocity: { x: 0, y: 0, z: 0 }, speed: 0,
   extent: { min: { x: x - .04, y: y - .06, z }, max: { x: x + .04, y: y + .06, z } },
-  radius: .06, openness: 1, pinch: 0, confidence: 1, ageMs: 100, staleMs: 0, push: z, points: [], ...extra,
+  radius: .06, openness: 1, pinch: 0, confidence: 1, ageMs: 100, staleMs: 0, push: z, points: [], capsules: [], ...extra,
 });
 /** The same hand moving vertically at `vy` (uniform units/s; negative = coming down). */
 const falling = (id: number, x: number, z: number, y: number, vy: number) => hand(id, x, z, y, { velocity: { x: 0, y: vy, z: 0 } });
@@ -173,13 +178,27 @@ describe('basin shader time', () => {
     expect(advectVelocity(false)).not.toContain('u_time');
     expect(advectVelocity(true)).toContain('u_decayFloor');
   });
-  it('gates the hand force by the grip and draws the hands over the water', () => {
-    // The relaxation toward the hand's velocity is multiplied by the grip (meta.w), so a hovering hand with grip 0 is not a brake.
-    expect(advectVelocity(false)).toContain('* g * u_couple * m.w');
+  it('gates each footprint\'s force by its grip and draws the solids over the water', () => {
+    // The relaxation toward the footprint's velocity is multiplied by its grip (meta.y), so a hovering hand with grip 0 is not a brake.
+    const a = advectVelocity(false);
+    expect(a).toContain('* g * u_couple * m.y');
+    expect(a).toContain(`u_footSeg[${MAX_FOOTPRINTS}]`); expect(a).toContain(`u_footVel[${MAX_FOOTPRINTS}]`); expect(a).toContain(`u_footMeta[${MAX_FOOTPRINTS}]`);
+    // The velocity is interpolated along the stadium, so a rotating hand's endpoints can differ.
+    expect(a).toContain('mix(fv.xy, fv.zw, t)');
+    // The scan's wet cells are looked up per grid point, behind the shell by SCAN_THICKNESS, gated by the water level.
+    expect(a).toContain('u_surfaceReady == 1'); expect(a).toContain(`const float THICK = ${SCAN_THICKNESS.toFixed(3)};`); expect(a).toContain('u_scanRows.z - y');
     for (const packed of [false, true]) {
       const c = composite(packed);
-      expect(c).toContain('u_shadows['); expect(c).toContain('u_shadowMeta['); expect(c).toContain('u_shadowCount');
+      expect(c).toContain(`u_capSeg[${MAX_SHADOW_CAPSULES}]`); expect(c).toContain(`u_capMeta[${MAX_SHADOW_CAPSULES}]`);
+      expect(c).toContain('u_shadowHands['); expect(c).toContain('u_shadowMeta['); expect(c).toContain('u_shadowCount');
       expect(c).toContain('* shade');
+      // The shadow leans by each endpoint's own height with the CPU's light direction and penumbra constants.
+      expect(c).toContain(`const vec2 LIGHT_SHIFT = vec2(${LIGHT_SHIFT[0].toFixed(3)}, ${LIGHT_SHIFT[1].toFixed(3)});`);
+      expect(c).toContain(`const float PEN_BASE = ${PENUMBRA_BASE.toFixed(3)}, PEN_H = ${PENUMBRA_PER_HEIGHT.toFixed(3)};`);
+      expect(c).toContain('LIGHT_SHIFT * (max(hA, 0.0) / u_domain)');
+      // The ring follows the wet part of every capsule (hmin < 0) and never the shadow-only forearm stub (weight < 0).
+      expect(c).toContain('if (hmin < 0.0 && cm.w > 0.0)');
+      expect(c).toContain('scanWaterline(');
     }
   });
 });
@@ -415,5 +434,331 @@ describe('basin drop scheduler', () => {
     expect(idle).toHaveLength(1); expect(insideBowl(idle[0], .42)).toBe(true); expect(idle[0].impulse).toBe(0);
     expect(s.update({ ...base, time: 21, inkLevel: 0 })).toHaveLength(0);
     expect(s.update({ ...base, time: 40, inkLevel: 0 })).toHaveLength(1);
+  });
+  it('detects the plunge from a solid hand\'s lowest capsule and drops the bead under it', () => {
+    // A hand whose palm is high but whose fingertip reaches the water: the sphere would be dry, the solid is wet.
+    const finger = (tipY: number): Capsule => ({ a: { x: .62, y: tipY + .12, z: .5 }, b: { x: .62, y: tipY, z: .5 }, radius: .008 });
+    const s = new DropScheduler();
+    s.update({ ...base, time: 0, hands: [hand(1, .5, .5, .6, { capsules: [finger(.5)] })] });
+    const drops = s.update({ ...base, time: .5, hands: [hand(1, .5, .5, .6, { velocity: { x: 0, y: -.9, z: 0 }, capsules: [finger(.32)] })] });
+    expect(drops).toHaveLength(1); expect(drops[0].impulse).toBeGreaterThan(0);
+    expect(drops[0].x).toBeCloseTo(simToGrid({ x: .62, z: .5 }, 16 / 9).x, 9);   // under the fingertip, not the palm
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Solid hands
+// ---------------------------------------------------------------------------
+
+const ASPECT = 16 / 9;
+/** A capsule in sim space between two heights at (x, z), with a radius in sim x units. */
+const cap = (x: number, z: number, y0: number, y1: number, radius: number, x1 = x, z1 = z): Capsule => ({ a: { x, y: y0, z }, b: { x: x1, y: y1, z: z1 }, radius });
+/** Five vertical fingers side by side, tips at `tipY`, 0.07 long. */
+const fingers = (tipY: number, r = .008) => [0, 1, 2, 3, 4].map(i => cap(.44 + i * .03, .5, tipY + .07, tipY, r));
+/** Four horizontal metacarpals fanning across the plane at height `y`. */
+const palm = (y: number, r = .012) => [0, 1, 2, 3].map(i => cap(.5, .48, y, y, r, .45 + i * .033, .53));
+
+describe('basin capsule footprint', () => {
+  it('is dry above the surface and reports the axis length regardless', () => {
+    const f = capsuleFootprint(cap(.5, .5, .6, .4, .01), ASPECT, SURFACE);
+    expect(f).toBe(false);
+    const out = { ax: 0, ay: 0, bx: 0, by: 0, radius: 0, immersion: 0, near: 0, wet: 0, length: 0 };
+    expect(capsuleFootprint(cap(.5, .5, .6, .4, .01), ASPECT, SURFACE, out)).toBe(false);
+    expect(out.length).toBeCloseTo(.2, 12); expect(out.wet).toBe(0); expect(out.immersion).toBe(0);
+    // The underside just touching (a radius above the surface) is still dry; a hair lower is wet.
+    const ry = .01 * ASPECT;
+    expect(capsuleFootprint(cap(.5, .5, .6, SURFACE + ry, .01), ASPECT, SURFACE)).toBe(false);
+    expect(capsuleFootprint(cap(.5, .5, .6, SURFACE + ry - 1e-4, .01), ASPECT, SURFACE, out)).toBe(true);
+    expect(out.immersion).toBeGreaterThan(0); expect(out.immersion).toBeLessThan(.01);
+  });
+  it('clips the stadium to the wet part of the axis, with the cross-section at the surface as its radius', () => {
+    const out = { ax: 0, ay: 0, bx: 0, by: 0, radius: 0, immersion: 0, near: 0, wet: 0, length: 0 };
+    // A vertical finger dipped in: the wet part projects to a point at the tip, the radius is the full cross-section.
+    const r = .008;
+    expect(capsuleFootprint(cap(.5, .5, .40, .33, r), ASPECT, SURFACE, out)).toBe(true);
+    const tip = simToGrid({ x: .5, z: .5 }, ASPECT);
+    expect(out.ax).toBeCloseTo(tip.x, 9); expect(out.bx).toBeCloseTo(tip.x, 9); expect(out.ay).toBeCloseTo(tip.y, 9); expect(out.by).toBeCloseTo(tip.y, 9);
+    expect(out.radius).toBe(Math.max(FOOT_MIN, r * ASPECT));   // the axis is under: the full projection
+    expect(out.immersion).toBe(1);                                // the tip is more than a radius under
+    // Submerged axis length: from where the axis crosses the surface to the tip.
+    expect(out.wet).toBeCloseTo(SURFACE - .33, 9); expect(out.length).toBeCloseTo(.07, 12);
+    expect(out.near).toBe(0);                                     // it pokes through the surface
+    // A horizontal capsule fully under: the whole stadium, radius = the capsule radius in grid units.
+    const under = cap(.4, .5, .3, .3, .02, .6, .5);
+    expect(capsuleFootprint(under, ASPECT, SURFACE, out)).toBe(true);
+    const a = simToGrid(under.a, ASPECT), b = simToGrid(under.b, ASPECT);
+    expect(out.ax).toBeCloseTo(a.x, 9); expect(out.bx).toBeCloseTo(b.x, 9);
+    expect(out.radius).toBeCloseTo(.02 * ASPECT / domainScale(ASPECT), 12);
+    expect(out.wet).toBeCloseTo(out.length, 12); expect(out.immersion).toBe(1);
+    expect(out.near).toBeCloseTo(SURFACE - (.3 + .02 * ASPECT), 9);   // its top is that deep
+    // A capsule crossing the surface obliquely: clipped at the crossing of its underside, half its axis wet.
+    const slope = cap(.4, .4, SURFACE + .1 + .01 * ASPECT, SURFACE - .1 - .01 * ASPECT, .01, .6, .6);
+    expect(capsuleFootprint(slope, ASPECT, SURFACE, out)).toBe(true);
+    const sa = simToGrid(slope.a, ASPECT), sb = simToGrid(slope.b, ASPECT), tA = .1 / (.2 + 2 * .01 * ASPECT);   // where the underside crosses
+    expect(out.ax).toBeCloseTo(sa.x + (sb.x - sa.x) * tA, 9); expect(out.ay).toBeCloseTo(sa.y + (sb.y - sa.y) * tA, 9);
+    expect(out.bx).toBeCloseTo(sb.x, 9); expect(out.by).toBeCloseTo(sb.y, 9);
+    expect(out.wet / out.length).toBeCloseTo(.5, 6);
+    // A horizontal capsule whose underside is just in: a narrow cross-section (floored), a small immersion.
+    const skim = cap(.4, .5, SURFACE + .02 * ASPECT * .6, SURFACE + .02 * ASPECT * .6, .02, .6, .5);
+    expect(capsuleFootprint(skim, ASPECT, SURFACE, out)).toBe(true);
+    expect(out.radius).toBeCloseTo(.02 * ASPECT * .8, 9); expect(out.radius).toBeGreaterThanOrEqual(FOOT_MIN);   // sqrt(1 − .6²) of the radius
+    expect(out.immersion).toBeCloseTo(.2, 9); expect(out.wet).toBe(0);   // the axis itself is still above
+    // Thin fingers never fall below the few-texel floor.
+    expect(capsuleFootprint(cap(.4, .5, SURFACE + .004 * ASPECT * .6, SURFACE + .004 * ASPECT * .6, .004, .6, .5), ASPECT, SURFACE, out)).toBe(true);
+    expect(out.radius).toBe(FOOT_MIN);
+  });
+});
+
+describe('basin solid hand', () => {
+  it('reads immersion as the submerged share of the capsule length', () => {
+    const solid = (capsules: Capsule[]) => hand(1, .5, .5, .9, { capsules });
+    // One capsule half under.
+    expect(handImmersion(solid([cap(.5, .5, SURFACE + .1, SURFACE - .1, .01)]), SURFACE, ASPECT)).toBeCloseTo(.5, 6);
+    // Weighted by length: a long dry one and a short wet one.
+    expect(handImmersion(solid([cap(.5, .5, .6, .9, .01), cap(.5, .5, .2, .3, .01)]), SURFACE, ASPECT)).toBeCloseTo(.25, 9);
+    expect(handImmersion(solid([cap(.5, .5, .2, .3, .01)]), SURFACE, ASPECT)).toBe(1);
+    expect(handImmersion(solid([cap(.5, .5, .6, .9, .01)]), SURFACE, ASPECT)).toBe(0);
+    // Fingertips dipped read small; the same fingers plunged to the knuckles read large.
+    expect(handImmersion(solid(fingers(.33)), SURFACE, ASPECT)).toBeLessThan(.4);
+    expect(handImmersion(solid(fingers(.2)), SURFACE, ASPECT)).toBeGreaterThan(.9);
+    // The palm's height is irrelevant once the hand is solid; through handToGrid the same value arrives.
+    const h = handToGrid(solid(fingers(.33)), ASPECT, SURFACE);
+    expect(h.immersion).toBeCloseTo(handImmersion(solid(fingers(.33)), SURFACE, ASPECT), 12);
+    expect(immersionSignal(h, .42)).toBeCloseTo(h.immersion, 12);
+  });
+  it('takes the underside from the lowest capsule', () => {
+    const solid = hand(1, .5, .5, .9, { capsules: [cap(.5, .5, .45, .25, .01), cap(.7, .6, .5, .5, .03)] });
+    const u = handUnderside(solid, ASPECT);
+    expect(u.y).toBeCloseTo(.25 - .01 * ASPECT, 12); expect(u.x).toBe(.5); expect(u.z).toBe(.5);
+    expect(handClearance(solid, SURFACE, ASPECT)).toBeCloseTo(.25 - .01 * ASPECT - SURFACE, 12);
+    expect(handToGrid(solid, ASPECT, SURFACE).clearance).toBeCloseTo(.25 - .01 * ASPECT - SURFACE, 12);
+    // A fat capsule can be the lowest through its radius alone.
+    const fat = hand(1, .5, .5, .9, { capsules: [cap(.5, .5, .4, .4, .01), cap(.7, .6, .41, .41, .04)] });
+    expect(handUnderside(fat, ASPECT).x).toBe(.7);
+    // Writes into a caller-owned point.
+    const out = { x: 0, y: 0, z: 0 };
+    expect(handUnderside(solid, ASPECT, out)).toBe(out);
+  });
+  it('falls back to the sphere for a hand without capsules', () => {
+    const bare = hand(1, .5, .5, .38);
+    expect(handImmersion(bare, SURFACE, ASPECT)).toBe(sphereImmersion(bare, SURFACE));
+    expect(handImmersion(bare, SURFACE)).toBeCloseTo(.25, 9);
+    expect(handUnderside(bare, ASPECT).y).toBeCloseTo(.38 - .06, 12);
+    expect(handClearance(bare, SURFACE)).toBeCloseTo(-.03, 12);
+    const h = handToGrid(bare, ASPECT, SURFACE);
+    expect(h.immersion).toBeCloseTo(.25, 9); expect(h.radius).toBeGreaterThan(.035); expect(h.radius).toBeLessThan(h.extent);
+    // Degenerate capsules with no length fall back to the sphere too.
+    expect(handImmersion(hand(1, .5, .5, .38, { capsules: [cap(.5, .5, .38, .38, 0)] }), SURFACE, ASPECT)).toBeCloseTo(.25, 9);
+  });
+});
+
+describe('basin footprints', () => {
+  const grid = (c: Capsule) => simToGrid(c.b, ASPECT);
+  it('makes five small stirs for dipped fingertips and broad pushes for a submerged palm', () => {
+    const f = new Footprints();
+    f.begin();
+    expect(f.addSolid(fingers(.33), ASPECT, SURFACE, .3, -.1, null, MAX_FOOTPRINTS, 1, 0)).toBe(5);
+    expect(f.count).toBe(5);
+    for (let i = 0; i < 5; i++) {
+      const o = i * 4, tip = grid(fingers(.33)[i]);
+      // Each is a point stadium at its own fingertip with the finger's cross-section, moving with the hand.
+      expect(f.seg[o]).toBeCloseTo(tip.x, 5); expect(f.seg[o + 2]).toBeCloseTo(tip.x, 5); expect(f.seg[o + 1]).toBeCloseTo(tip.y, 5);
+      expect(f.meta[o]).toBeCloseTo(Math.max(FOOT_MIN, .008 * ASPECT), 5); expect(f.meta[o + 1]).toBeGreaterThan(.9);
+      expect(f.vel[o]).toBeCloseTo(.3, 6); expect(f.vel[o + 1]).toBeCloseTo(-.1, 6); expect(f.vel[o + 2]).toBeCloseTo(.3, 6);
+    }
+    const xs = [0, 1, 2, 3, 4].map(i => f.seg[i * 4]);
+    expect(new Set(xs.map(x => x.toFixed(4))).size).toBe(5);   // five distinct stirs
+    // A flat palm under the surface: four long stadiums with the metacarpals' radius, all gripping fully.
+    f.begin();
+    expect(f.addSolid(palm(.3), ASPECT, SURFACE, 0, 0, null, MAX_FOOTPRINTS, 1, 0)).toBe(4);
+    for (let i = 0; i < 4; i++) {
+      const o = i * 4, len = Math.hypot(f.seg[o + 2] - f.seg[o], f.seg[o + 3] - f.seg[o + 1]);
+      expect(len).toBeGreaterThan(.04); expect(f.meta[o]).toBeCloseTo(.012 * ASPECT, 5); expect(f.meta[o + 1]).toBeGreaterThan(.99);
+    }
+    // The same palm held above the water stirs nothing; a hand with the fingers up and the palm dry, only the fingers.
+    f.begin();
+    expect(f.addSolid(palm(.5), ASPECT, SURFACE, 0, 0, null, MAX_FOOTPRINTS, 1, 0)).toBe(0);
+    expect(f.addSolid([...palm(.5), ...fingers(.33)], ASPECT, SURFACE, 0, 0, null, MAX_FOOTPRINTS, 1, 0)).toBe(5);
+    expect(f.count).toBe(5);
+  });
+  it('keeps the capsules nearest the surface within the budget and shares the press', () => {
+    const f = new Footprints();
+    const deep = cap(.5, .5, .1, .12, .01), mid = cap(.6, .5, .2, .22, .01), crossing = cap(.7, .5, .4, .3, .01);
+    f.begin();
+    expect(f.addSolid([deep, mid, crossing], ASPECT, SURFACE, 0, 0, null, 2, 1, .6)).toBe(2);
+    expect(f.count).toBe(2);
+    expect(f.seg[0]).toBeCloseTo(grid(crossing).x, 5); expect(f.seg[4]).toBeCloseTo(grid(mid).x, 5);
+    expect(f.meta[2]).toBeCloseTo(.3, 6); expect(f.meta[6]).toBeCloseTo(.3, 6);
+    // The stir gain scales the velocity; the global cap holds across hands.
+    f.begin();
+    f.addSolid([deep], ASPECT, SURFACE, 1, 0, null, 9, 2, 0);
+    expect(f.vel[0]).toBeCloseTo(2, 6);
+    const many = Array.from({ length: 30 }, (_, i) => cap(.3 + i * .01, .5, .2, .22, .01));
+    f.begin();
+    expect(f.addSolid(many, ASPECT, SURFACE, 0, 0, null, MAX_FOOTPRINTS, 1, 0)).toBe(MAX_FOOTPRINTS);
+    expect(f.addSolid(many, ASPECT, SURFACE, 0, 0, null, MAX_FOOTPRINTS, 1, 0)).toBe(0);
+    expect(f.count).toBe(MAX_FOOTPRINTS);
+  });
+  it('adds the relative motion of the endpoints to the hand velocity', () => {
+    const f = new Footprints();
+    const rel = new Float32Array(8); rel[0] = .5; rel[1] = -.25; rel[2] = -.5; rel[3] = .25;
+    f.begin();
+    f.addSolid([cap(.4, .5, .3, .3, .01, .6, .5)], ASPECT, SURFACE, 1, 0, rel, 9, 1, 0);
+    expect(f.vel[0]).toBeCloseTo(1.5, 6); expect(f.vel[1]).toBeCloseTo(-.25, 6); expect(f.vel[2]).toBeCloseTo(.5, 6); expect(f.vel[3]).toBeCloseTo(.25, 6);
+  });
+  it('falls back to one round footprint for a bare hand, none above the water', () => {
+    const f = new Footprints();
+    f.begin();
+    expect(f.addSphere(handToGrid(hand(1, .5, .5, .6), ASPECT, SURFACE), 1, 0)).toBe(0);
+    const h = handToGrid(hand(1, .5, .5, .2, { velocity: { x: .2, y: 0, z: .1 } }), ASPECT, SURFACE);
+    expect(f.addSphere(h, 1.5, .4)).toBe(1);
+    expect(Array.from(f.seg.subarray(0, 4))).toEqual([h.x, h.y, h.x, h.y].map(v => Math.fround(v)));
+    expect(f.meta[0]).toBeCloseTo(h.radius, 6); expect(f.meta[1]).toBe(1); expect(f.meta[2]).toBeCloseTo(.4, 6);
+    expect(f.vel[0]).toBeCloseTo(h.vx * 1.5, 5); expect(f.vel[1]).toBeCloseTo(h.vy * 1.5, 5);
+  });
+});
+
+describe('basin solid shadow', () => {
+  it('packs the capsules with each endpoint\'s underside clearance and bounds shadow, penumbra and ring', () => {
+    const s = new SolidShadow();
+    const c = cap(.4, .5, .5, .5, .01, .6, .5);
+    s.setSolid([c], ASPECT, SURFACE, .5, .5, 0);
+    expect(s.count).toBe(1);
+    const a = simToGrid(c.a, ASPECT), b = simToGrid(c.b, ASPECT);
+    expect(s.seg[0]).toBeCloseTo(a.x, 5); expect(s.seg[1]).toBeCloseTo(a.y, 5); expect(s.seg[2]).toBeCloseTo(b.x, 5); expect(s.seg[3]).toBeCloseTo(b.y, 5);
+    expect(s.meta[0]).toBeCloseTo(.01 * ASPECT, 5); expect(s.meta[1]).toBeCloseTo(.5 - .01 * ASPECT - SURFACE, 5); expect(s.meta[2]).toBeCloseTo(s.meta[1], 6); expect(s.meta[3]).toBe(1);
+    // Every endpoint, displaced by its height like the shader does, lies inside the bound with room for the penumbra.
+    const h = Math.max(s.meta[1], 0), pen = PENUMBRA_BASE + h * PENUMBRA_PER_HEIGHT;
+    for (const [x, y] of [[a.x, a.y], [b.x, b.y], [a.x + LIGHT_SHIFT[0] * h, a.y + LIGHT_SHIFT[1] * h], [b.x + LIGHT_SHIFT[0] * h, b.y + LIGHT_SHIFT[1] * h]]) {
+      expect(Math.hypot(x - s.cx, y - s.cy) + s.meta[0] + pen).toBeLessThanOrEqual(s.bound + 1e-6);
+    }
+    // In the water: no displacement, and the clearances are negative.
+    s.setSolid([cap(.4, .5, .3, .3, .01, .6, .5)], ASPECT, SURFACE, .5, .5, 0);
+    expect(s.meta[1]).toBeLessThan(0);
+    // Capped at the shader's array.
+    s.setSolid(Array.from({ length: 60 }, (_, i) => cap(.3 + i * .005, .5, .5, .5, .005)), ASPECT, SURFACE, .5, .5, 0);
+    expect(s.count).toBe(MAX_SHADOW_CAPSULES);
+  });
+  it('tracks the endpoints\' motion relative to the hand, from rest, capped and smoothed', () => {
+    const s = new SolidShadow(), dt = 1 / 60;
+    s.setSolid([cap(.4, .5, .5, .5, .01, .6, .5)], ASPECT, SURFACE, .5, .5, dt);
+    expect(Array.from(s.rel.subarray(0, 4))).toEqual([0, 0, 0, 0]);
+    // The b endpoint moves right relative to the hand: a positive velocity at b only, approaching the finite difference.
+    s.setSolid([cap(.4, .5, .5, .5, .01, .61, .5)], ASPECT, SURFACE, .5, .5, dt);
+    expect(s.rel[0]).toBeCloseTo(0, 5); expect(s.rel[1]).toBeCloseTo(0, 5); expect(s.rel[2]).toBeGreaterThan(1e-3); expect(s.rel[2]).toBeLessThan(.01 * ASPECT / dt); expect(s.rel[3]).toBeCloseTo(0, 5);
+    // A jump larger than the cap is clamped; the hand moving with its capsules is not relative motion.
+    s.setSolid([cap(.4, .5, .5, .5, .01, .9, .5)], ASPECT, SURFACE, .5, .5, dt);
+    expect(s.rel[2]).toBeLessThanOrEqual(REL_MOTION_MAX);
+    const still = new SolidShadow();
+    still.setSolid([cap(.4, .5, .5, .5, .01, .6, .5)], ASPECT, SURFACE, .5, .5, dt);
+    still.setSolid([cap(.5, .5, .5, .5, .01, .7, .5)], ASPECT, SURFACE, simToGrid({ x: .6, z: .5 }, ASPECT).x, .5, dt);
+    expect(Math.abs(still.rel[0])).toBeLessThan(1e-3); expect(Math.abs(still.rel[2])).toBeLessThan(1e-3);
+    // A changed capsule count starts over.
+    s.setSolid([cap(.4, .5, .5, .5, .01, .6, .5), cap(.4, .5, .5, .5, .01)], ASPECT, SURFACE, .5, .5, dt);
+    expect(Array.from(s.rel.subarray(0, 8))).toEqual([0, 0, 0, 0, 0, 0, 0, 0]);
+  });
+  it('draws a bare hand as a disc plus a shadow-only forearm stub toward the glass edge', () => {
+    const s = new SolidShadow();
+    const h = handToGrid(hand(1, .5, .5, .6), ASPECT, SURFACE);
+    s.setSphere(h, ASPECT);
+    expect(s.count).toBe(2);
+    expect(s.seg[0]).toBe(Math.fround(h.x)); expect(s.seg[2]).toBe(Math.fround(h.x)); expect(s.meta[0]).toBeCloseTo(h.extent, 6); expect(s.meta[1]).toBeCloseTo(h.clearance, 6); expect(s.meta[3]).toBe(1);
+    expect(s.seg[7]).toBeLessThan(s.seg[5]);   // the stub runs down the screen
+    expect(s.meta[4]).toBeCloseTo(h.extent * .7, 6); expect(s.meta[7]).toBeLessThan(0);   // shadow only: no ring
+    expect(s.bound).toBeGreaterThan(h.extent * 2.4);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The scanned surface
+// ---------------------------------------------------------------------------
+
+/** A field with one scanned column: cells at column `col` for the given rows, all at depth z. */
+function column(width: number, height: number, col: number, rows: number[], z: number): SurfaceField {
+  const field: SurfaceField = { width, height, z: new Float32Array(width * height).fill(1), mask: new Uint8Array(width * height) };
+  for (const row of rows) { field.mask[row * width + col] = 255; field.z[row * width + col] = z; }
+  return field;
+}
+
+describe('basin scanned surface', () => {
+  it('counts the cells at or below the water level as wet, at the (x, z) of each cell, and none above', () => {
+    // Rows 0..5 at heights .0625 … .6875; the water at .35 wets rows 0, 1, 2.
+    const field = column(8, 8, 3, [0, 1, 2, 3, 4, 5], .3);
+    const m = measureScan(field, ASPECT, SURFACE);
+    expect(m.total).toBe(6); expect(m.wet).toBe(3);
+    const g = simToGrid({ x: 3.5 / 8, z: .3 }, ASPECT);
+    expect(m.cx).toBeCloseTo(g.x, 5); expect(m.cy).toBeCloseTo(g.y + SCAN_THICKNESS / domainScale(ASPECT) * .5, 5);
+    expect(m.lowest).toBeCloseTo(.0625, 12); expect(m.minY).toBeCloseTo(.0625, 12); expect(m.maxY).toBeCloseTo(.6875, 12);
+    // Raise the water: everything wet. Drain it: nothing.
+    expect(measureScan(field, ASPECT, .95).wet).toBe(6);
+    expect(measureScan(field, ASPECT, .05).wet).toBe(0);
+    expect(measureScan(field, ASPECT, .05).cx).toBe(.5);
+    // The bound covers every cell's solid and its shadow (displaced by height, padded by the penumbra).
+    for (const row of [0, 5]) {
+      const y = (row + .5) / 8, h = Math.max(y - SURFACE, 0), pad = PENUMBRA_BASE + h * PENUMBRA_PER_HEIGHT;
+      for (const [x, yy] of [[g.x, g.y], [g.x, g.y + SCAN_THICKNESS], [g.x + LIGHT_SHIFT[0] * h, g.y + LIGHT_SHIFT[1] * h], [g.x + LIGHT_SHIFT[0] * h, g.y + SCAN_THICKNESS + LIGHT_SHIFT[1] * h]]) {
+        expect(Math.hypot(x - m.bx, yy - m.by) + pad).toBeLessThanOrEqual(m.bound + 1e-6);
+      }
+    }
+    // An empty scan.
+    const empty = measureScan(column(8, 8, 3, [], .3), ASPECT, SURFACE);
+    expect(empty.total).toBe(0); expect(empty.wet).toBe(0); expect(empty.bound).toBe(0); expect(empty.lowest).toBe(1);
+    // Writes into a caller-owned record.
+    const out = measureScan(field, ASPECT, SURFACE, m);
+    expect(out).toBe(m);
+  });
+  it('finds the footprint of the synthetic performer\'s scan below the water level only', () => {
+    // The scripted hand: image frame (y down), fingers up, forearm down to y ≈ .69, so in sim space the forearm hangs to ≈ .31.
+    const scan = surfaceFromCapsules(syntheticHandCapsules({ x: .5, y: .5, z: .3 }, 1, .06), 64, 48);
+    const field = mapSurface(IMAGE_MAPPING, scan, 96, 64)!;
+    expect(field).not.toBeNull();
+    const m = measureScan(field, ASPECT, SURFACE);
+    expect(m.total).toBeGreaterThan(100);
+    expect(m.wet).toBeGreaterThan(0); expect(m.wet).toBeLessThan(m.total);
+    // Exactly the scanned cells whose height is at or below the level.
+    let wet = 0, total = 0;
+    for (let row = 0; row < 64; row++) for (let col = 0; col < 96; col++) if (field.mask[row * 96 + col]) { total++; if ((row + .5) / 64 <= SURFACE) wet++; }
+    expect(m.wet).toBe(wet); expect(m.total).toBe(total);
+    expect(m.lowest).toBeLessThan(SURFACE);
+    // The wet centroid sits at the scan's depth (z ≈ .3 → the lower half of the screen), mirrored x stays near the middle.
+    expect(m.cy).toBeLessThan(.5); expect(m.cy).toBeGreaterThan(.2);
+    expect(Math.abs(m.cx - .5)).toBeLessThan(.15);
+    // Water below the hand: dry. Water over the fingertips: all wet.
+    expect(measureScan(field, ASPECT, .05).wet).toBe(0);
+    expect(measureScan(field, ASPECT, .99).wet).toBe(total);
+  });
+  it('takes the stirring velocity from the wet centroid and the descent from the lowest point, from rest', () => {
+    const motion = new ScanMotion(), dt = 1 / 60;
+    const at = (cx: number, lowest: number, wet = 10) => ({ ...measureScan(column(8, 8, 3, [0, 1, 2], .3), ASPECT, SURFACE), cx, lowest, wet, total: 20 });
+    motion.update(at(.4, .2), dt);
+    expect(motion.vx).toBe(0); expect(motion.descent).toBe(0);
+    motion.update(at(.41, .19), dt);
+    expect(motion.vx).toBeGreaterThan(0); expect(motion.vx).toBeLessThan(.01 / dt); expect(motion.descent).toBeGreaterThan(0);
+    for (let i = 0; i < 60; i++) motion.update(at(.41 + (i + 1) * .01, .19 - (i + 1) * .001), dt);
+    expect(motion.vx).toBeCloseTo(.6, 1); expect(motion.descent).toBeCloseTo(.06, 1);
+    // Rising is not a descent; a jump is capped; a footprint that vanishes and returns starts from rest.
+    motion.update(at(1.02, .5), dt);
+    expect(motion.descent).toBeLessThan(.06);
+    for (let i = 0; i < 100; i++) motion.update(at(1.02 + (i + 1) * .5, .5), dt);
+    expect(motion.vx).toBeLessThanOrEqual(SCAN_VELOCITY_MAX);
+    motion.update(at(.5, .5, 0), dt);
+    expect(motion.vx).toBe(0);
+    motion.update(at(.9, .5), dt);
+    expect(motion.vx).toBe(0);
+    motion.reset();
+    expect(motion.vx).toBe(0); expect(motion.descent).toBe(0);
+  });
+  it('dilates the depth into the empty cells around the scan so bilinear sampling never blends toward the back wall', () => {
+    const field = column(4, 4, 1, [1], .3);
+    const d = dilateScanDepth(field, null);
+    expect(d.width).toBe(4); expect(d.mask).toBe(field.mask);
+    expect(d.z[1 * 4 + 1]).toBeCloseTo(.3, 5);
+    for (const [r, c] of [[0, 0], [0, 1], [0, 2], [1, 0], [1, 2], [2, 0], [2, 1], [2, 2]]) expect(d.z[r * 4 + c]).toBeCloseTo(.3, 5);
+    expect(d.z[3 * 4 + 3]).toBe(1); expect(d.z[0 * 4 + 3]).toBe(1);
+    // Averages the scanned neighbours; reuses the buffer for the same size and re-creates it for another.
+    const two = column(4, 4, 1, [1], .3); two.mask[1 * 4 + 2] = 255; two.z[1 * 4 + 2] = .5;
+    const again = dilateScanDepth(two, d);
+    expect(again).toBe(d); expect(again.z[0 * 4 + 1]).toBeCloseTo(.4, 5); expect(again.z[0 * 4 + 0]).toBeCloseTo(.3, 5);
+    expect(dilateScanDepth(column(6, 6, 1, [1], .3), d)).not.toBe(d);
   });
 });

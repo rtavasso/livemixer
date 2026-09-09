@@ -10,9 +10,9 @@
  *  - Deterministic: all time comes in through arguments, never from Date/performance.
  */
 import { z } from 'zod';
-import type { OccupancyField, Vec3 } from '../core/types';
-import { mapObservation, mapOccupancy, type SpaceMapping } from './mapping';
-import type { Box3, HandObservation, HandState, InputFrame } from './types';
+import type { OccupancyField, SurfaceField, Vec3, VolumeField } from '../core/types';
+import { mapObservation, mapOccupancy, mapSurface, mapVoxels, type SpaceMapping } from './mapping';
+import type { Box3, Capsule, HandObservation, HandState, InputFrame } from './types';
 
 export const trackerSettingsSchema = z.object({
   /** Observations below this confidence are ignored. */
@@ -40,6 +40,13 @@ export const trackerSettingsSchema = z.object({
   /** Occupancy field resolution in sim space. */
   occupancyWidth: z.number().int().min(4).max(256).default(64),
   occupancyHeight: z.number().int().min(4).max(256).default(48),
+  /** Volume field resolution in sim space (depth-camera voxels). */
+  volumeNx: z.number().int().min(4).max(128).default(48),
+  volumeNy: z.number().int().min(4).max(128).default(32),
+  volumeNz: z.number().int().min(4).max(128).default(24),
+  /** Surface field resolution in sim space (depth-camera scan). */
+  surfaceWidth: z.number().int().min(8).max(512).default(128),
+  surfaceHeight: z.number().int().min(8).max(512).default(96),
 }).strict();
 export type TrackerSettings = z.infer<typeof trackerSettingsSchema>;
 export const DEFAULT_TRACKER_SETTINGS: TrackerSettings = trackerSettingsSchema.parse({});
@@ -79,6 +86,9 @@ interface Track {
   confidence: number;
   push: number;
   points: Vec3[];
+  /** Raw observed capsules (sim space) and the raw position they were observed with. */
+  capsules: Capsule[];
+  rawPosition: Vec3;
   lastFilterMs: number;
   /** Running estimate of the source's observation interval for this hand, ms. */
   intervalMs: number;
@@ -89,6 +99,8 @@ export interface TrackedInput {
   presence: number;
   activity: number;
   occupancy: OccupancyField | null;
+  volume: VolumeField | null;
+  surface: SurfaceField | null;
   /** Milliseconds since the last accepted frame, or Infinity before the first. */
   sourceAgeMs: number;
   /** Frames dropped as stale/out of order since the last reset. */
@@ -105,6 +117,10 @@ export class HandTracker {
   private activity = 0;
   private occupancy: OccupancyField | null = null;
   private occupancyAtMs = -Infinity;
+  private volume: VolumeField | null = null;
+  private volumeAtMs = -Infinity;
+  private surface: SurfaceField | null = null;
+  private surfaceAtMs = -Infinity;
   private stats: Record<string, number> = {};
   discarded = 0;
 
@@ -113,7 +129,7 @@ export class HandTracker {
   /** Forget everything, e.g. when the source or mapping changes. */
   reset() {
     this.tracks.clear(); this.sequence = -1; this.lastFrameMs = -Infinity; this.lastTickMs = null;
-    this.presence = 0; this.activity = 0; this.occupancy = null; this.stats = {}; this.discarded = 0;
+    this.presence = 0; this.activity = 0; this.occupancy = null; this.volume = null; this.surface = null; this.stats = {}; this.discarded = 0;
   }
 
   /** Ingest a frame. Returns false when the frame was discarded. */
@@ -131,6 +147,8 @@ export class HandTracker {
       this.observe(o, now);
     }
     if (frame.occupancy) { this.occupancy = mapOccupancy(this.mapping, frame.occupancy, s.occupancyWidth, s.occupancyHeight); this.occupancyAtMs = now; }
+    if (frame.voxels) { this.volume = mapVoxels(this.mapping, frame.voxels, s.volumeNx, s.volumeNy, s.volumeNz); this.volumeAtMs = now; }
+    if (frame.surface) { this.surface = mapSurface(this.mapping, frame.surface, s.surfaceWidth, s.surfaceHeight); this.surfaceAtMs = now; }
     return true;
   }
 
@@ -139,7 +157,7 @@ export class HandTracker {
     let track = this.tracks.get(o.id);
     if (!track) {
       const mk = () => new OneEuro(s.minCutoff, s.beta, s.derivativeCutoff);
-      track = { id: o.id, firstSeenMs: now, lastSeenMs: now, present: false, filters: [mk(), mk(), mk()], pushFilter: new OneEuro(4, .1, 1), position: { ...o.position }, velocity: { x: 0, y: 0, z: 0 }, extent: defaultExtent(o.position), openness: o.openness ?? 1, pinch: o.pinch ?? 0, confidence: o.confidence, push: o.position.z, points: o.points ?? [], lastFilterMs: now, intervalMs: 33 };
+      track = { id: o.id, firstSeenMs: now, lastSeenMs: now, present: false, filters: [mk(), mk(), mk()], pushFilter: new OneEuro(4, .1, 1), position: { ...o.position }, velocity: { x: 0, y: 0, z: 0 }, extent: defaultExtent(o.position), openness: o.openness ?? 1, pinch: o.pinch ?? 0, confidence: o.confidence, push: o.position.z, points: o.points ?? [], capsules: o.capsules ?? [], rawPosition: { ...o.position }, lastFilterMs: now, intervalMs: 33 };
       track.filters.forEach((f, i) => f.reset([o.position.x, o.position.y, o.position.z][i]));
       track.pushFilter.reset(o.position.z);
       this.tracks.set(o.id, track);
@@ -159,6 +177,7 @@ export class HandTracker {
     track.pinch = o.pinch ?? track.pinch;
     track.confidence = o.confidence;
     track.points = o.points ?? track.points;
+    track.capsules = o.capsules ?? track.capsules; track.rawPosition = o.position;
     track.lastSeenMs = now; track.lastFilterMs = now;
   }
 
@@ -186,7 +205,10 @@ export class HandTracker {
       const speed = Math.hypot(t.velocity.x, t.velocity.y);
       maxSpeed = Math.max(maxSpeed, speed);
       const ex = t.extent.max.x - t.extent.min.x, ey = t.extent.max.y - t.extent.min.y;
-      hands.push({ id, position: t.position, velocity: t.velocity, speed, extent: t.extent, radius: Math.max(.02, Math.max(ex, ey) / 2), openness: t.openness, pinch: t.pinch, confidence: t.confidence, ageMs: now - t.firstSeenMs, staleMs: sinceSeen, push: t.push, points: t.points });
+      // The solid shape rides on the smoothed position: shift every raw capsule by (smoothed − raw).
+      const dx = t.position.x - t.rawPosition.x, dy = t.position.y - t.rawPosition.y, dz = t.position.z - t.rawPosition.z;
+      const capsules = t.capsules.length ? t.capsules.map(c => ({ a: { x: c.a.x + dx, y: c.a.y + dy, z: c.a.z + dz }, b: { x: c.b.x + dx, y: c.b.y + dy, z: c.b.z + dz }, radius: c.radius })) : [];
+      hands.push({ id, position: t.position, velocity: t.velocity, speed, extent: t.extent, radius: Math.max(.02, Math.max(ex, ey) / 2), openness: t.openness, pinch: t.pinch, confidence: t.confidence, ageMs: now - t.firstSeenMs, staleMs: sinceSeen, push: t.push, points: t.points, capsules });
     }
     hands.sort((a, b) => b.ageMs - a.ageMs || a.id - b.id);
     const target = hands.length ? 1 : 0;
@@ -194,7 +216,9 @@ export class HandTracker {
     const activityTarget = Math.min(1, maxSpeed / s.activityFullSpeed);
     this.activity += (activityTarget - this.activity) * (dt > 0 ? 1 - Math.exp(-dt / s.activityTau) : 0);
     if (this.occupancy && now - this.occupancyAtMs > s.leaveMs * 2) this.occupancy = null;
-    return { hands, presence: this.presence, activity: this.activity, occupancy: this.occupancy, sourceAgeMs: now - this.lastFrameMs, discarded: this.discarded, stats: this.stats };
+    if (this.volume && now - this.volumeAtMs > s.leaveMs * 2) this.volume = null;
+    if (this.surface && now - this.surfaceAtMs > s.leaveMs * 2) this.surface = null;
+    return { hands, presence: this.presence, activity: this.activity, occupancy: this.occupancy, volume: this.volume, surface: this.surface, sourceAgeMs: now - this.lastFrameMs, discarded: this.discarded, stats: this.stats };
   }
 }
 

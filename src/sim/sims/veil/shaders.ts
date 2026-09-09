@@ -11,18 +11,84 @@
  * frame — z from the sheet's resting plane toward the viewer — and the vertex
  * shader is the one place it becomes world space; the camera, the light and
  * the hands are all world.
+ *
+ * Hands are the packed capsules of `handSdfGlsl` (`u_capsules`, `u_handBounds`):
+ * finger bones, palm and forearm when the source knows them, a sphere otherwise;
+ * or, with a depth camera, the scan of `surfaceGlsl` (`u_surface`), a shell of
+ * `u_scanThick` behind the scanned front, boxed by `u_scanMin`/`u_scanMax` so
+ * only rays that cross the box sample it.
  */
 import { GLSL_HEADER } from '../../gl/program';
-import { MAX_COLLIDERS } from './cloth';
+import { handSdfGlsl } from '../../gl/hand';
+import { surfaceGlsl } from '../../gl/surface';
+
+/**
+ * The scan's box (world units) and thickness, a slab test (the [t0, t1] along `ro + rd t` inside the box; empty
+ * when t1 < t0), and sampling that weights filled cells only. The texture's own bilinear filtering blends the
+ * depth of a silhouette edge toward the empty cells' far value, a "skirt" that a ray crossing the outline at any
+ * depth can hit; weighting by the mask (as `sampleSurface` does on the CPU) removes it.
+ */
+const SCAN_GLSL = `${surfaceGlsl()}
+uniform vec3 u_scanMin, u_scanMax;
+uniform float u_scanThick;
+vec2 scanBoxSpan(vec3 ro, vec3 rd) {
+  vec3 inv = 1.0 / (abs(rd) + 1e-9) * sign(rd + 1e-12);
+  vec3 a = (u_scanMin - ro) * inv, b = (u_scanMax - ro) * inv;
+  vec3 lo = min(a, b), hi = max(a, b);
+  return vec2(max(lo.x, max(lo.y, lo.z)), min(hi.x, min(hi.y, hi.z)));
+}
+// Mask-weighted bilinear sample at sim xy: (depth 0..1 of the volume, mask 0..1). Depth is 1 where nothing is filled.
+vec2 scanSample(vec2 xy) {
+  ivec2 size = textureSize(u_surface, 0);
+  vec2 f = xy * vec2(size) - 0.5;
+  ivec2 i0 = clamp(ivec2(floor(f)), ivec2(0), size - 1), i1 = min(i0 + 1, size - 1);
+  vec2 t = clamp(f - vec2(i0), 0.0, 1.0);
+  vec2 s00 = texelFetch(u_surface, i0, 0).rg, s10 = texelFetch(u_surface, ivec2(i1.x, i0.y), 0).rg;
+  vec2 s01 = texelFetch(u_surface, ivec2(i0.x, i1.y), 0).rg, s11 = texelFetch(u_surface, i1, 0).rg;
+  float w00 = (1.0 - t.x) * (1.0 - t.y) * s00.g, w10 = t.x * (1.0 - t.y) * s10.g, w01 = (1.0 - t.x) * t.y * s01.g, w11 = t.x * t.y * s11.g;
+  float ws = w00 + w10 + w01 + w11;
+  float z = ws > 0.0 ? (w00 * s00.r + w10 * s10.r + w01 * s01.r + w11 * s11.r) / ws : 1.0;
+  return vec2(z, ws);
+}
+// World-space normal of the scan at sim xy, toward the viewer; one-sided at the silhouette so the edge has no skirt slope.
+vec3 scanNormal(vec2 xy) {
+  vec2 c = scanSample(xy);
+  vec2 r = scanSample(xy + vec2(u_surfaceTexel.x, 0.0)), l = scanSample(xy - vec2(u_surfaceTexel.x, 0.0));
+  vec2 u = scanSample(xy + vec2(0.0, u_surfaceTexel.y)), d = scanSample(xy - vec2(0.0, u_surfaceTexel.y));
+  float mr = step(0.5, r.y), ml = step(0.5, l.y), mu = step(0.5, u.y), md = step(0.5, d.y);
+  float zx = mr + ml > 0.0 ? (mix(c.x, r.x, mr) - mix(c.x, l.x, ml)) / ((mr + ml) * u_surfaceTexel.x * u_surfaceAspect) : 0.0;
+  float zy = mu + md > 0.0 ? (mix(c.x, u.x, mu) - mix(c.x, d.x, md)) / ((mu + md) * u_surfaceTexel.y) : 0.0;
+  return normalize(vec3(zx * u_surfaceDepth, zy * u_surfaceDepth, -1.0));
+}
+// March a world ray from ro (z >= 0) until it passes behind the scanned front, stopping at z = zExit. xyz = hit, w = 1; w = 0 for a miss.
+vec4 scanHit(vec3 ro, vec3 rd, float zExit, int steps) {
+  if (rd.z <= 1e-5) return vec4(0.0);
+  float t1 = (zExit - ro.z) / rd.z, dt = t1 / float(steps);
+  vec3 prev = ro;
+  for (int i = 1; i <= steps; i++) {
+    vec3 p = ro + rd * (dt * float(i));
+    vec2 s = scanSample(vec2(p.x / u_surfaceAspect, p.y));
+    if (s.y > 0.5 && p.z >= s.x * u_surfaceDepth) {
+      vec3 a = prev, b = p;
+      for (int j = 0; j < 4; j++) { vec3 m = (a + b) * 0.5; vec2 ms = scanSample(vec2(m.x / u_surfaceAspect, m.y)); if (ms.y > 0.5 && m.z >= ms.x * u_surfaceDepth) b = m; else a = m; }
+      return vec4(b, 1.0);
+    }
+    prev = p;
+  }
+  return vec4(0.0);
+}`;
 
 /**
  * The room: the window camera run backwards. Each pixel's ray leaves the eye
  * through its point on the glass and lands on the floor (y = 0) or the back
  * wall (z = depth), which carries the dim window. The floor catches a pool of
  * the window's light by the wall and a soft reflection of the window itself.
- * Hands that are behind the sheet are ray-cast here too, as dark spheres
- * against the wall: seen through the gauze they are the silhouettes a hand
- * makes behind a backlit curtain.
+ * Hands are ray-marched here too, through their capsule field and only along
+ * the part of the ray inside a hand's bounding sphere, as a dark solid against
+ * the wall: seen through the gauze it is the silhouette a hand makes behind a
+ * backlit curtain. Only what has reached the sheet's depth shows, so fingers
+ * poking through appear before the palm, and a hand in front stays unseen.
+ * With a depth camera the scan is marched instead, inside its box.
  */
 export const BACKGROUND_FS = `${GLSL_HEADER}
 in vec2 v_uv; out vec4 o;
@@ -30,9 +96,12 @@ uniform float u_aspect, u_depth, u_eye, u_plane;
 uniform vec3 u_tint;
 uniform float u_backlight;
 uniform vec4 u_window;   // centre x, centre y, half width, half height, on the back wall (uniform units)
-uniform int u_handCount;
-uniform vec4 u_hands[${MAX_COLLIDERS}];       // world x, y, z, radius
-uniform float u_handAlpha[${MAX_COLLIDERS}];  // how far behind the sheet each hand is, 0..1
+${handSdfGlsl()}
+${SCAN_GLSL}
+vec3 handNormal(vec3 p) {
+  vec2 e = vec2(0.003, 0.0);
+  return normalize(vec3(handDistance(p + e.xyy) - handDistance(p - e.xyy), handDistance(p + e.yxy) - handDistance(p - e.yxy), handDistance(p + e.yyx) - handDistance(p - e.yyx)));
+}
 void main() {
   vec3 E = vec3(u_aspect * 0.5, 0.5, -u_eye);
   vec3 D = vec3(v_uv.x * u_aspect, v_uv.y, 0.0) - E;
@@ -68,22 +137,54 @@ void main() {
     float sky = 0.85 + 0.3 * smoothstep(u_window.y - u_window.w, u_window.y + u_window.w, P.y);
     c = ground + glow * (0.095 * box * sky + 0.028 * halo);
   }
-  // Hands behind the sheet: dark, soft-edged spheres with a faint rim from the window behind them.
-  float tHit = min(tFloor, tWall);
-  float invLen = inversesqrt(dot(D, D));
-  vec3 Dn = D * invLen;
-  for (int i = 0; i < ${MAX_COLLIDERS}; i++) {
-    if (i >= u_handCount) break;
-    vec4 hand = u_hands[i];
-    vec3 EC = hand.xyz - E;
-    float along = dot(EC, Dn);
-    if (along <= 0.0 || along * invLen >= tHit) continue;
-    float h = sqrt(max(dot(EC, EC) - along * along, 0.0));
-    // The gauze diffuses the silhouette more the further behind the sheet the hand is.
-    float soft = clamp(0.2 + 0.7 * (hand.z - u_plane), 0.2, 0.6) * hand.w;
-    float cover = (1.0 - smoothstep(hand.w - soft, hand.w + soft * 0.5, h)) * u_handAlpha[i];
-    float rim = smoothstep(hand.w * 0.5, hand.w, h);
-    c = mix(c, vec3(0.0015, 0.0015, 0.0022) + glow * 0.03 * rim, cover * 0.9);
+  // Hands: sphere-trace the capsule field along the part of the ray inside a hand's bounds, stopping at the room.
+  // A dark silhouette with a faint rim from the window behind it. What lies in front of the sheet's plane stays
+  // unseen (the sheet is drawn over this pass; a finger appears as it reaches the fabric), and the gauze
+  // diffuses the edge: a ray that only grazes the hand still picks up some of its shadow, more the deeper it is.
+  if (u_capsuleCount > 0) {
+    float invLen = inversesqrt(dot(D, D));
+    vec3 Dn = D * invLen;
+    vec2 span = handBoundsHit(E, Dn);
+    float t = max(span.x, 0.0), tEnd = min(span.y, min(tFloor, tWall) / invLen);
+    if (tEnd > t) {
+      float hit = -1.0, nearest = 1e9, tNear = t;
+      for (int i = 0; i < 40; i++) {
+        vec3 q = E + Dn * t;
+        float d = handDistance(q);
+        if (d < nearest) { nearest = d; tNear = t; }
+        if (d < 0.0015) { hit = t; break; }
+        t += max(d, 0.002);
+        if (t > tEnd) break;
+      }
+      vec3 q = E + Dn * (hit > 0.0 ? hit : tNear);
+      float behind = smoothstep(u_plane - 0.12, u_plane - 0.02, q.z);
+      float soft = clamp(0.012 + 0.08 * (q.z - u_plane), 0.012, 0.06);
+      float cover = 1.0 - smoothstep(0.0, soft, max(nearest, 0.0));
+      float rim = 0.0;
+      if (hit > 0.0) { vec3 nrm = handNormal(q); rim = pow(1.0 - abs(dot(nrm, Dn)), 3.0); }
+      c = mix(c, vec3(0.0015, 0.0015, 0.0022) + glow * 0.03 * rim, cover * behind * 0.9);
+    }
+  }
+  // The scan: march the ray through the shell, only along the part inside the scan's box and in front of the room.
+  if (u_surfaceReady == 1) {
+    float invLen = inversesqrt(dot(D, D));
+    vec3 Dn = D * invLen;
+    vec2 span = scanBoxSpan(E, Dn);
+    float t0 = max(span.x, 0.0), t1 = min(span.y, min(tFloor, tWall) / invLen);
+    if (t1 > t0) {
+      vec4 hit = scanHit(E + Dn * t0, Dn, (E + Dn * t1).z, 24);
+      if (hit.w > 0.0) {
+        vec2 xy = vec2(hit.x / u_surfaceAspect, hit.y);
+        vec3 nrm = scanNormal(xy);
+        float rim = pow(1.0 - abs(dot(nrm, Dn)), 3.0);
+        float behind = smoothstep(u_plane - 0.12, u_plane - 0.02, hit.z);
+        // The scan is coarse (a cell is several pixels): soften the silhouette with a small cross of mask taps.
+        vec2 e = u_surfaceTexel * 0.75;
+        float m = (surfaceMask(xy) * 2.0 + surfaceMask(xy + vec2(e.x, 0.0)) + surfaceMask(xy - vec2(e.x, 0.0)) + surfaceMask(xy + vec2(0.0, e.y)) + surfaceMask(xy - vec2(0.0, e.y))) / 6.0;
+        float cover = smoothstep(0.35, 0.9, m);
+        c = mix(c, vec3(0.0015, 0.0015, 0.0022) + glow * 0.03 * rim, cover * behind * 0.9);
+      }
+    }
   }
   // Gentle vignette.
   vec2 v = v_uv - 0.5;
@@ -112,8 +213,9 @@ void main() {
  * the cosine of the viewing angle, so folds seen edge-on become nearly opaque
  * while flat areas stay gauzy. Light: transmitted backlight (warm, from the
  * window on the back wall, with the soft silhouette of any hand that is
- * between the sheet and the window), a faint cool fill from the room, and a
- * soft rim. Output is premultiplied: rgb = fabric radiance × coverage (+ rim),
+ * between the sheet and the window, sampled through the hand's capsule field
+ * along the light ray), a faint cool fill from the room, and a soft rim.
+ * Output is premultiplied: rgb = fabric radiance × coverage (+ rim),
  * a = coverage.
  */
 export const CLOTH_FS = `${GLSL_HEADER}
@@ -126,8 +228,8 @@ uniform vec3 u_cam;       // the window camera's eye
 uniform vec3 u_light;     // the window's light, a little behind the back wall
 uniform vec2 u_threads;   // stripe counts across u and v
 uniform vec2 u_fade;      // uv-space soft edge widths (side, hem)
-uniform int u_handCount;
-uniform vec4 u_hands[${MAX_COLLIDERS}];   // world x, y, z, effective radius
+${handSdfGlsl()}
+${SCAN_GLSL}
 
 float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
 float vnoise(vec2 p) {
@@ -161,18 +263,45 @@ void main() {
   float dist2 = dot(toLight, toLight);
   float dist = sqrt(dist2);
   vec3 L = toLight / dist;
-  // A hand between the sheet and the window throws a soft silhouette onto the fabric; a hand in front of
-  // the sheet (t <= 0) throws none. The window is wide, so the penumbra grows with the hand's distance.
+  // A hand between the sheet and the window throws a soft silhouette onto the fabric; a hand in front of the
+  // sheet throws none. The capsule field is sampled along the light ray only where it crosses a hand's
+  // bounding sphere; the window is wide, so the penumbra grows with the hand's distance from the sheet.
   float shadow = 1.0;
-  for (int i = 0; i < ${MAX_COLLIDERS}; i++) {
-    if (i >= u_handCount) break;
-    vec4 hand = u_hands[i];
-    vec3 toHand = hand.xyz - v_pos;
-    float t = dot(toHand, L);
-    if (t <= 0.0 || t >= dist) continue;
-    float off = length(toHand - L * t);
-    float soft = hand.w * (0.3 + 1.0 * t / dist);
-    shadow *= mix(0.55, 1.0, smoothstep(hand.w - 0.5 * soft, hand.w + soft, off));
+  if (u_capsuleCount > 0) {
+    vec2 span = handBoundsHit(v_pos, L);
+    float t0 = max(span.x, 0.0), t1 = min(span.y, dist);
+    if (t1 > t0) {
+      float closest = 1e9;
+      for (int i = 0; i < 16; i++) {
+        float t = mix(t0, t1, (float(i) + 0.5) / 16.0);
+        float soft = 0.04 + 0.16 * t / dist;
+        closest = min(closest, handDistance(v_pos + L * t) / soft);
+      }
+      shadow = mix(0.55, 1.0, smoothstep(-0.5, 1.0, closest));
+    }
+  }
+  // The scan's shadow: the light ray sampled through the shell, only inside the scan's box. The shell test is
+  // sharp in z and uses the mask-weighted depth (the texture's own filtering would let the outline's skirt be
+  // hit at any depth and smear along the ray); the penumbra comes from the mask's own bilinear edge, widened a
+  // little with the hand's distance from the sheet.
+  if (u_surfaceReady == 1) {
+    vec2 span = scanBoxSpan(v_pos, L);
+    float t0 = max(span.x, 0.0), t1 = min(span.y, dist);
+    if (t1 > t0) {
+      float cover = 0.0;
+      for (int i = 0; i < 16; i++) {
+        float t = mix(t0, t1, (float(i) + 0.5) / 16.0);
+        vec3 q = v_pos + L * t;
+        vec2 xy = vec2(q.x / u_surfaceAspect, q.y);
+        vec2 s = scanSample(xy);
+        float zs = s.x * u_surfaceDepth;
+        if (s.y < 0.05 || q.z < zs - 0.01 || q.z > zs + u_scanThick + 0.01) continue;
+        float blur = 0.5 + 2.0 * t / dist;
+        float m = (s.y + surfaceMask(xy + u_surfaceTexel * vec2(blur, 0.0)) + surfaceMask(xy - u_surfaceTexel * vec2(blur, 0.0)) + surfaceMask(xy + u_surfaceTexel * vec2(0.0, blur)) + surfaceMask(xy - u_surfaceTexel * vec2(0.0, blur))) * 0.2;
+        cover = max(cover, m);
+      }
+      shadow *= mix(1.0, 0.55, cover);
+    }
   }
   float through = 0.45 + 0.55 * abs(dot(n, L));
   float falloff = 1.6 / (1.0 + dist2 * 0.55);

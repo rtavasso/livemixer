@@ -81,7 +81,7 @@ export class SimHost {
   private pendingEvents: GestureEvent[] = [];
   private frameEvents: GestureEvent[] = [];
   private lastEvents: GestureEvent[] = [];
-  private tracked: TrackedInput = { hands: [], presence: 0, activity: 0, occupancy: null, sourceAgeMs: Infinity, discarded: 0, stats: {} };
+  private tracked: TrackedInput = { hands: [], presence: 0, activity: 0, occupancy: null, volume: null, surface: null, sourceAgeMs: Infinity, discarded: 0, stats: {} };
   private rawSamples: { position: { x: number; y: number; z: number }; atMs: number }[] = [];
   private calibration: CalibrationCaptures = {};
   private warnings: HostWarning[] = [];
@@ -364,7 +364,7 @@ export class SimHost {
     try {
       result = this.stepper.advance(now, dt => {
         this.simTime += dt;
-        const input: SimInput = { time: this.simTime, dt, hands: this.tracked.hands, primary, events: stepped ? [] : this.pendingEvents, presence: this.tracked.presence, activity: this.tracked.activity, occupancy: this.tracked.occupancy };
+        const input: SimInput = { time: this.simTime, dt, hands: this.tracked.hands, primary, events: stepped ? [] : this.pendingEvents, presence: this.tracked.presence, activity: this.tracked.activity, occupancy: this.tracked.occupancy, volume: this.tracked.volume, surface: this.tracked.surface };
         this.instance!.step(input, this.params as never);
         stepped = true;
       });
@@ -390,7 +390,7 @@ export class SimHost {
       type: 'schema', v: 1,
       sim: { id: this.definition.id, title: this.definition.title, description: this.definition.description, params: this.definition.params, signals: this.definition.signals },
       sims: SIMULATIONS.map(s => ({ id: s.id, title: s.title })),
-      input: { hand: ['id', 'x', 'y', 'z', 'vx', 'vy', 'vz', 'speed', 'radius', 'openness', 'pinch', 'push', 'ageMs', 'staleMs'], gestures: GESTURE_TYPES, sources: SOURCE_IDS },
+      input: { hand: ['id', 'x', 'y', 'z', 'vx', 'vy', 'vz', 'speed', 'radius', 'openness', 'pinch', 'push', 'ageMs', 'staleMs', 'solid'], gestures: GESTURE_TYPES, sources: SOURCE_IDS },
     };
   }
 
@@ -421,6 +421,6 @@ export class SimHost {
 }
 
 function handTelemetry(h: HandState): HandTelemetry {
-  return { id: h.id, x: round(h.position.x), y: round(h.position.y), z: round(h.position.z), vx: round(h.velocity.x), vy: round(h.velocity.y), vz: round(h.velocity.z), speed: round(h.speed), radius: round(h.radius), openness: round(h.openness), pinch: round(h.pinch), push: round(h.push), ageMs: Math.round(h.ageMs), staleMs: Math.round(h.staleMs) };
+  return { id: h.id, x: round(h.position.x), y: round(h.position.y), z: round(h.position.z), vx: round(h.velocity.x), vy: round(h.velocity.y), vz: round(h.velocity.z), speed: round(h.speed), radius: round(h.radius), openness: round(h.openness), pinch: round(h.pinch), push: round(h.push), ageMs: Math.round(h.ageMs), staleMs: Math.round(h.staleMs), solid: h.capsules.length };
 }
 const round = (v: number) => Math.round(v * 1000) / 1000;

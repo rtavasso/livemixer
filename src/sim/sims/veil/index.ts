@@ -1,18 +1,23 @@
 /**
  * Veil — a sheer curtain hanging inside the volume, breathing in a breeze
- * from a dim window on the back wall. The hand is a sphere at its 3D position:
- * in front of the sheet it hovers without touching, at the sheet it presses
- * and sweeps, and deeper than the sheet it passes through, the fabric wrapping
- * around it and trailing behind; from behind, the backlight throws its soft
- * silhouette onto the fabric.
+ * from a dim window on the back wall. The hand is a solid in the volume —
+ * finger bones, palm and forearm when the source knows the skeleton
+ * (`hand.capsules`), a sphere at its position otherwise: in front of the sheet
+ * it hovers without touching, at the sheet each finger pokes its own pocket
+ * and a flat palm presses a palm-shaped one, and deeper than the sheet it
+ * passes through, the fabric wrapping around it and trailing behind; from
+ * behind, the backlight throws its soft silhouette onto the fabric and the
+ * hand itself shows through the gauze as a dark shape.
  *
  * Physics: `cloth.ts` (CPU position-based dynamics, deterministic) driven by
- * `wind.ts` (curl-noise breeze with gusts), hands from `colliders.ts`.
+ * `wind.ts` (curl-noise breeze with gusts), hands from `colliders.ts` (the
+ * capsules in the cloth's frame, padded, with a bounding sphere per hand).
  * Rendering: the room — floor, back wall and window — is ray-cast in one
- * full-screen pass; the sheet is an indexed mesh (positions and normals
- * re-uploaded every frame) projected by the shared window camera and drawn
- * with premultiplied blending into a float scene target; a small post pass
- * applies exposure, gamma and dither.
+ * full-screen pass, which also sphere-traces the hands through `handSdfGlsl`
+ * inside their bounding spheres; the sheet is an indexed mesh (positions and
+ * normals re-uploaded every frame) projected by the shared window camera and
+ * drawn with premultiplied blending into a float scene target; a small post
+ * pass applies exposure, gamma and dither.
  *
  * Coordinates. The volume is `[0, aspect] × [0, 1] × [0, depth]` in uniform
  * units with z INTO the scene (`toWorld`, `windowCamera`); the floor is y = 0
@@ -31,15 +36,18 @@
  * above the floor. Moving the plane (or resizing) re-hangs the sheet and lets
  * it settle before the signal baselines are retaken.
  */
-import { defineSimulation, type ParamSpecs, type ParamValues, type Quality } from '../../core/types';
-import { approach, clamp, clamp01, smoothstep } from '../../core/math';
+import { defineSimulation, type ParamSpecs, type ParamValues, type Quality, type SimInput } from '../../core/types';
+import { approach, clamp, clamp01 } from '../../core/math';
 import { DEFAULT_EYE, windowCamera } from '../../core/camera';
 import { defaultParams, hexToRgb } from '../../core/params';
 import { bindScreen, Fbo, pickFormat } from '../../gl/fbo';
+import { createPackedHands } from '../../gl/hand';
 import { Program } from '../../gl/program';
 import { drawQuad, quadProgram } from '../../gl/quad';
-import { Cloth, MAX_COLLIDERS, type ClothStepParams } from './cloth';
-import { HandColliders, strengthEase } from './colliders';
+import { SurfaceTexture } from '../../gl/surface';
+import { Cloth, NO_COLLIDERS, type ClothStepParams } from './cloth';
+import { HandColliders } from './colliders';
+import { SCAN_THICKNESS } from './scan';
 import { WindField } from './wind';
 import { BACKGROUND_FS, CLOTH_FS, CLOTH_VS, POST_FS } from './shaders';
 
@@ -119,10 +127,13 @@ export default defineSimulation({
       clothParams.stiffness = p.stiffness;
     };
 
-    // Hands → sphere colliders that grow in on arrival and shrink out on departure (no snapping).
+    // Hands → capsule colliders (or a sphere for a hand without a shape) that grow in on arrival and shrink out on
+    // departure (no snapping); with a depth camera, the scan is the solid instead.
     const colliders = new HandColliders();
-    // The same spheres in world space for the shaders, and how far behind the sheet each one is (0 in front).
-    const handData = new Float32Array(MAX_COLLIDERS * 4), handAlpha = new Float32Array(MAX_COLLIDERS);
+    // The same capsules in world space, with their bounding spheres, for the shaders; and the scan as a texture.
+    const packed = createPackedHands();
+    const surfaceTexture = new SurfaceTexture(gl);
+    let surface: SimInput['surface'] = null;
 
     // Interpolation state for rendering between fixed steps.
     const n = cloth.count;
@@ -163,7 +174,7 @@ export default defineSimulation({
      * frame does not interpolate from wherever the sheet was before.
      */
     const settle = (steps: number) => {
-      for (let i = 0; i < steps; i++) cloth.step(1 / 60, clothParams, colliders.data, 0);
+      for (let i = 0; i < steps; i++) cloth.step(1 / 60, clothParams, NO_COLLIDERS);
       swayBase = cloth.meanAbsDx; strainBase = cloth.meanStrain * .9;
       contactNorm = .3 / (layout.scale * layout.scale);
       renderPrev.set(cloth.pos); renderPos.set(cloth.pos);
@@ -186,12 +197,13 @@ export default defineSimulation({
       step(input, params) {
         applyParams(params);
         if (params.plane !== plane) { plane = params.plane; planeZ = plane * depth; rehang(); }
-        colliders.update(input.hands, input.dt, aspect, depth, planeZ);
+        surface = input.surface;
+        colliders.update(input.hands, input.dt, aspect, depth, planeZ, surface);
         // A quiet room stays a little calmer; a busy hand stirs the air.
         const changed = wind.update({ time: input.time, dt: input.dt, wind: params.wind * (.85 + .15 * input.presence), gustiness: params.gustiness, turbulence: .5 * input.activity, x0: cloth.rodX0, x1: cloth.rodX1, top: cloth.top, length: cloth.length });
         if (changed) cloth.wind.set(wind.data);
         renderPrev.set(cloth.pos);
-        cloth.step(input.dt, clothParams, colliders.data, colliders.count);
+        cloth.step(input.dt, clothParams, colliders);
         flutter = approach(flutter, clamp01(cloth.meanSpeed / .6), input.dt, .12);
         signalValues.sway = clamp01(Math.max(0, cloth.meanAbsDx - swayBase) / .12);
         signalValues.flutter = flutter;
@@ -211,16 +223,16 @@ export default defineSimulation({
         gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
         gl.bufferSubData(gl.ARRAY_BUFFER, 0, vertexData);
         gl.bindBuffer(gl.ARRAY_BUFFER, null);
-        // Hands as world-space spheres (the eased radius the cloth actually uses). A hand becomes a silhouette
-        // in the room pass as its sphere crosses the plane; in front of the sheet it is not drawn at all.
-        let handCount = 0;
-        for (const c of colliders.list) {
-          const r = c.r * strengthEase(c.strength);
-          if (r < 1e-3 || handCount >= MAX_COLLIDERS) continue;
-          handData.set([c.x, c.y, planeZ - c.z, r], handCount * 4);
-          handAlpha[handCount] = smoothstep(-r, 0, -c.z);
-          handCount++;
-        }
+        // Hands as world-space capsules with the eased radii the cloth actually feels, or the scan as a texture
+        // (the capsules pack empty then). The room pass shows whatever part of a hand has reached the sheet's
+        // plane; the sheet pass shadows the fabric with it.
+        colliders.packWorld(planeZ, packed);
+        const shell = colliders.shell, scanReady = shell.active && surfaceTexture.upload(surface);
+        const bindHands = (program: Program) => program
+          .f4v('u_capsules', packed.capsules).i1('u_capsuleCount', packed.count).f4v('u_handBounds', packed.bounds).i1('u_handBoundCount', packed.boundCount)
+          .texture('u_surface', scanReady ? surfaceTexture.texture : null, 0).i1('u_surfaceReady', scanReady ? 1 : 0)
+          .f2('u_surfaceTexel', 1 / Math.max(1, surfaceTexture.width), 1 / Math.max(1, surfaceTexture.height)).f1('u_surfaceAspect', aspect).f1('u_surfaceDepth', depth)
+          .f3('u_scanMin', shell.x0, shell.y0, shell.z0).f3('u_scanMax', shell.x1, shell.y1, shell.z1).f1('u_scanThick', SCAN_THICKNESS * depth);
 
         const [tr, tg, tb] = hexToRgb(params.tint);
         const cx = aspect * .5;
@@ -230,17 +242,15 @@ export default defineSimulation({
         // 1. the room (and the hands behind the sheet) into the scene target
         scene.bind();
         gl.disable(gl.BLEND); gl.disable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
-        background.use().f1('u_aspect', aspect).f1('u_depth', depth).f1('u_eye', EYE).f1('u_plane', planeZ)
-          .f3('u_tint', tr, tg, tb).f1('u_backlight', params.backlight).f4('u_window', wx, wy, ww, wh)
-          .i1('u_handCount', handCount).f4v('u_hands', handData).f1v('u_handAlpha', handAlpha);
+        bindHands(background.use().f1('u_aspect', aspect).f1('u_depth', depth).f1('u_eye', EYE).f1('u_plane', planeZ)
+          .f3('u_tint', tr, tg, tb).f1('u_backlight', params.backlight).f4('u_window', wx, wy, ww, wh));
         drawQuad(gl);
         // 2. the sheet, both faces, premultiplied over
         gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-        clothProgram.use().matrix4('u_matrix', camera.matrix).f1('u_plane', planeZ)
+        bindHands(clothProgram.use().matrix4('u_matrix', camera.matrix).f1('u_plane', planeZ)
           .f1('u_opacity', params.opacity).f1('u_backlight', params.backlight).f1('u_weave', params.weave)
           .f3('u_tint', tr, tg, tb).f3('u_cam', cx, .5, -EYE).f3('u_light', wx, wy, depth + LIGHT_BEHIND)
-          .f2('u_threads', 340, 230).f2('u_fade', 1.5 / (cloth.cols - 1), 1.5 / (cloth.rows - 1))
-          .i1('u_handCount', handCount).f4v('u_hands', handData);
+          .f2('u_threads', 340, 230).f2('u_fade', 1.5 / (cloth.cols - 1), 1.5 / (cloth.rows - 1)));
         gl.bindVertexArray(vao);
         gl.drawElements(gl.TRIANGLES, cloth.indices.length, gl.UNSIGNED_SHORT, 0);
         gl.bindVertexArray(null);
@@ -264,7 +274,7 @@ export default defineSimulation({
         }
       },
       dispose() {
-        background.dispose(); clothProgram.dispose(); post.dispose(); scene.dispose();
+        background.dispose(); clothProgram.dispose(); post.dispose(); scene.dispose(); surfaceTexture.dispose();
         gl.deleteVertexArray(vao); gl.deleteBuffer(vbo); gl.deleteBuffer(uvbo); gl.deleteBuffer(ibo);
       },
     };

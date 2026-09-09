@@ -64,6 +64,31 @@ export const SPLASH = { radius: .05, gain: 3.5 } as const;
 /** Glass rendering: colour, the additive brightness of the nine edges, and the per-face fill (base + edge-on Fresnel term). */
 export const GLASS = { color: [.62, .74, .92] as const, edge: .11, faceBase: .01, faceGlance: .07 } as const;
 
+/** Most solids (capsules or scan pieces) the tracer tests per light plane; a second hand and a scanned body fit comfortably. */
+export const MAX_OCCLUDERS = 48;
+/** Most bodies (hands, scan runs) per light plane. */
+export const MAX_OCCLUDER_GROUPS = 16;
+/** How far behind the scanned front surface counts as solid, in sim z (the scan is a shell, not a closed volume). */
+export const SCAN_THICKNESS = .08;
+/** A scan run is split into straight pieces where its depth strays more than this (sim z) from a straight line. */
+export const SCAN_TOLERANCE = SCAN_THICKNESS * .35;
+/**
+ * Solids within this distance of the beam's origin (uniform units) are the emitter the light leaves from: a ray's
+ * first segment passes through them (the palm, the base of the thumb, a forearm), while fingers farther out shade it.
+ */
+export const PALM_REACH = .12;
+/** Solids this close to the origin (beyond the beam's half width) are the palm itself, whose extent sizes the clearance disc. */
+export const TOUCH_MARGIN = .012;
+/** Longest clearance the rays are started outside of, in uniform units, so the beam is seen leaving the hand and never mid-air. */
+export const CLEARANCE_MAX = .06;
+/**
+ * Splashes where light lands on skin: like the wall splashes but smaller (a finger is narrower than a wall) and
+ * tinted warm, as skin reflects. `gain` is normalised by the radius in scene pixels like `SPLASH`.
+ */
+export const SKIN_SPLASH = { radius: .022, gain: 3, tint: [1, .74, .52] as const } as const;
+/** The ghost solid: a dim rim-lit body at its real height so the occluder can be seen while the spectrum dominates. */
+export const GHOST = { color: [.6, .66, .78] as const, base: .012, rim: .09 } as const;
+
 /** Rays across the beam for a `rays` parameter value at a quality tier, scaled by the adaptive budget. */
 export function rayCount(rays: number, tier: QualityTier, budget = 1): number {
   return Math.max(4, Math.round(rays * tier.rayScale * budget));

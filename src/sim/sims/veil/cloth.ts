@@ -15,13 +15,23 @@
  *
  * Solver: Verlet integration + Gauss–Seidel distance constraints (structural,
  * shear, bend) + a long-range attachment to each column's pin (keeps a
- * hanging sheet from sagging with few iterations) + sphere colliders with
+ * hanging sheet from sagging with few iterations) + hand colliders with
  * friction so fabric wraps around and trails behind a hand.
+ *
+ * Hands are solids: each is a set of capsules (finger bones, metacarpals, a
+ * forearm; or a single sphere, a capsule with coincident ends, when the source
+ * only knows a position) with one bounding sphere, a velocity and a strength
+ * that scales every radius in and out. Points are tested against a hand only
+ * inside its bounding sphere, and against a capsule only inside the capsule's
+ * padded box, so the cost follows the hand, not the sheet. A depth camera's
+ * scan (`ScanShell`) is a solid too: a shell of SCAN_THICKNESS behind the
+ * scanned front, tested only inside the scan's box.
  *
  * Working arrays are Float64 (V8 avoids float conversions); the renderer
  * copies into its own Float32 upload buffer.
  */
 import { rng } from '../../core/math';
+import { SCAN_THICKNESS, type ScanShell } from './scan';
 
 export interface ClothOptions {
   cols: number;
@@ -57,13 +67,35 @@ export interface ClothStepParams {
   iterations: number;
 }
 
-/** Colliders are packed 8 floats each: x, y, z, radius, vx, vy, vz, strength (0..1, scales the radius in/out). */
-export const COLLIDER_STRIDE = 8;
+/**
+ * Colliders (hands) are packed COLLIDER_STRIDE floats each: bounding sphere x, y, z, radius; velocity vx, vy, vz;
+ * strength (0..1, scales every radius in/out); index of the hand's first capsule in the capsule pool; capsule
+ * count; 1 when the hand is a solid shape (0 for the sphere fallback); unused.
+ */
+export const COLLIDER_STRIDE = 12;
 export const MAX_COLLIDERS = 4;
+/** Capsules are packed CAPSULE_STRIDE floats each: a.xyz, radius, b.xyz, (not read by the solver). A sphere is a capsule with a = b. */
+export const CAPSULE_STRIDE = 8;
+/** Capsules per hand the solver accepts (finger bones, metacarpals and a forearm come to about 21). */
+export const MAX_COLLIDER_CAPSULES = 32;
 /** Distance beyond a collider's surface that counts as contact (for the contact signal). */
 export const CONTACT_SKIN = .05;
 /** Penetration (per substep) at which friction fully couples fabric to the hand; shallower contact slides. */
 export const FRICTION_SKIN = .006;
+/** Passes of "push out of the deepest capsule" per point, so a point in the crease between overlapping capsules still ends outside them all. */
+const COLLIDE_PASSES = 4;
+/** Floats per capsule in the solver's scratch: axis start, axis, 1/len², radius, reach, box min, box max. */
+const SCRATCH_STRIDE = 16;
+
+/** What `Cloth.step` collides with: `count` hands in `hands`, each pointing at its capsules in `capsules`, and optionally the scan. */
+export interface ColliderPack {
+  hands: Float32Array | Float64Array;
+  count: number;
+  capsules: Float32Array | Float64Array;
+  /** The depth camera's scan as a shell; ignored when absent or inactive. */
+  shell?: ScanShell | null;
+}
+export const NO_COLLIDERS: ColliderPack = { hands: new Float32Array(0), count: 0, capsules: new Float32Array(0), shell: null };
 /** Rows over which the horizontal rest spacing eases from the gathered rod to the full fabric width (the "heading"). */
 const HEADING_ROWS = 8;
 
@@ -93,7 +125,7 @@ export class Cloth {
   meanStrain = 0;
   /** Mean point speed, units/s. */
   meanSpeed = 0;
-  /** Fraction of points within a collider's surface + CONTACT_SKIN. */
+  /** Fraction of points within CONTACT_SKIN of any capsule of any hand. */
   contactFraction = 0;
   /** Mean signed z. */
   meanZ = 0;
@@ -115,6 +147,10 @@ export class Cloth {
   // Bilinear wind lookup, precomputed per column / row.
   private readonly wu0: Int32Array; private readonly wuf: Float64Array;
   private readonly wv0: Int32Array; private readonly wvf: Float64Array;
+  // Collision scratch: points inside the current hand's bounding sphere, per-point contact flags, per-capsule geometry.
+  private readonly candidates: Int32Array;
+  private readonly touched: Uint8Array;
+  private readonly capsuleScratch = new Float64Array(MAX_COLLIDER_CAPSULES * SCRATCH_STRIDE);
 
   constructor(options: ClothOptions) {
     const cols = Math.max(3, options.cols | 0), rows = Math.max(3, options.rows | 0);
@@ -128,6 +164,7 @@ export class Cloth {
     this.pos = new Float64Array(n * 3); this.prev = new Float64Array(n * 3); this.normal = new Float64Array(n * 3);
     this.invMass = new Float64Array(n); this.restX = new Float64Array(n); this.uv = new Float32Array(n * 2);
     this.wind = new Float64Array(WIND_COLS * WIND_ROWS * 3);
+    this.candidates = new Int32Array(n); this.touched = new Uint8Array(n);
     for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) { const i = r * cols + c; this.uv[i * 2] = c / (cols - 1); this.uv[i * 2 + 1] = r / (rows - 1); this.invMass[i] = r === 0 ? 0 : 1; }
 
     // Constraint topology (fixed order → deterministic Gauss–Seidel).
@@ -257,10 +294,10 @@ export class Cloth {
   }
 
   /**
-   * Advance by `dt` seconds. `colliders` holds up to `colliderCount` spheres
-   * packed with COLLIDER_STRIDE. The wind lattice must already be filled.
+   * Advance by `dt` seconds. `colliders` holds the hands (up to MAX_COLLIDERS, packed with COLLIDER_STRIDE)
+   * and the capsule pool they point into. The wind lattice must already be filled.
    */
-  step(dt: number, p: ClothStepParams, colliders: Float32Array | Float64Array, colliderCount: number) {
+  step(dt: number, p: ClothStepParams, colliders: ColliderPack = NO_COLLIDERS) {
     const sub = Math.max(1, p.substeps | 0), iterations = Math.max(1, p.iterations | 0);
     const h = dt / sub, h2 = h * h, damp = Math.exp(-p.damping * h);
     const stiff = Math.min(1, Math.max(0, p.stiffness));
@@ -271,7 +308,8 @@ export class Cloth {
     const cols = this.cols, rows = this.rows, n = this.count;
     const wu0 = this.wu0, wuf = this.wuf, wv0 = this.wv0, wvf = this.wvf, wc3 = WIND_COLS * 3;
     const g = p.gravity, dn = p.dragNormal, dtg = p.dragTangent, invH = 1 / h;
-    const nCol = Math.min(MAX_COLLIDERS, colliderCount | 0);
+    const nCol = Math.min(MAX_COLLIDERS, colliders.count | 0);
+    const shell = colliders.shell && colliders.shell.active ? colliders.shell : null;
 
     this.computeNormals();
     let speedSum = 0, contacts = 0;
@@ -309,11 +347,13 @@ export class Cloth {
         if (it === 0) { solveDistance(pos, this.bhA, this.bhB, this.bhRest, this.bhWa, this.bhWb, kBend); solveDistance(pos, this.bvA, this.bvB, this.bvRest, this.bvWa, this.bvWb, kBend); }
       }
       this.longRangeAttachment();
-      // Colliders last, so no point ends a substep inside a hand.
+      // Colliders last, so no point ends a substep inside a hand. Contact is counted on the final substep, once per point.
       const count = s === sub - 1;
+      if (count && (nCol > 0 || shell)) this.touched.fill(0);
       for (let k = 0; k < nCol; k++) contacts += this.collide(colliders, k * COLLIDER_STRIDE, h, p.friction, count);
+      if (shell) contacts += this.collideShell(shell, h, p.friction, count);
       // Only a hand can push fabric below the floor (the attachment keeps the hem at top − length otherwise).
-      if (nCol > 0) { const floor = this.floor; for (let i = cols; i < n; i++) { const o = i * 3 + 1; if (pos[o] < floor) pos[o] = floor; } }
+      if (nCol > 0 || shell) { const floor = this.floor; for (let i = cols; i < n; i++) { const o = i * 3 + 1; if (pos[o] < floor) pos[o] = floor; } }
     }
     // --- signals
     this.meanSpeed = speedSum / (sub * n) * invH;
@@ -343,51 +383,172 @@ export class Cloth {
     }
   }
 
-  /** Push points out of one sphere and couple nearby fabric to the hand's velocity. Returns the contact count when `count` is set. */
-  private collide(col: Float32Array | Float64Array, o: number, h: number, friction: number, count: boolean): number {
-    const strength = col[o + 7];
+  /**
+   * Push points out of one hand's capsules and couple the fabric it presses on to the hand's velocity.
+   * Only points inside the hand's bounding sphere are considered, and each of those only against the
+   * capsules whose padded box contains it. A point inside one or more capsules is pushed out of the deepest,
+   * again and again until it is clear of them all, so fingers, palm and forearm each press their own shape.
+   * Returns the number of points newly within reach of the hand when `count` is set.
+   */
+  private collide(colliders: ColliderPack, o: number, h: number, friction: number, count: boolean): number {
+    const hand = colliders.hands, caps = colliders.capsules;
+    const strength = hand[o + 7];
     if (strength <= 0) return 0;
     const ease = strength * strength * (3 - 2 * strength);
-    const cx = col[o], cy = col[o + 1], cz = col[o + 2], radius = col[o + 3] * ease;
-    if (radius <= 1e-4) return 0;
-    const tx = col[o + 4] * h, ty = col[o + 5] * h, tz = col[o + 6] * h;
+    const first = hand[o + 8] | 0, nCaps = Math.min(MAX_COLLIDER_CAPSULES, hand[o + 9] | 0);
+    if (nCaps <= 0 || hand[o + 3] * ease <= 1e-4) return 0;
+    const bx = hand[o], by = hand[o + 1], bz = hand[o + 2], reachB = hand[o + 3] + CONTACT_SKIN, reachB2 = reachB * reachB;
+    const tx = hand[o + 4] * h, ty = hand[o + 5] * h, tz = hand[o + 6] * h;
     const pos = this.pos, prev = this.prev, w = this.invMass, n = this.count;
-    const reach = radius + CONTACT_SKIN, reach2 = reach * reach, r2 = radius * radius, invPen = 1 / FRICTION_SKIN, mu = friction * ease;
-    let contacts = 0;
-    for (let i = 0; i < n; i++) {
+    // 1. Candidates: free points inside the bounding sphere plus the contact skin (the bound is unscaled, so it holds at any strength).
+    const cand = this.candidates;
+    let m = 0;
+    for (let i = this.cols; i < n; i++) {
       if (w[i] === 0) continue;
-      const p = i * 3;
-      let dx = pos[p] - cx, dy = pos[p + 1] - cy, dz = pos[p + 2] - cz;
-      const d2 = dx * dx + dy * dy + dz * dz;
-      if (d2 >= reach2) continue;
-      if (count) contacts++;
-      const d = Math.sqrt(d2);
-      if (d < radius) {
-        // Friction grows with how hard the hand presses (penetration this substep): grazing fabric slides,
-        // fabric the hand pushes into travels with it. Blend the point's displacement toward the hand's.
-        const k = mu * Math.min(1, (radius - d) * invPen);
-        pos[p] += (tx - (pos[p] - prev[p])) * k;
-        pos[p + 1] += (ty - (pos[p + 1] - prev[p + 1])) * k;
-        pos[p + 2] += (tz - (pos[p + 2] - prev[p + 2])) * k;
-        dx = pos[p] - cx; dy = pos[p + 1] - cy; dz = pos[p + 2] - cz;
+      const p = i * 3, dx = pos[p] - bx, dy = pos[p + 1] - by, dz = pos[p + 2] - bz;
+      if (dx * dx + dy * dy + dz * dz < reachB2) cand[m++] = i;
+    }
+    if (m === 0) return 0;
+    // 2. Per capsule: axis, 1/len², eased radius, reach, and the box the reach expands to.
+    const S = SCRATCH_STRIDE, sc = this.capsuleScratch;
+    for (let k = 0; k < nCaps; k++) {
+      const c = (first + k) * CAPSULE_STRIDE, q = k * S;
+      const ax = caps[c], ay = caps[c + 1], az = caps[c + 2], r = caps[c + 3] * ease;
+      const abx = caps[c + 4] - ax, aby = caps[c + 5] - ay, abz = caps[c + 6] - az;
+      const len2 = abx * abx + aby * aby + abz * abz, reach = r + CONTACT_SKIN;
+      sc[q] = ax; sc[q + 1] = ay; sc[q + 2] = az; sc[q + 3] = abx; sc[q + 4] = aby; sc[q + 5] = abz;
+      sc[q + 6] = len2 > 1e-12 ? 1 / len2 : 0; sc[q + 7] = r; sc[q + 8] = reach;
+      sc[q + 9] = Math.min(ax, ax + abx) - reach; sc[q + 10] = Math.min(ay, ay + aby) - reach; sc[q + 11] = Math.min(az, az + abz) - reach;
+      sc[q + 12] = Math.max(ax, ax + abx) + reach; sc[q + 13] = Math.max(ay, ay + aby) + reach; sc[q + 14] = Math.max(az, az + abz) + reach;
+    }
+    const invPen = 1 / FRICTION_SKIN, mu = friction * ease, touched = this.touched;
+    let contacts = 0;
+    // 3. Each candidate: within reach of any capsule is contact; inside one is pushed out of the deepest until clear.
+    for (let ci = 0; ci < m; ci++) {
+      const i = cand[ci], p = i * 3;
+      let px = pos[p], py = pos[p + 1], pz = pos[p + 2];
+      for (let pass = 0; pass < COLLIDE_PASSES; pass++) {
+        let deepest = -1, deepestPen = 0, nx = 0, ny = 0, nz = 0;
+        for (let k = 0; k < nCaps; k++) {
+          const q = k * S;
+          if (px < sc[q + 9] || px > sc[q + 12] || py < sc[q + 10] || py > sc[q + 13] || pz < sc[q + 11] || pz > sc[q + 14]) continue;
+          const apx = px - sc[q], apy = py - sc[q + 1], apz = pz - sc[q + 2];
+          let t = (apx * sc[q + 3] + apy * sc[q + 4] + apz * sc[q + 5]) * sc[q + 6];
+          t = t < 0 ? 0 : t > 1 ? 1 : t;
+          const dx = apx - sc[q + 3] * t, dy = apy - sc[q + 4] * t, dz = apz - sc[q + 5] * t;
+          const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+          if (count && pass === 0 && d < sc[q + 8] && touched[i] === 0) { touched[i] = 1; contacts++; }
+          const pen = sc[q + 7] - d;
+          if (pen > deepestPen) { deepestPen = pen; deepest = k; nx = dx; ny = dy; nz = dz; }
+        }
+        if (deepest < 0) break;
+        const q = deepest * S, r = sc[q + 7];
+        if (pass === 0) {
+          // Friction grows with how hard the hand presses (penetration this substep): grazing fabric slides,
+          // fabric the hand pushes into travels with it. Blend the point's displacement toward the hand's,
+          // then find its offset from the capsule's axis again.
+          const kf = mu * Math.min(1, deepestPen * invPen);
+          px += (tx - (px - prev[p])) * kf; py += (ty - (py - prev[p + 1])) * kf; pz += (tz - (pz - prev[p + 2])) * kf;
+          const apx = px - sc[q], apy = py - sc[q + 1], apz = pz - sc[q + 2];
+          let t = (apx * sc[q + 3] + apy * sc[q + 4] + apz * sc[q + 5]) * sc[q + 6];
+          t = t < 0 ? 0 : t > 1 ? 1 : t;
+          nx = apx - sc[q + 3] * t; ny = apy - sc[q + 4] * t; nz = apz - sc[q + 5] * t;
+        }
+        // Project onto the capsule's surface (a point on the axis is pushed toward the viewer).
+        const e2 = nx * nx + ny * ny + nz * nz;
+        if (e2 >= r * r) continue;
+        const cx = px - nx, cy = py - ny, cz = pz - nz;
+        if (e2 > 1e-14) { const s = r / Math.sqrt(e2); px = cx + nx * s; py = cy + ny * s; pz = cz + nz * s; }
+        else { px = cx; py = cy; pz = cz + r; }
       }
-      // then project onto the surface (a point at the exact centre is pushed toward the viewer)
-      const e2 = dx * dx + dy * dy + dz * dz;
-      if (e2 < r2) {
-        if (e2 > 1e-14) { const s = radius / Math.sqrt(e2); pos[p] = cx + dx * s; pos[p + 1] = cy + dy * s; pos[p + 2] = cz + dz * s; }
-        else pos[p + 2] = cz + radius;
-      }
+      pos[p] = px; pos[p + 1] = py; pos[p + 2] = pz;
     }
     return contacts;
   }
 
-  /** True when any non-pinned point lies strictly inside the sphere (for tests). */
-  anyInside(cx: number, cy: number, cz: number, radius: number, tolerance = 1e-6): boolean {
-    const pos = this.pos, r2 = (radius - tolerance) * (radius - tolerance);
+  /**
+   * Push points out of the scan's shell and couple the fabric it presses on to the scan's depth motion. Only
+   * points inside the scan's box are sampled. A point inside the shell leaves by the nearer face, tilted by the
+   * local slope (then straight along z if the tilt landed it under a different depth), so it always ends outside.
+   * Returns the number of points newly within reach of the shell when `count` is set.
+   */
+  private collideShell(shell: ScanShell, h: number, friction: number, count: boolean): number {
+    const pos = this.pos, prev = this.prev, w = this.invMass, n = this.count, touched = this.touched;
+    const aspect = shell.aspect, depth = shell.depth, plane = shell.plane, invAspect = 1 / aspect;
+    const thick = SCAN_THICKNESS * depth, skin = CONTACT_SKIN, invPen = 1 / FRICTION_SKIN;
+    // The box in the cloth frame: x, y as world; z from the plane toward the viewer, plus the skin.
+    const bx0 = shell.x0, bx1 = shell.x1, by0 = shell.y0, by1 = shell.y1, bz0 = plane - shell.z1 - skin, bz1 = plane - shell.z0 + skin;
+    let contacts = 0;
+    for (let i = this.cols; i < n; i++) {
+      if (w[i] === 0) continue;
+      const p = i * 3;
+      let px = pos[p], py = pos[p + 1], pz = pos[p + 2];
+      if (px < bx0 || px > bx1 || py < by0 || py > by1 || pz < bz0 || pz > bz1) continue;
+      shell.sample(px * invAspect, py);
+      if (shell.smask < .5) continue;
+      let wz = plane - pz;
+      const front = shell.sz * depth, back = front + thick;
+      if (wz < front - skin || wz > back + skin) continue;
+      if (count && touched[i] === 0) { touched[i] = 1; contacts++; }
+      if (wz < front || wz > back) continue;
+      // Friction against the shell's depth motion, growing with how deep the point is in.
+      const pen = Math.min(wz - front, back - wz), tz = -shell.svz * depth * h;
+      const kf = friction * Math.min(1, pen * invPen);
+      pz += (tz - (pz - prev[p + 2])) * kf; wz = plane - pz;
+      if (wz >= front && wz <= back) {
+        shell.slopes(px * invAspect, py);
+        const dFront = wz - front, dBack = back - wz;
+        if (dFront <= dBack) { wz = front; px += shell.gx * dFront; py += shell.gy * dFront; }
+        else { wz = back; px -= shell.gx * dBack; py -= shell.gy * dBack; }
+        if (shell.gx !== 0 || shell.gy !== 0) {
+          // The tilt moved it under a different column of the scan: leave along z if that column holds it.
+          shell.sample(px * invAspect, py);
+          if (shell.smask >= .5) {
+            const f2 = shell.sz * depth, b2 = f2 + thick;
+            if (wz > f2 && wz < b2) wz = wz - f2 <= b2 - wz ? f2 : b2;
+          }
+        }
+        pz = plane - wz;
+      }
+      pos[p] = px; pos[p + 1] = py; pos[p + 2] = pz;
+    }
+    return contacts;
+  }
+
+  /** True when any non-pinned point lies strictly inside the scan's shell (for tests). */
+  anyInsideShell(shell: ScanShell, tolerance = 1e-6): boolean {
+    if (!shell.active) return false;
+    const pos = this.pos, depth = shell.depth, plane = shell.plane, thick = SCAN_THICKNESS * depth;
     for (let i = 0; i < this.count; i++) {
       if (this.invMass[i] === 0) continue;
-      const dx = pos[i * 3] - cx, dy = pos[i * 3 + 1] - cy, dz = pos[i * 3 + 2] - cz;
-      if (dx * dx + dy * dy + dz * dz < r2) return true;
+      shell.sample(pos[i * 3] / shell.aspect, pos[i * 3 + 1]);
+      if (shell.smask < .5) continue;
+      const wz = plane - pos[i * 3 + 2], front = shell.sz * depth;
+      if (wz > front + tolerance && wz < front + thick - tolerance) return true;
+    }
+    return false;
+  }
+
+  /** True when any non-pinned point lies strictly inside any capsule of any hand in the pack, at the hands' current strengths (for tests). */
+  anyInside(colliders: ColliderPack, tolerance = 1e-6): boolean {
+    const pos = this.pos, hand = colliders.hands, caps = colliders.capsules;
+    for (let k = 0; k < Math.min(MAX_COLLIDERS, colliders.count | 0); k++) {
+      const o = k * COLLIDER_STRIDE, strength = hand[o + 7];
+      if (strength <= 0) continue;
+      const ease = strength * strength * (3 - 2 * strength), first = hand[o + 8] | 0, nCaps = hand[o + 9] | 0;
+      for (let c = 0; c < nCaps; c++) {
+        const q = (first + c) * CAPSULE_STRIDE, r = caps[q + 3] * ease - tolerance;
+        if (r <= 0) continue;
+        const ax = caps[q], ay = caps[q + 1], az = caps[q + 2], abx = caps[q + 4] - ax, aby = caps[q + 5] - ay, abz = caps[q + 6] - az;
+        const len2 = abx * abx + aby * aby + abz * abz, inv = len2 > 1e-12 ? 1 / len2 : 0;
+        for (let i = 0; i < this.count; i++) {
+          if (this.invMass[i] === 0) continue;
+          const apx = pos[i * 3] - ax, apy = pos[i * 3 + 1] - ay, apz = pos[i * 3 + 2] - az;
+          let t = (apx * abx + apy * aby + apz * abz) * inv; t = t < 0 ? 0 : t > 1 ? 1 : t;
+          const dx = apx - abx * t, dy = apy - aby * t, dz = apz - abz * t;
+          if (dx * dx + dy * dy + dz * dz < r * r) return true;
+        }
+      }
     }
     return false;
   }

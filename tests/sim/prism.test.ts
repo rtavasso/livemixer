@@ -1,13 +1,20 @@
 import { describe, expect, it } from 'vitest';
 import {
-  beamGain, beamWidth, idleOrbit, lightPlane, MAX_SEGMENTS, nextRayBudget, prismCentre, prismRadius, QUALITY, rayCount, TRACE_DEFAULTS, traceOptionsFor, wallOf,
+  beamGain, beamWidth, CLEARANCE_MAX, idleOrbit, lightPlane, MAX_OCCLUDERS, MAX_SEGMENTS, nextRayBudget, PALM_REACH, prismCentre, prismRadius, QUALITY, rayCount,
+  SCAN_THICKNESS, SCAN_TOLERANCE, TOUCH_MARGIN, TRACE_DEFAULTS, traceOptionsFor, wallOf,
 } from '../../src/sim/sims/prism/config';
 import {
-  buildSpectrum, CAUCHY_B_GLASS, cauchyIndex, createPolygon, criticalAngle, fresnelReflectance, intersectPolygon, pointInPolygon, refract, reflect,
-  SEGMENT_STRIDE, setRegularPolygon, signalsFromStats, Tracer, wavelengthToRgb, type BeamSource, type RawSignals, type TraceOptions,
+  buildSpectrum, CAUCHY_B_GLASS, cauchyIndex, createPolygon, criticalAngle, fresnelReflectance, HIT_STRIDE, intersectPolygon, OCCLUDER_CAPSULE, OCCLUDER_QUAD,
+  OCCLUDER_STRIDE, OccluderSet, pointInPolygon, rayCapsuleInPlane, rayConvexQuad, refract, reflect, SEGMENT_STRIDE, setRegularPolygon, signalsFromStats, Tracer,
+  wavelengthToRgb, type BeamSource, type RawSignals, type TraceOptions,
 } from '../../src/sim/sims/prism/optics';
+import { addHandOccluders, addScanOccluders, pointQuadDistance, quadCorners, type Emitter } from '../../src/sim/sims/prism/solids';
 import { convexHull, EYE_HEIGHT, faceBrightness, prismCamera, prismCorners, prismSilhouette } from '../../src/sim/sims/prism/geometry';
 import { DEFAULT_EYE, transformPoint, windowCamera } from '../../src/sim/core/camera';
+import type { SurfaceField, Vec3 } from '../../src/sim/core/types';
+import type { Capsule, HandState } from '../../src/sim/input/types';
+import { surfaceFromCapsules, syntheticHandCapsules } from '../../src/sim/input/synthetic';
+import { IMAGE_MAPPING, mapPoint, mapSurface } from '../../src/sim/input/mapping';
 import prism from '../../src/sim/sims/prism';
 
 const deg = (d: number) => (d * Math.PI) / 180;
@@ -135,7 +142,7 @@ describe('prism ray tracer', () => {
     expect(one.stats.exitEnergy).toBeLessThanOrEqual(one.stats.launched + 1e-6);
   });
   it('reports signals within their ranges', () => {
-    const out: RawSignals = { spread: 0, hue: 0, brightness: 0, reflected: 0, incidence: 0, inside: 0 };
+    const out: RawSignals = { spread: 0, hue: 0, brightness: 0, reflected: 0, incidence: 0, inside: 0, occluded: 0 };
     const { prism, source, options, theta1 } = minimumDeviationScene(1.5, 16, .014, 4);
     const tracer = new Tracer(20000);
     signalsFromStats(tracer.trace([prism], [{ ...source, width: .2, rays: 40 }], options), out);
@@ -169,7 +176,7 @@ describe('wavelength interleaving', () => {
     const twice = new Tracer(5000); twice.trace([prism], [source], options);
     expect(twice.stats).toEqual(tracer.stats);
     // Signals: a complete spectrum sits near the middle hue; cutting the blue end (index 0..15) would pull it towards red.
-    const out: RawSignals = { spread: 0, hue: 0, brightness: 0, reflected: 0, incidence: 0, inside: 0 };
+    const out: RawSignals = { spread: 0, hue: 0, brightness: 0, reflected: 0, incidence: 0, inside: 0, occluded: 0 };
     signalsFromStats(tracer.stats, out);
     expect(out.hue).toBeGreaterThan(.15); expect(out.hue).toBeLessThan(.5);
     const focused = tracer.signals({ ...out });
@@ -276,7 +283,7 @@ describe('wall termination', () => {
     const stats = tracer.trace([], [beam], scene.options);
     expect(stats.segments).toBe(scene.rays); expect(stats.insideSegments).toBe(0);
     for (let i = 0; i < stats.segments; i++) expect(wallOf(tracer.segments[i * SEGMENT_STRIDE + 2], tracer.segments[i * SEGMENT_STRIDE + 3], ASPECT, DEPTH)).toBe(4);
-    const out: RawSignals = { spread: 0, hue: .3, brightness: 0, reflected: 0, incidence: 0, inside: 0 };
+    const out: RawSignals = { spread: 0, hue: .3, brightness: 0, reflected: 0, incidence: 0, inside: 0, occluded: 0 };
     signalsFromStats(stats, out);
     expect(out.incidence).toBe(0); expect(out.inside).toBe(0); expect(out.brightness).toBeCloseTo(1, 6);
   });
@@ -377,7 +384,7 @@ describe('segment budget', () => {
   it('dropping second-order reflections keeps most of the launched energy', () => {
     const scene = simulationScene('high');
     const tracer = new Tracer(MAX_SEGMENTS);
-    const out: RawSignals = { spread: 0, hue: 0, brightness: 0, reflected: 0, incidence: 0, inside: 0 };
+    const out: RawSignals = { spread: 0, hue: 0, brightness: 0, reflected: 0, incidence: 0, inside: 0, occluded: 0 };
     for (const angle of orbit) {
       signalsFromStats(tracer.trace([scene.polygon], [scene.beamAt(angle)], scene.options), out);
       expect(out.brightness, `brightness at ${Math.round(angle * 180 / Math.PI)}°`).toBeGreaterThan(.85);
@@ -422,12 +429,247 @@ describe('segment budget', () => {
   });
 });
 
+/** A tracked hand in sim space with a solid shape. */
+function handState(id: number, position: Vec3, capsules: Capsule[]): HandState {
+  return { id, position, velocity: { x: 0, y: 0, z: 0 }, speed: 0, extent: { min: position, max: position }, radius: .05, openness: 1, pinch: 0, confidence: 1, ageMs: 0, staleMs: 0, push: position.z, points: [], capsules };
+}
+const emptySignals = (): RawSignals => ({ spread: 0, hue: 0, brightness: 0, reflected: 0, incidence: 0, inside: 0, occluded: 0 });
+const noGlass: TraceOptions = { spectrum: buildSpectrum(8), glassA: 1.5, glassB: 0, bounces: 2, minEnergy: 1e-6, bounds: [-1, -1, 3, 1] };
+
+describe('solids in the light plane', () => {
+  it('slices a capsule by the plane exactly: a vertical bone is a disc of its radius, a bone passing above the plane a sphere slice', () => {
+    const r = .1;
+    // A vertical bone at x = 1 through the plane h = .5: rays across it (along x, at lateral offset y) meet a disc of radius r.
+    const vertical = (offset: number) => rayCapsuleInPlane(0, .5, offset, 1, 0, 1, 0, 0, 1, 1, 0, r);
+    expect(vertical(0)).toBeCloseTo(1 - r, 9);
+    expect(vertical(r - 1e-4)).toBeLessThan(Infinity); expect(vertical(r + 1e-4)).toBe(Infinity);
+    // A bone lying along the tracer's y at x = 1, its axis dy above the plane: the cross-section radius is sqrt(r² − dy²).
+    for (const dy of [0, .03, .06, .0999]) {
+      const slice = Math.sqrt(r * r - dy * dy);
+      expect(rayCapsuleInPlane(0, .5, 0, 1, 0, 1, .5 + dy, -1, 1, .5 + dy, 1, r)).toBeCloseTo(1 - slice, 9);
+    }
+    expect(rayCapsuleInPlane(0, .5, 0, 1, 0, 1, .5 + r + 1e-4, -1, 1, .5 + r + 1e-4, 1, r)).toBe(Infinity);
+    // A ray starting inside passes through; a ray along a bone's axis enters its near cap; one beside it misses.
+    expect(rayCapsuleInPlane(1, .5, 0, 1, 0, 1, 0, 0, 1, 1, 0, r)).toBe(Infinity);
+    expect(rayCapsuleInPlane(0, .5, 0, 1, 0, 1, .5, 0, 2, .5, 0, r)).toBeCloseTo(1 - r, 9);
+    expect(rayCapsuleInPlane(0, .5, r + .01, 1, 0, 1, .5, 0, 2, .5, 0, r)).toBe(Infinity);
+    // A sphere (zero-length capsule) behaves like its end caps.
+    expect(rayCapsuleInPlane(0, .5, 0, 1, 0, 1, .5, 0, 1, .5, 0, r)).toBeCloseTo(1 - r, 9);
+  });
+  it('enters a convex quad through the nearest edge and passes through when starting inside', () => {
+    const d = new Float64Array([1, -.5, 2, -.5, 2, .5, 1, .5]), edge = new Int32Array(1);
+    expect(rayConvexQuad(0, 0, 1, 0, d, 0, edge)).toBeCloseTo(1, 12); expect(edge[0]).toBe(3);      // the left edge
+    expect(rayConvexQuad(1.5, -2, 0, 1, d, 0, edge)).toBeCloseTo(1.5, 12); expect(edge[0]).toBe(0);  // the bottom edge
+    expect(rayConvexQuad(0, 1, 1, 0, d, 0, edge)).toBe(Infinity);                                     // beside it
+    expect(rayConvexQuad(1.5, 0, 1, 0, d, 0, edge)).toBe(Infinity);                                   // inside
+    expect(rayConvexQuad(3, 0, 1, 0, d, 0, edge)).toBe(Infinity);                                     // behind
+    expect(pointQuadDistance(1.5, 0, d)).toBeCloseTo(-.5, 12); expect(pointQuadDistance(0, 0, d)).toBeCloseTo(1, 12); expect(pointQuadDistance(0, 1, d)).toBeCloseTo(Math.hypot(1, .5), 9);
+  });
+  it('keeps only the capsules that reach the plane and bounds each body with a disc around its slices', () => {
+    const occ = new OccluderSet(8, 2);
+    occ.begin(.5);
+    occ.beginGroup();
+    expect(occ.addCapsule(0, .8, 0, 1, .9, 0, .1)).toBe(false);      // entirely above the plane
+    expect(occ.addCapsule(0, .61, 0, 1, .61, 0, .1)).toBe(false);    // axis .11 above with radius .1: out of reach
+    expect(occ.addCapsule(0, .55, 0, 1, .55, 0, .1)).toBe(true);     // within reach
+    expect(occ.addCapsule(2, .2, .3, 2, .9, .3, .05)).toBe(true);    // crosses the plane
+    occ.endGroup();
+    occ.beginGroup(); expect(occ.addCapsule(5, 2, 5, 6, 2, 5, .1)).toBe(false); occ.endGroup();   // nothing in the plane: no group
+    expect(occ.count).toBe(2); expect(occ.groupCount).toBe(1); expect(occ.kind[0]).toBe(OCCLUDER_CAPSULE);
+    const [cx, cy, cr] = occ.disc(0);
+    // Every point on either slice's boundary lies within the disc: cast rays at the slices from all around.
+    let boundaryPoints = 0;
+    for (let a = 0; a < 36; a++) {
+      const dx = Math.cos((a / 36) * Math.PI * 2), dy = Math.sin((a / 36) * Math.PI * 2), ox = cx - dx * 10, oy = cy - dy * 10;
+      for (let k = 0; k < occ.count; k++) {
+        const o = k * OCCLUDER_STRIDE, d = occ.data;
+        const t = rayCapsuleInPlane(ox, .5, oy, dx, dy, d[o], d[o + 1], d[o + 2], d[o + 3], d[o + 4], d[o + 5], d[o + 6]);
+        if (t === Infinity) continue;
+        boundaryPoints++;
+        expect(Math.hypot(ox + dx * t - cx, oy + dy * t - cy)).toBeLessThanOrEqual(cr + 1e-9);
+      }
+    }
+    expect(boundaryPoints).toBeGreaterThan(20);
+    // The cap: the 9th capsule of an 8-capsule set is refused.
+    occ.begin(.5); occ.beginGroup();
+    for (let i = 0; i < 9; i++) expect(occ.addCapsule(i, .5, 0, i, .5, 1, .1)).toBe(i < 8);
+    occ.endGroup();
+    expect(occ.full).toBe(true); expect(MAX_OCCLUDERS).toBe(48);
+  });
+  it('a body across the beam stops every ray, absorbs its energy, and leaves a splash whose normal faces the light', () => {
+    const occ = new OccluderSet();
+    occ.begin(.5); occ.beginGroup(); occ.addCapsule(1, .5, -1, 1, .5, 1, .15); occ.endGroup();   // a bone lying across the beam at x = 1
+    const beam: BeamSource = { x: 0, y: 0, dirX: 1, dirY: 0, width: .2, intensity: 1, rays: 16, gain: 1 };
+    const tracer = new Tracer(1000);
+    const stats = tracer.trace([], [beam], noGlass, occ);
+    expect(stats.rays).toBe(16); expect(stats.occludedRays).toBe(16); expect(stats.exitEnergy).toBe(0);
+    expect(stats.occluded).toBeCloseTo(stats.launched, 9);
+    expect(stats.segments).toBe(16); expect(tracer.hitCount).toBe(16);
+    for (let i = 0; i < 16; i++) {
+      expect(tracer.segments[i * SEGMENT_STRIDE + 2]).toBeCloseTo(.85, 5);   // ends on the bone's near surface
+      const h = i * HIT_STRIDE;
+      expect(tracer.hits[h]).toBeCloseTo(.85, 5); expect(tracer.hits[h + 2]).toBeCloseTo(-1, 5); expect(tracer.hits[h + 3]).toBeCloseTo(0, 5);
+      expect(tracer.hits[h + 8]).toBeCloseTo(.5, 6); expect(tracer.hits[h + 9]).toBeCloseTo(0, 5);
+      for (let c = 4; c < 7; c++) expect(tracer.hits[h + c]).toBeCloseTo(1, 4);  // white light lands white; the tint is the renderer's
+      expect(tracer.hits[h + 7]).toBeCloseTo(tracer.segments[i * SEGMENT_STRIDE + 7], 6);
+    }
+    const out = signalsFromStats(stats, emptySignals());
+    expect(out.occluded).toBe(1); expect(out.brightness).toBe(0);
+    // Half the beam covered: what leaves and what is stopped add up to what was launched.
+    occ.begin(.5); occ.beginGroup(); occ.addCapsule(1, .5, .02, 1, .5, 1, .02); occ.endGroup();
+    const half = tracer.trace([], [beam], noGlass, occ);
+    expect(half.occludedRays).toBe(8); expect(half.occluded + half.exitEnergy).toBeCloseTo(half.launched, 9);
+    expect(signalsFromStats(half, emptySignals()).occluded).toBeCloseTo(.5, 6);
+    // No occluders at all: nothing changes.
+    const clear = tracer.trace([], [beam], noGlass, null);
+    expect(clear.occluded).toBe(0); expect(clear.occludedRays).toBe(0); expect(tracer.hitCount).toBe(0); expect(clear.exitEnergy).toBeCloseTo(clear.launched, 9);
+  });
+  it('the hand the beam leaves from does not stop its own light, while a finger farther out still shades it', () => {
+    const aspect = ASPECT, depth = DEPTH, palm = { x: .5, y: .5, z: .3 };
+    const capsules = syntheticHandCapsules(palm, 1, .05);
+    const hand = handState(1, palm, capsules);
+    const px = palm.x * aspect, pz = palm.z * depth, width = beamWidth(TRACE_DEFAULTS.beam, 1);
+    const beamFrom = (dirX: number, dirY: number): BeamSource => ({ x: px, y: pz, dirX, dirY, width, intensity: 1, rays: 24, gain: 1, clearance: { x: px, y: pz, radius: 0 } });
+    const options = traceOptionsFor(QUALITY.medium, buildSpectrum(64), TRACE_DEFAULTS, aspect, depth, CAUCHY_B_GLASS);
+    const tracer = new Tracer(MAX_SEGMENTS), occ = new OccluderSet();
+    // Without an emitter, the palm's own bones stop the beam at once.
+    occ.begin(palm.y, px, pz); addHandOccluders(occ, hand, aspect, depth, null);
+    expect(occ.count).toBeGreaterThanOrEqual(4); expect(occ.groupCount).toBe(1); expect(occ.palmReach).toBe(0);
+    const blocked = tracer.trace([], [beamFrom(-1, 0)], options, occ);
+    expect(blocked.occluded / blocked.launched).toBeGreaterThan(.5);
+    // With the hand as the emitter the beam leaves freely, its rays starting on the clearance disc rather than in the palm.
+    const emitter: Emitter = { x: px, y: palm.y, z: pz, reach: PALM_REACH, touch: width / 2 + TOUCH_MARGIN };
+    occ.begin(palm.y, px, pz); addHandOccluders(occ, hand, aspect, depth, emitter);
+    expect(occ.palmReach).toBeGreaterThan(.02); expect(occ.palmReach).toBeLessThan(PALM_REACH);
+    let emitters = 0; for (let k = 0; k < occ.count; k++) emitters += occ.emitter[k];
+    expect(emitters).toBeGreaterThanOrEqual(4);
+    const beam = beamFrom(-1, 0); beam.clearance!.radius = Math.min(CLEARANCE_MAX, occ.palmReach);
+    const free = tracer.trace([], [beam], options, occ);
+    expect(free.occluded).toBe(0); expect(free.occludedRays).toBe(0); expect(free.exitEnergy).toBeCloseTo(free.launched, 9);
+    for (let i = 0; i < free.segments; i++) {
+      const o = i * SEGMENT_STRIDE;
+      expect(Math.hypot(tracer.segments[o] - px, tracer.segments[o + 1] - pz)).toBeCloseTo(beam.clearance!.radius, 4);
+      expect(tracer.segments[o]).toBeLessThan(px);
+    }
+    // The same rays without the clearance disc still pass: the emitter is skipped by a first segment wherever it starts.
+    const clearance = beamFrom(-1, 0);
+    expect(tracer.trace([], [clearance], options, occ).occluded).toBe(0);
+    // A finger of the same hand farther out than a palm's reach, lying in the beam's path, shades it.
+    const finger: Capsule = { a: { x: palm.x - .2 / aspect, y: palm.y - .01, z: palm.z }, b: { x: palm.x - .26 / aspect, y: palm.y + .01, z: palm.z }, radius: .012 };
+    occ.begin(palm.y, px, pz); addHandOccluders(occ, handState(1, palm, [...capsules, finger]), aspect, depth, emitter);
+    const shaded = tracer.trace([], [beam], options, occ);
+    expect(shaded.occluded / shaded.launched).toBeGreaterThan(.9);
+    expect(tracer.hitCount).toBe(shaded.occludedRays);
+    // The finger lies nearly in the plane, so its slice is a stadium: every hit is on the near cap, within a radius of its end.
+    for (let i = 0; i < tracer.hitCount; i++) { const x = tracer.hits[i * HIT_STRIDE]; expect(x).toBeGreaterThan(px - .2 - 1e-6); expect(x).toBeLessThan(px - .2 + .012 * aspect + 1e-6); }
+  });
+  it('is deterministic with solids in the plane', () => {
+    const aspect = ASPECT, depth = DEPTH, palm = { x: .3, y: .5, z: .3 };
+    const scene = simulationScene('medium');
+    const hands = [handState(1, palm, syntheticHandCapsules(palm, .7, .06)), handState(2, { x: .6, y: .5, z: .7 }, syntheticHandCapsules({ x: .6, y: .5, z: .7 }, 1, .05, true))];
+    const run = () => {
+      const occ = new OccluderSet(), tracer = new Tracer(MAX_SEGMENTS);
+      occ.begin(.5, palm.x * aspect, palm.z * depth);
+      for (const h of hands) addHandOccluders(occ, h, aspect, depth, h.id === 1 ? { x: palm.x * aspect, y: .5, z: palm.z * depth, reach: PALM_REACH, touch: .02 } : null);
+      const beam = scene.beamAt(Math.PI * 1.2); beam.clearance = { x: palm.x * aspect, y: palm.z * depth, radius: Math.min(CLEARANCE_MAX, occ.palmReach) };
+      const stats = { ...tracer.trace([scene.polygon], [beam], scene.options, occ) };
+      return { stats, segments: tracer.segments.slice(0, stats.segments * SEGMENT_STRIDE), hits: tracer.hits.slice(0, tracer.hitCount * HIT_STRIDE), occluders: occ.count, groups: occ.groupCount };
+    };
+    const a = run(), b = run();
+    expect(a.occluders).toBeGreaterThan(0); expect(a.groups).toBe(2);
+    expect(a.stats).toEqual(b.stats);
+    expect(a.segments).toEqual(b.segments); expect(a.hits).toEqual(b.hits);
+  });
+  it('a body behind the prism catches part of the fan and the energy stays accounted for', () => {
+    const scene = simulationScene('medium');
+    const occ = new OccluderSet(), tracer = new Tracer(MAX_SEGMENTS);
+    occ.begin(.5); occ.beginGroup(); occ.addCapsule(.3 * ASPECT, .5, .85 * DEPTH, .7 * ASPECT, .5, .85 * DEPTH, .04); occ.endGroup();
+    const beam = scene.beamAt(Math.PI * 1.5);
+    const stats = tracer.trace([scene.polygon], [beam], scene.options, occ);
+    expect(stats.occluded).toBeGreaterThan(0); expect(stats.occluded).toBeLessThan(stats.launched);
+    expect(stats.exitEnergy + stats.occluded).toBeLessThanOrEqual(stats.launched + 1e-6);
+    expect(tracer.hitCount).toBe(stats.occludedRays);
+    // Dispersed light lands in colour: the hits are not all white.
+    let coloured = 0;
+    for (let i = 0; i < tracer.hitCount; i++) { const h = i * HIT_STRIDE; if (Math.abs(tracer.hits[h + 4] - tracer.hits[h + 6]) > .2) coloured++; }
+    expect(coloured).toBeGreaterThan(0);
+    const out = signalsFromStats(stats, emptySignals());
+    expect(out.occluded).toBeGreaterThan(0); expect(out.occluded).toBeLessThan(1);
+  });
+  it('builds occluders from a scan row: each run becomes a band of straight pieces behind the shell', () => {
+    const width = 32, height = 8, z = new Float32Array(width * height).fill(1), mask = new Uint8Array(width * height);
+    const row = 4, set = (c: number, d: number) => { z[row * width + c] = d; mask[row * width + c] = 255; };
+    for (let c = 8; c < 16; c++) set(c, .3);          // a flat palm
+    for (let c = 16; c < 20; c++) set(c, .2);         // a finger in front of it, in the same run
+    for (let c = 24; c < 26; c++) set(c, .6);         // another body
+    const field: SurfaceField = { width, height, z, mask }, cell = ASPECT / width, occ = new OccluderSet();
+    occ.begin(.55);
+    expect(addScanOccluders(occ, field, .55, ASPECT, DEPTH, SCAN_THICKNESS, SCAN_TOLERANCE, null)).toBe(3);
+    expect(occ.groupCount).toBe(2); expect(occ.kind[0]).toBe(OCCLUDER_QUAD);
+    const want = [8 * cell, .3, 16 * cell, .3, 16 * cell, .3 + SCAN_THICKNESS, 8 * cell, .3 + SCAN_THICKNESS];
+    quadCorners(occ, 0).forEach((v, i) => expect(v).toBeCloseTo(want[i], 6));
+    expect(quadCorners(occ, 1)[0]).toBeCloseTo(16 * cell, 9); expect(quadCorners(occ, 1)[1]).toBeCloseTo(.2, 6);
+    expect(quadCorners(occ, 2)[0]).toBeCloseTo(24 * cell, 9); expect(quadCorners(occ, 2)[1]).toBeCloseTo(.6, 6);
+    // Rays from the glass stop at the shell where the row is scanned and reach the back wall where it is not; from behind, the band is `thickness` deep.
+    const tracer = new Tracer(100);
+    const options: TraceOptions = { ...noGlass, bounds: [0, 0, ASPECT, DEPTH] };
+    const from = (col: number, front: boolean): BeamSource => ({ x: (col + .5) * cell, y: front ? .01 : DEPTH - .01, dirX: 0, dirY: front ? 1 : -1, width: 0, intensity: 1, rays: 1, gain: 1 });
+    expect(tracer.trace([], [from(10, true)], options, occ).occludedRays).toBe(1); expect(tracer.segments[3]).toBeCloseTo(.3, 6);
+    tracer.trace([], [from(17, true)], options, occ); expect(tracer.segments[3]).toBeCloseTo(.2, 6);
+    expect(tracer.trace([], [from(21, true)], options, occ).occludedRays).toBe(0); expect(tracer.segments[3]).toBeCloseTo(DEPTH, 6);
+    tracer.trace([], [from(10, false)], options, occ); expect(tracer.segments[3]).toBeCloseTo(.3 + SCAN_THICKNESS, 6);
+    expect(tracer.hits[2]).toBeCloseTo(0, 6); expect(tracer.hits[3]).toBeCloseTo(1, 6);   // the back edge's normal points to the back wall
+    // The plane's height picks the row: a plane through an empty row has nothing in it.
+    occ.begin(.1); expect(addScanOccluders(occ, field, .1, ASPECT, DEPTH, SCAN_THICKNESS, SCAN_TOLERANCE, null)).toBe(0); expect(occ.groupCount).toBe(0);
+    // A straight ramp stays one piece; a bend splits it.
+    for (let c = 8; c < 20; c++) set(c, .2 + .01 * (c - 8));
+    occ.begin(.55); expect(addScanOccluders(occ, field, .55, ASPECT, DEPTH, SCAN_THICKNESS, SCAN_TOLERANCE, null)).toBe(2);
+    for (let c = 14; c < 20; c++) set(c, .2 + .01 * (c - 8) + SCAN_TOLERANCE * 3);
+    occ.begin(.55); expect(addScanOccluders(occ, field, .55, ASPECT, DEPTH, SCAN_THICKNESS, SCAN_TOLERANCE, null)).toBe(3);
+    // The run holding the beam's origin is the emitter: its pieces are passed through and the palm reach grows from those the origin touches.
+    const emitter: Emitter = { x: 11 * cell, y: .55, z: .32, reach: PALM_REACH, touch: .02 };
+    occ.begin(.55, emitter.x, emitter.z); addScanOccluders(occ, field, .55, ASPECT, DEPTH, SCAN_THICKNESS, SCAN_TOLERANCE, emitter);
+    expect(occ.emitter[0]).toBe(1); expect(occ.emitter[occ.count - 1]).toBe(0); expect(occ.palmReach).toBeGreaterThan(0);
+    const inside: BeamSource = { x: emitter.x, y: emitter.z, dirX: 1, dirY: 0, width: 0, intensity: 1, rays: 1, gain: 1, clearance: { x: emitter.x, y: emitter.z, radius: Math.min(CLEARANCE_MAX, occ.palmReach) } };
+    const st = tracer.trace([], [inside], options, occ);
+    expect(st.occludedRays).toBe(0); expect(tracer.segments[2]).toBeCloseTo(ASPECT, 6);
+  });
+  it('the synthetic performer\'s scan at palm height: the palm run lets its own beam out, and a second hand\'s scan shadows it', () => {
+    // Built exactly as the source and tracker do it: a scan of the skeleton, resampled through the image mapping.
+    const near = { x: .35, y: .5, z: .3 }, far = { x: .65, y: .5, z: .3 };
+    const nearCapsules = syntheticHandCapsules(near, 1, .05), farCapsules = syntheticHandCapsules(far, 1, .05, true);
+    const field = mapSurface(IMAGE_MAPPING, surfaceFromCapsules([...nearCapsules, ...farCapsules], 64, 48), 96, 64)!;
+    const palm = mapPoint(IMAGE_MAPPING, near), other = mapPoint(IMAGE_MAPPING, far);
+    const px = palm.x * ASPECT, pz = palm.z * DEPTH, width = beamWidth(TRACE_DEFAULTS.beam, 1);
+    const emitter: Emitter = { x: px, y: palm.y, z: pz, reach: PALM_REACH, touch: width / 2 + TOUCH_MARGIN };
+    const occ = new OccluderSet();
+    occ.begin(palm.y, px, pz);
+    const quads = addScanOccluders(occ, field, palm.y, ASPECT, DEPTH, SCAN_THICKNESS, SCAN_TOLERANCE, emitter);
+    expect(quads).toBeGreaterThanOrEqual(2); expect(occ.groupCount).toBeGreaterThanOrEqual(2); expect(occ.palmReach).toBeGreaterThan(0);
+    const options = traceOptionsFor(QUALITY.medium, buildSpectrum(64), TRACE_DEFAULTS, ASPECT, DEPTH, CAUCHY_B_GLASS);
+    const tracer = new Tracer(MAX_SEGMENTS);
+    // Toward the other hand (along x): the beam leaves its own palm and is stopped by the other hand's scan.
+    const dir = Math.sign(other.x - palm.x);
+    const beam: BeamSource = { x: px, y: pz, dirX: dir, dirY: 0, width, intensity: 1, rays: 24, gain: 1, clearance: { x: px, y: pz, radius: Math.min(CLEARANCE_MAX, occ.palmReach) } };
+    const stats = tracer.trace([], [beam], options, occ);
+    // Most of the beam is stopped; its edge rays can slip past the gap at the other hand's thumb.
+    expect(stats.occluded / stats.launched).toBeGreaterThan(.7);
+    const otherX = other.x * ASPECT;
+    for (let i = 0; i < tracer.hitCount; i++) expect(Math.abs(tracer.hits[i * HIT_STRIDE] - otherX)).toBeLessThan(.2);
+    // Away from it (into the volume): nothing in the way.
+    const away = { ...beam, dirX: 0, dirY: 1 };
+    const clear = tracer.trace([], [away], options, occ);
+    expect(clear.occluded).toBe(0);
+  });
+});
+
 describe('declaration', () => {
   it('declares the volume-era params and signals with ranges the host can trust', () => {
     expect(Object.keys(prism.params).length).toBeLessThanOrEqual(12);
     expect(prism.params.height.kind).toBe('number'); expect(prism.params.size.default).toBe(TRACE_DEFAULTS.size);
-    for (const name of ['spread', 'hue', 'brightness', 'reflected', 'incidence', 'inside', 'elevation']) { expect(prism.signals[name as keyof typeof prism.signals].min).toBe(0); expect(prism.signals[name as keyof typeof prism.signals].max).toBe(1); }
+    for (const name of ['spread', 'hue', 'brightness', 'reflected', 'incidence', 'inside', 'elevation', 'occluded']) { expect(prism.signals[name as keyof typeof prism.signals].min).toBe(0); expect(prism.signals[name as keyof typeof prism.signals].max).toBe(1); }
     expect(prism.signals.elevation.description).toMatch(/height/i);
+    expect(prism.signals.occluded.description).toMatch(/stopped/i);
   });
 });
 

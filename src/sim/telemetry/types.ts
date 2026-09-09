@@ -27,6 +27,8 @@ export interface HandTelemetry {
   vx: number; vy: number; vz: number;
   speed: number; radius: number; openness: number; pinch: number; push: number;
   ageMs: number; staleMs: number;
+  /** Number of capsules in the hand's solid shape (0 = position and radius only). */
+  solid: number;
 }
 
 export interface TelemetryFrame {

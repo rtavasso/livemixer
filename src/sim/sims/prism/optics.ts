@@ -197,8 +197,187 @@ export function intersectPolygon(poly: Polygon, ox: number, oy: number, dx: numb
 }
 
 // ---------------------------------------------------------------------------
+// Occluders: solid capsules cut by the light plane
+// ---------------------------------------------------------------------------
+
+/**
+ * Nearest crossing of a ray lying in the horizontal plane at height `oh` with a 3D capsule
+ * a–b of radius `r`: the ray's origin is (ox, oh, oy), its unit direction (dx, 0, dy). Exact:
+ * the capsule's cross-section by the plane is whatever a ray in the plane can reach, so a
+ * vertical capsule reads as a disc of radius r and one whose axis passes `dy` above the plane
+ * as a disc of radius sqrt(r² − dy²) (a sphere slice). Returns the ray parameter, or Infinity
+ * for a miss; a ray starting inside the capsule passes through it (its entry lies behind it).
+ */
+export function rayCapsuleInPlane(ox: number, oh: number, oy: number, dx: number, dy: number, ax: number, ah: number, ay: number, bx: number, bh: number, by: number, r: number): number {
+  const bax = bx - ax, bah = bh - ah, bay = by - ay;
+  const oax = ox - ax, oah = oh - ah, oay = oy - ay;
+  const baba = bax * bax + bah * bah + bay * bay;
+  const bard = bax * dx + bay * dy;
+  const baoa = bax * oax + bah * oah + bay * oay;
+  const rdoa = dx * oax + dy * oay;
+  const oaoa = oax * oax + oah * oah + oay * oay;
+  const a = baba - bard * bard;
+  if (a > 1e-12) {
+    const b = baba * rdoa - baoa * bard;
+    const c = baba * oaoa - baoa * baoa - r * r * baba;
+    const h = b * b - a * c;
+    if (h < 0) return Infinity; // misses the infinite cylinder, so the capsule too
+    const t = (-b - Math.sqrt(h)) / a;
+    const yy = baoa + t * bard;
+    if (yy > 0 && yy < baba) return t > HIT_EPSILON ? t : Infinity; // the body
+    // The cap on the side the body root fell past.
+    const ocx = yy <= 0 ? oax : ox - bx, och = yy <= 0 ? oah : oh - bh, ocy = yy <= 0 ? oay : oy - by;
+    const b2 = dx * ocx + dy * ocy, c2 = ocx * ocx + och * och + ocy * ocy - r * r, h2 = b2 * b2 - c2;
+    if (h2 < 0) return Infinity;
+    const t2 = -b2 - Math.sqrt(h2);
+    return t2 > HIT_EPSILON ? t2 : Infinity;
+  }
+  // Parallel to the axis (or a degenerate point capsule): only the end spheres can be entered.
+  let best = Infinity;
+  const b1 = dx * oax + dy * oay, c1 = oaoa - r * r, h1 = b1 * b1 - c1;
+  if (h1 >= 0) { const t = -b1 - Math.sqrt(h1); if (t > HIT_EPSILON) best = t; }
+  const obx = ox - bx, obh = oh - bh, oby = oy - by;
+  const b2 = dx * obx + dy * oby, c2 = obx * obx + obh * obh + oby * oby - r * r, h2 = b2 * b2 - c2;
+  if (h2 >= 0) { const t = -b2 - Math.sqrt(h2); if (t > HIT_EPSILON && t < best) best = t; }
+  return best;
+}
+
+/**
+ * Nearest entry of a ray into a convex quadrilateral lying in the plane (vertices counter-clockwise
+ * at `data[o..o+7]` as x, y pairs), by clipping the ray against the four edge half-planes. Returns
+ * the ray parameter and writes the entered edge's index into `outEdge[0]`, or Infinity for a miss.
+ * A ray starting inside passes through (no entry ahead of it).
+ */
+export function rayConvexQuad(ox: number, oy: number, dx: number, dy: number, data: Float64Array, o: number, outEdge: Int32Array): number {
+  let tEnter = -Infinity, tExit = Infinity, edge = -1;
+  for (let i = 0; i < 4; i++) {
+    const j = (i + 1) & 3;
+    const ax = data[o + i * 2], ay = data[o + i * 2 + 1];
+    const nx = data[o + j * 2 + 1] - ay, ny = ax - data[o + j * 2]; // outward, unnormalised
+    const denom = dx * nx + dy * ny;
+    const dist = (ax - ox) * nx + (ay - oy) * ny;                    // > 0 while the origin is inside this half-plane
+    if (denom > -1e-15 && denom < 1e-15) { if (dist < 0) return Infinity; continue; }
+    const t = dist / denom;
+    if (denom < 0) { if (t > tEnter) { tEnter = t; edge = i; } } else if (t < tExit) tExit = t;
+    if (tEnter > tExit) return Infinity;
+  }
+  if (!(tEnter > HIT_EPSILON) || tEnter > tExit) return Infinity;
+  outEdge[0] = edge;
+  return tEnter;
+}
+
+/** Floats per occluder. Capsule: ax, ah, ay, bx, bh, by, radius, unused. Quad: four x, y pairs. */
+export const OCCLUDER_STRIDE = 8;
+/** Occluder kinds: a 3D capsule cut by the light plane, or a convex quadrilateral lying in it. */
+export const OCCLUDER_CAPSULE = 0;
+export const OCCLUDER_QUAD = 1;
+/** Floats per group: bounding disc centre x, y, radius. */
+const GROUP_STRIDE = 3;
+
+/**
+ * The solids in a light plane: capsules (a skeleton hand) or quads (the slice of a depth
+ * scan), grouped per body with a bounding disc in the plane so a ray that misses the disc
+ * tests nothing. Only capsules that reach the plane (some part of their axis within `radius`
+ * of it) are kept. Occluders flagged `emitter` are what the beam leaves from: a ray's first
+ * segment passes through them. Those flagged `palm` (the ones the beam's origin lies in)
+ * also grow `palmReach`, their farthest extent from the origin given to `begin`, which sizes
+ * the clearance disc rays are started outside of.
+ *
+ * Coordinates are the tracer's (x, y) with a height between them: (x, h, y).
+ */
+export class OccluderSet {
+  readonly data: Float64Array;
+  readonly kind: Uint8Array;
+  readonly emitter: Uint8Array;
+  readonly groups: Float64Array;
+  /** Per group: first occluder index, end index. */
+  readonly range: Int32Array;
+  count = 0;
+  groupCount = 0;
+  planeY = 0;
+  palmReach = 0;
+  private originX = 0; private originY = 0;
+  private groupStart = 0;
+  private minX = 0; private minY = 0; private maxX = 0; private maxY = 0;
+
+  constructor(readonly capacity = 48, readonly maxGroups = 8) {
+    this.data = new Float64Array(capacity * OCCLUDER_STRIDE);
+    this.kind = new Uint8Array(capacity);
+    this.emitter = new Uint8Array(capacity);
+    this.groups = new Float64Array(maxGroups * GROUP_STRIDE);
+    this.range = new Int32Array(maxGroups * 2);
+  }
+
+  get full() { return this.count >= this.capacity; }
+
+  /** Start over for a plane at `planeY`; `originX/Y` is the point the palm reach is measured from. */
+  begin(planeY: number, originX = 0, originY = 0) {
+    this.count = 0; this.groupCount = 0; this.planeY = planeY; this.palmReach = 0;
+    this.originX = originX; this.originY = originY; this.groupStart = 0;
+  }
+
+  beginGroup() { this.groupStart = this.count; this.minX = this.minY = Infinity; this.maxX = this.maxY = -Infinity; }
+
+  private extend(x: number, y: number, r: number, palm: boolean) {
+    if (x - r < this.minX) this.minX = x - r; if (x + r > this.maxX) this.maxX = x + r;
+    if (y - r < this.minY) this.minY = y - r; if (y + r > this.maxY) this.maxY = y + r;
+    if (palm) { const reach = Math.sqrt((x - this.originX) ** 2 + (y - this.originY) ** 2) + r; if (reach > this.palmReach) this.palmReach = reach; }
+  }
+
+  /** Add a capsule to the open group. Returns true when it reaches the plane and was stored. */
+  addCapsule(ax: number, ah: number, ay: number, bx: number, bh: number, by: number, r: number, emitter = false, palm = false): boolean {
+    if (this.count >= this.capacity || !(r > 0)) return false;
+    // The part of the axis within r of the plane, as a parameter range [t0, t1].
+    const h0 = ah - this.planeY, h1 = bh - this.planeY, dh = h1 - h0;
+    let t0 = 0, t1 = 1;
+    if (Math.abs(dh) > 1e-12) {
+      const ta = (-r - h0) / dh, tb = (r - h0) / dh;
+      t0 = Math.max(0, Math.min(ta, tb)); t1 = Math.min(1, Math.max(ta, tb));
+      if (t0 >= t1) return false;
+    } else if (Math.abs(h0) >= r) return false;
+    const o = this.count * OCCLUDER_STRIDE, d = this.data;
+    d[o] = ax; d[o + 1] = ah; d[o + 2] = ay; d[o + 3] = bx; d[o + 4] = bh; d[o + 5] = by; d[o + 6] = r; d[o + 7] = 0;
+    this.kind[this.count] = OCCLUDER_CAPSULE; this.emitter[this.count] = emitter ? 1 : 0;
+    this.count++;
+    // The clipped axis, padded by r, bounds the cross-section.
+    this.extend(ax + (bx - ax) * t0, ay + (by - ay) * t0, r, palm);
+    this.extend(ax + (bx - ax) * t1, ay + (by - ay) * t1, r, palm);
+    return true;
+  }
+
+  /** Add a convex quadrilateral (counter-clockwise x, y pairs) lying in the plane to the open group. */
+  addQuad(x0: number, y0: number, x1: number, y1: number, x2: number, y2: number, x3: number, y3: number, emitter = false, palm = false): boolean {
+    if (this.count >= this.capacity) return false;
+    const o = this.count * OCCLUDER_STRIDE, d = this.data;
+    d[o] = x0; d[o + 1] = y0; d[o + 2] = x1; d[o + 3] = y1; d[o + 4] = x2; d[o + 5] = y2; d[o + 6] = x3; d[o + 7] = y3;
+    this.kind[this.count] = OCCLUDER_QUAD; this.emitter[this.count] = emitter ? 1 : 0;
+    this.count++;
+    this.extend(x0, y0, 0, palm); this.extend(x1, y1, 0, palm); this.extend(x2, y2, 0, palm); this.extend(x3, y3, 0, palm);
+    return true;
+  }
+
+  /** Close the open group with a bounding disc around everything in it. An empty group (nothing reached the plane) is dropped. */
+  endGroup() {
+    if (this.count === this.groupStart) return;
+    if (this.groupCount >= this.maxGroups) { this.count = this.groupStart; return; }
+    const g = this.groupCount * GROUP_STRIDE;
+    const cx = (this.minX + this.maxX) / 2, cy = (this.minY + this.maxY) / 2;
+    const hx = (this.maxX - this.minX) / 2, hy = (this.maxY - this.minY) / 2;
+    this.groups[g] = cx; this.groups[g + 1] = cy; this.groups[g + 2] = Math.sqrt(hx * hx + hy * hy);
+    this.range[this.groupCount * 2] = this.groupStart; this.range[this.groupCount * 2 + 1] = this.count;
+    this.groupCount++;
+  }
+
+  /** Bounding disc of group `g`: centre x, y and radius. */
+  disc(g: number): [number, number, number] { const o = g * GROUP_STRIDE; return [this.groups[o], this.groups[o + 1], this.groups[o + 2]]; }
+}
+
+// ---------------------------------------------------------------------------
 // Tracer
 // ---------------------------------------------------------------------------
+
+/** A disc in the light plane that rays starting inside it are moved out of: the palm the beam leaves. Radius 0 disables it. */
+export interface Clearance { x: number; y: number; radius: number }
 
 /** A parallel beam of white light. `gain` converts physical energy into stored segment intensity. */
 export interface BeamSource {
@@ -211,6 +390,8 @@ export interface BeamSource {
   intensity: number;
   rays: number;
   gain: number;
+  /** Optional: rays that would start inside this disc start where they leave it instead (if that is still inside the scene bounds). */
+  clearance?: Clearance;
 }
 
 export interface TraceOptions {
@@ -253,6 +434,10 @@ export interface TraceStats {
   /** Sum of (incidence angle × energy) at first contact, and the energy that made contact. */
   incidenceSum: number;
   incidenceWeight: number;
+  /** Energy stopped by occluders (hands in the light plane). */
+  occluded: number;
+  /** Rays that ended on an occluder. */
+  occludedRays: number;
 }
 
 /** Energy weight of a ray at offset s ∈ [-½, ½] across the beam: soft edges, 1 at the centre. */
@@ -262,6 +447,9 @@ export const BEAM_PROFILE_MEAN = .3 + .7 * (2 / 3);
 
 /** Floats per segment in `Tracer.segments`: x0, y0, x1, y1, r, g, b, intensity. */
 export const SEGMENT_STRIDE = 8;
+/** Floats per occluder hit in `Tracer.hits`: x, y, nx, ny (plane point and in-plane normal), r, g, b, intensity, plane height, normal's vertical component. */
+export const HIT_STRIDE = 10;
+export const MAX_HITS = 8192;
 const MAX_STACK = 4096;
 const SPECTRUM_SLOTS = 64;
 const MAX_SPECTRUM = 64;
@@ -269,7 +457,10 @@ const MAX_EXITS = 16384;
 
 export class Tracer {
   readonly segments: Float32Array;
-  readonly stats: TraceStats = { segments: 0, insideSegments: 0, truncated: false, rays: 0, launched: 0, exitEnergy: 0, exitReflected: 0, exitDirX: 0, exitDirY: 0, exitHue: 0, incidenceSum: 0, incidenceWeight: 0 };
+  /** Where rays ended on occluders, for the splashes on the skin. Capped at `MAX_HITS`; `stats.occluded` is exact. */
+  readonly hits = new Float32Array(MAX_HITS * HIT_STRIDE);
+  hitCount = 0;
+  readonly stats: TraceStats = { segments: 0, insideSegments: 0, truncated: false, rays: 0, launched: 0, exitEnergy: 0, exitReflected: 0, exitDirX: 0, exitDirY: 0, exitHue: 0, incidenceSum: 0, incidenceWeight: 0, occluded: 0, occludedRays: 0 };
   /** Exit records for inspection (direction, energy, wavelength index or -1, reflected flag). Capped; `stats` are exact. */
   readonly exitDirX = new Float32Array(MAX_EXITS);
   readonly exitDirY = new Float32Array(MAX_EXITS);
@@ -301,6 +492,7 @@ export class Tracer {
   private readonly reflectance = new Float64Array(MAX_SPECTRUM);
   private readonly outT = new Float64Array(2);
   private readonly outR = new Float64Array(2);
+  private readonly outEdge = new Int32Array(1);
   private readonly colour = new Float64Array(3);
   private top = 0;
 
@@ -308,21 +500,29 @@ export class Tracer {
 
   get count() { return this.stats.segments; }
 
-  trace(polygons: readonly Polygon[], sources: readonly BeamSource[], options: TraceOptions): TraceStats {
+  /**
+   * Trace every source through the glass polygons. `occluders` (optional) are the solids in this plane: a ray that
+   * meets one stops there, its energy counted in `stats.occluded` and its end recorded in `hits`. Build one set per
+   * plane; its emitter flags apply to every source's first segment.
+   */
+  trace(polygons: readonly Polygon[], sources: readonly BeamSource[], options: TraceOptions, occluders: OccluderSet | null = null): TraceStats {
     const st = this.stats;
     st.segments = 0; st.insideSegments = 0; st.truncated = false; st.rays = 0; st.launched = 0; st.exitEnergy = 0; st.exitReflected = 0;
-    st.exitDirX = 0; st.exitDirY = 0; st.exitHue = 0; st.incidenceSum = 0; st.incidenceWeight = 0;
-    this.exitCount = 0; this.top = 0;
+    st.exitDirX = 0; st.exitDirY = 0; st.exitHue = 0; st.incidenceSum = 0; st.incidenceWeight = 0; st.occluded = 0; st.occludedRays = 0;
+    this.exitCount = 0; this.hitCount = 0; this.top = 0;
     this.slotFree.fill(1);
     const spectrum = options.spectrum;
     const S = Math.min(MAX_SPECTRUM, spectrum.count);
     const K = Math.max(1, Math.min(S, Math.floor(options.samplesPerRay ?? S)));
     const M = Math.max(1, Math.floor(S / K));
     for (let k = 0; k < S; k++) this.index[k] = cauchyIndex(spectrum.lambdaUm[k], options.glassA, options.glassB);
+    const occ = occluders && occluders.groupCount > 0 ? occluders : null;
+    const b0 = options.bounds[0], b1 = options.bounds[1], b2 = options.bounds[2], b3 = options.bounds[3];
 
     for (const source of sources) {
       const rays = Math.max(1, Math.floor(source.rays));
       const px = -source.dirY, py = source.dirX; // across the beam
+      const clearance = source.clearance && source.clearance.radius > 0 ? source.clearance : null;
       // Rays are launched in bit-reversed order of their index across the beam (0, 4, 2, 6, 1, 5, 3, 7 for eight):
       // every prefix of that sequence is spread evenly over the width, so a frame that hits the segment cap thins
       // the whole beam instead of losing the rays on one side. The set of segments is unchanged when nothing is cut.
@@ -341,8 +541,18 @@ export class Tracer {
         if (slot < 0) continue;
         const base = slot * MAX_SPECTRUM;
         for (let j = 0; j < K; j++) this.spectra[base + j] = energy / K;
-        this.push(source.x + px * s * source.width, source.y + py * s * source.width, source.dirX, source.dirY, energy, -1, -1, -1, -1, 0, 0, slot, i % M);
-        this.run(polygons, options, K, M, source.gain);
+        let x0 = source.x + px * s * source.width, y0 = source.y + py * s * source.width;
+        if (clearance) {
+          // The palm the beam leaves: a ray starting inside the clearance disc starts where it leaves it instead.
+          const ocx = x0 - clearance.x, ocy = y0 - clearance.y, c = ocx * ocx + ocy * ocy - clearance.radius * clearance.radius;
+          if (c < 0) {
+            const b = ocx * source.dirX + ocy * source.dirY, tExit = -b + Math.sqrt(b * b - c) + 1e-6;
+            const nx = x0 + source.dirX * tExit, ny = y0 + source.dirY * tExit;
+            if (nx >= b0 && nx <= b2 && ny >= b1 && ny <= b3) { x0 = nx; y0 = ny; }
+          }
+        }
+        this.push(x0, y0, source.dirX, source.dirY, energy, -1, -1, -1, -1, 0, 0, slot, i % M);
+        this.run(polygons, options, K, M, source.gain, occ);
       }
     }
     return st;
@@ -434,8 +644,9 @@ export class Tracer {
    * boxes doubles that cross non-inlined calls, and that allocation was the
    * dominant cost of a function-per-step version.
    */
-  private run(polygons: readonly Polygon[], options: TraceOptions, K: number, M: number, gain: number) {
+  private run(polygons: readonly Polygon[], options: TraceOptions, K: number, M: number, gain: number, occ: OccluderSet | null) {
     const st = this.stats, spectrum = options.spectrum, rgb = spectrum.rgb, hue = spectrum.hue, spectra = this.spectra, index = this.index, colour = this.colour;
+    const hits = this.hits, outEdge = this.outEdge;
     const sx = this.sx, sy = this.sy, sdx = this.sdx, sdy = this.sdy, se = this.se, skind = this.skind, sinside = this.sinside, sfrom = this.sfrom, sedge = this.sedge, sdepth = this.sdepth, sreflected = this.sreflected, sslot = this.sslot, sphase = this.sphase;
     const seg = this.segments, maxSegments = this.maxSegments;
     const exitDirX = this.exitDirX, exitDirY = this.exitDirY, exitEnergyArr = this.exitEnergy, exitKind = this.exitKind, exitReflectedArr = this.exitReflected, exitHueArr = this.exitHue;
@@ -471,14 +682,42 @@ export class Tracer {
       }
 
       // End point: the surface, or the scene bounds.
-      let x1: number, y1: number, draw = true;
+      let draw = true, limit = hitT;
       if (hitEdge < 0) {
         let t = Infinity;
         if (dx > 1e-12) t = (b2 - ox) / dx; else if (dx < -1e-12) t = (b0 - ox) / dx;
         if (dy > 1e-12) { const ty = (b3 - oy) / dy; if (ty < t) t = ty; } else if (dy < -1e-12) { const ty = (b1 - oy) / dy; if (ty < t) t = ty; }
         if (!(t > 0) || t === Infinity) { draw = false; t = 0; }
-        x1 = ox + dx * t; y1 = oy + dy * t;
-      } else { x1 = ox + dx * hitT; y1 = oy + dy * hitT; }
+        limit = t;
+      }
+      // Solids in the plane: the nearest one ahead of that end point stops the ray. There are none inside glass, and the
+      // emitter (the palm the beam leaves) is passed through by a ray's first segment.
+      let occK = -1, occEdge = -1;
+      if (occ !== null && draw && inside < 0) {
+        const first = from < 0;
+        const od = occ.data, okind = occ.kind, oe = occ.emitter, og = occ.groups, orange = occ.range, planeY = occ.planeY;
+        for (let g = 0, gn = occ.groupCount; g < gn; g++) {
+          const gb = g * GROUP_STRIDE;
+          const ocx = ox - og[gb], ocy = oy - og[gb + 1], gr = og[gb + 2];
+          const bb = ocx * dx + ocy * dy, cc = ocx * ocx + ocy * ocy - gr * gr;
+          if (cc > 0 && bb > 0) continue;               // the whole group is behind the ray
+          const hh = bb * bb - cc;
+          if (hh < 0) continue;                         // the ray misses its bounding disc
+          if (-bb - Math.sqrt(hh) > limit) continue;    // the disc starts beyond the end point
+          for (let k = orange[g * 2], kEnd = orange[g * 2 + 1]; k < kEnd; k++) {
+            if (first && oe[k] === 1) continue;
+            const o = k * OCCLUDER_STRIDE;
+            if (okind[k] === OCCLUDER_CAPSULE) {
+              const t = rayCapsuleInPlane(ox, planeY, oy, dx, dy, od[o], od[o + 1], od[o + 2], od[o + 3], od[o + 4], od[o + 5], od[o + 6]);
+              if (t < limit) { limit = t; occK = k; }
+            } else {
+              const t = rayConvexQuad(ox, oy, dx, dy, od, o, outEdge);
+              if (t < limit) { limit = t; occK = k; occEdge = outEdge[0]; }
+            }
+          }
+        }
+      }
+      const x1 = ox + dx * limit, y1 = oy + dy * limit;
 
       if (draw) {
         if (st.segments >= maxSegments) { st.truncated = true; top = 0; break; }
@@ -489,6 +728,33 @@ export class Tracer {
         seg[o + 7] = e * gain;
         st.segments++;
         if (inside >= 0) st.insideSegments++;
+      }
+
+      if (occK >= 0) {
+        // Stopped by a solid: the energy is absorbed there and the end point splashes on the skin.
+        st.occluded += e; st.occludedRays++;
+        if (this.hitCount < MAX_HITS) {
+          const od = occ!.data, o = occK * OCCLUDER_STRIDE, planeY = occ!.planeY;
+          let nx: number, ny: number, nh = 0;
+          if (occ!.kind[occK] === OCCLUDER_CAPSULE) {
+            const ax = od[o], ah = od[o + 1], ay = od[o + 2], bax = od[o + 3] - ax, bah = od[o + 4] - ah, bay = od[o + 5] - ay;
+            const l2 = bax * bax + bah * bah + bay * bay;
+            let tt = l2 > 1e-18 ? ((x1 - ax) * bax + (planeY - ah) * bah + (y1 - ay) * bay) / l2 : 0;
+            if (tt < 0) tt = 0; else if (tt > 1) tt = 1;
+            nx = x1 - (ax + bax * tt); nh = planeY - (ah + bah * tt); ny = y1 - (ay + bay * tt);
+          } else {
+            const j = (occEdge + 1) & 3;
+            nx = od[o + j * 2 + 1] - od[o + occEdge * 2 + 1]; ny = od[o + occEdge * 2] - od[o + j * 2];
+          }
+          const inv = 1 / (Math.sqrt(nx * nx + nh * nh + ny * ny) || 1);
+          const h = this.hitCount++ * HIT_STRIDE;
+          hits[h] = x1; hits[h + 1] = y1; hits[h + 2] = nx * inv; hits[h + 3] = ny * inv;
+          if (kind >= 0) { hits[h + 4] = rgb[kind * 3]; hits[h + 5] = rgb[kind * 3 + 1]; hits[h + 6] = rgb[kind * 3 + 2]; }
+          else { hits[h + 4] = colour[0]; hits[h + 5] = colour[1]; hits[h + 6] = colour[2]; }
+          hits[h + 7] = e * gain; hits[h + 8] = planeY; hits[h + 9] = nh * inv;
+        }
+        if (kind < 0) this.slotFree[slot] = 1;
+        continue;
       }
 
       if (hitEdge < 0) {
@@ -556,11 +822,12 @@ export class Tracer {
 // Signal helpers (pure, so the numbers can be tested).
 // ---------------------------------------------------------------------------
 
-export interface RawSignals { spread: number; hue: number; brightness: number; reflected: number; incidence: number; inside: number }
+export interface RawSignals { spread: number; hue: number; brightness: number; reflected: number; incidence: number; inside: number; occluded: number }
 
 /** Reduce trace statistics to the declared signals, each in 0..1. `hue` is left untouched when no light exits. */
 export function signalsFromStats(st: TraceStats, out: RawSignals): RawSignals {
   const e = st.exitEnergy;
+  out.occluded = st.launched > 1e-9 ? Math.min(1, Math.max(0, st.occluded / st.launched)) : 0;
   if (e > 1e-9) {
     const resultant = Math.min(1, Math.hypot(st.exitDirX, st.exitDirY) / e);
     // sqrt(2(1 - R)) is the angular standard deviation in radians for a tight bundle and saturates for a wide one.

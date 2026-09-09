@@ -14,7 +14,7 @@
  */
 import { z } from 'zod';
 import { ClockMapper } from './protocol';
-import type { HandObservation, InputFrame, InputSource, InputSourceStatus } from './types';
+import type { Capsule, HandObservation, InputFrame, InputSource, InputSourceStatus } from './types';
 import type { Vec3 } from '../core/types';
 
 const mm = z.number().finite();
@@ -23,10 +23,11 @@ export const leapBoxSchema = z.object({ x: range, y: range, z: range }).strict()
 export type LeapBox = z.infer<typeof leapBoxSchema>;
 /**
  * A comfortable reach above the device, measured with a real hand: people hold a hand 15–45 cm
- * up without thinking about it. (The service's own interaction box is smaller, about
- * 235 × 235 × 148 mm around (0, 200, 0).) Calibration in the overlay refines this per installation.
+ * up without thinking about it. The proportions (600 × 340 × 240 mm ≈ 1.76 : 1 : 0.7) match a
+ * 16:9 volume of depth 0.7, so a solid hand keeps its shape; set *Volume depth* to the box's
+ * z/y ratio for other boxes. Calibration in the overlay refines the box per installation.
  */
-export const DEFAULT_LEAP_BOX: LeapBox = { x: [-160, 160], y: [100, 450], z: [-120, 120] };
+export const DEFAULT_LEAP_BOX: LeapBox = { x: [-300, 300], y: [100, 440], z: [-120, 120] };
 
 const vec = z.tuple([mm, mm, mm]);
 const handSchema = z.object({
@@ -35,6 +36,10 @@ const handSchema = z.object({
   palmPosition: vec,
   stabilizedPalmPosition: vec.optional(),
   palmVelocity: vec.optional(),
+  palmWidth: mm.positive().optional(),
+  wrist: vec.optional(),
+  elbow: vec.optional(),
+  armWidth: mm.positive().optional(),
   grabStrength: z.number().min(0).max(1).optional(),
   pinchStrength: z.number().min(0).max(1).optional(),
   confidence: z.number().min(0).max(1).optional(),
@@ -46,6 +51,13 @@ const pointableSchema = z.object({
   type: z.number().int().min(0).max(4).optional(),
   tipPosition: vec,
   stabilizedTipPosition: vec.optional(),
+  /** Joints from the wrist outward: carpal (metacarpal base), knuckle, two inter-phalangeal joints, bone tip. */
+  carpPosition: vec.optional(),
+  mcpPosition: vec.optional(),
+  pipPosition: vec.optional(),
+  dipPosition: vec.optional(),
+  btipPosition: vec.optional(),
+  width: mm.positive().optional(),
   extended: z.boolean().optional(),
   tool: z.boolean().optional(),
 }).passthrough();
@@ -69,7 +81,45 @@ export function parseLeapMessage(text: string): LeapFrame | null {
 }
 
 const norm = (value: number, [low, high]: [number, number]) => Math.min(1, Math.max(0, (value - low) / (high - low)));
+/** Unclamped normalisation for skeleton joints, so a forearm leaving the box keeps its direction. */
+const normOpen = (value: number, [low, high]: [number, number]) => (value - low) / (high - low);
 const toSource = (p: [number, number, number], box: LeapBox): Vec3 => ({ x: norm(p[0], box.x), y: norm(p[1], box.y), z: norm(p[2], box.z) });
+const toSourceOpen = (p: [number, number, number], box: LeapBox): Vec3 => ({ x: normOpen(p[0], box.x), y: normOpen(p[1], box.y), z: normOpen(p[2], box.z) });
+const mmToSourceX = (mmValue: number, box: LeapBox) => mmValue / (box.x[1] - box.x[0]);
+
+/**
+ * Forearm capsules are cut off this far (mm) past the wrist. Reaching in, the forearm is the part
+ * nearest the window camera, so a long one dwarfs the hand; a short stub keeps the wrist solid.
+ */
+const FOREARM_MM = 70;
+
+/**
+ * Build the solid hand: three phalanx capsules per finger (two for the thumb, whose
+ * metacarpal Leap reports as zero length), one metacarpal capsule per finger from the
+ * carpal base to the knuckle (five of them make the palm), and a forearm capsule from
+ * the wrist toward the elbow. Radii are half the reported widths.
+ */
+export function leapHandCapsules(hand: LeapFrame['hands'][number], fingers: LeapFrame['pointables'], box: LeapBox): Capsule[] {
+  const out: Capsule[] = [];
+  const seg = (a: [number, number, number], b: [number, number, number], widthMm: number) => {
+    const dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+    if (dx * dx + dy * dy + dz * dz < 1) return; // zero-length bone (thumb metacarpal)
+    out.push({ a: toSourceOpen(a, box), b: toSourceOpen(b, box), radius: mmToSourceX(widthMm / 2, box) });
+  };
+  for (const f of fingers) {
+    const width = f.width ?? 16;
+    if (f.carpPosition && f.mcpPosition) seg(f.carpPosition, f.mcpPosition, width * 1.15);
+    if (f.mcpPosition && f.pipPosition) seg(f.mcpPosition, f.pipPosition, width);
+    if (f.pipPosition && f.dipPosition) seg(f.pipPosition, f.dipPosition, width * .9);
+    if (f.dipPosition && (f.btipPosition ?? f.tipPosition)) seg(f.dipPosition, f.btipPosition ?? f.tipPosition, width * .8);
+  }
+  if (hand.wrist && hand.elbow) {
+    const d = [hand.elbow[0] - hand.wrist[0], hand.elbow[1] - hand.wrist[1], hand.elbow[2] - hand.wrist[2]];
+    const len = Math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) || 1, cut = Math.min(len, FOREARM_MM) / len;
+    seg(hand.wrist, [hand.wrist[0] + d[0] * cut, hand.wrist[1] + d[1] * cut, hand.wrist[2] + d[2] * cut], (hand.armWidth ?? 55) * .85);
+  }
+  return out;
+}
 
 /** Reduce a Leap frame to hand observations in the box-normalized source frame. */
 export function leapFrameToHands(frame: LeapFrame, box: LeapBox): HandObservation[] {
@@ -80,9 +130,10 @@ export function leapFrameToHands(frame: LeapFrame, box: LeapBox): HandObservatio
     const all = [palm, ...tips];
     const min = { x: Math.min(...all.map(p => p.x)), y: Math.min(...all.map(p => p.y)), z: Math.min(...all.map(p => p.z)) };
     const max = { x: Math.max(...all.map(p => p.x)), y: Math.max(...all.map(p => p.y)), z: Math.max(...all.map(p => p.z)) };
+    const capsules = leapHandCapsules(hand, fingers, box);
     // Leap's `confidence` rates the pose fit, not whether a hand exists: the service only lists hands it is
     // tracking, and some builds report 0 for it. Never let it fall under the tracker's acceptance threshold.
-    return { id: hand.id, position: palm, confidence: Math.max(.5, hand.confidence ?? 1), openness: 1 - (hand.grabStrength ?? 0), pinch: hand.pinchStrength ?? 0, extent: { min, max }, points: [...tips, palm] };
+    return { id: hand.id, position: palm, confidence: Math.max(.5, hand.confidence ?? 1), openness: 1 - (hand.grabStrength ?? 0), pinch: hand.pinchStrength ?? 0, extent: { min, max }, points: [...tips, palm], capsules: capsules.length ? capsules : undefined };
   });
 }
 
