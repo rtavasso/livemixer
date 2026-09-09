@@ -30,19 +30,31 @@ Geometry conventions
 * The occupancy grid covers the same ROI: cell ``(row 0, col 0)`` is the
   top-left of the ROI, row-major, one byte per cell holding the fraction of
   in-range pixels in that cell scaled to 0..255.
+* The voxel grid is the same idea in 3D: the foreground (every in-range
+  pixel) binned into ``nx`` columns, ``ny`` rows and ``nz`` depth slabs of the
+  box. Bytes are laid out x fastest, then y (top row first), then z (nearest
+  slab first); each holds the fraction of the voxel's projected pixel area
+  that is filled, 0..255. See :func:`voxelize` for the normalisation.
+* The surface is a 3D scan of the foreground: a ``(height, width)`` grid over
+  the ROI (row 0 = top, like the occupancy) holding each cell's NEAREST
+  in-range depth as ``1 + round(254 * w)``, or 0 where the cell holds no
+  foreground pixel. See :func:`scan_surface`.
 
 Dependencies: ``numpy`` and ``websockets`` (``pip install numpy websockets``).
-Optional: ``opencv-python`` for multi-blob connected components and
-``pyrealsense2`` for the Intel RealSense source.
+Optional: ``opencv-python`` for multi-blob connected components and for the
+Leap Motion Controller stereo source (``--source leap``, see
+``leap_source.py``), ``pyrealsense2`` for the Intel RealSense source.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import base64
+import functools
 import json
 import logging
 import math
+import os
 import sys
 import time
 from abc import ABC, abstractmethod
@@ -66,6 +78,8 @@ PROTOCOL_VERSION = 1
 MAX_HANDS = 16            # bridgeFrameSchema: hands.max(16)
 MAX_POINTS = 256          # bridgeHandSchema: points.max(256)
 MAX_OCCUPANCY_SIDE = 256  # bridgeHelloSchema: occupancy width/height.max(256)
+MAX_VOXEL_SIDE = 128      # bridgeHelloSchema: voxels nx/ny/nz.max(128)
+MAX_SURFACE_SIDE = 512    # bridgeHelloSchema: surface width/height.max(512)
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 
@@ -387,6 +401,9 @@ class AnalyzerConfig:
     """Tuning for :class:`BoxAnalyzer`.
 
     ``occupancy`` is ``(width, height)`` of the grid or ``None`` to skip it.
+    ``voxels`` is ``(nx, ny, nz)`` of the foreground voxel grid (across, down,
+    deep) or ``None`` to skip it. ``surface`` is ``(width, height)`` of the
+    nearest-depth scan or ``None`` to skip it.
     A blob needs at least ``min_pixels`` in-range pixels; confidence rises
     linearly from there and saturates at ``conf_saturation * min_pixels``.
     ``morph_iterations`` rounds of 3x3 opening remove speckle. ``max_jump`` is
@@ -397,6 +414,8 @@ class AnalyzerConfig:
     """
 
     occupancy: tuple[int, int] | None = (32, 24)
+    voxels: tuple[int, int, int] | None = (32, 24, 16)
+    surface: tuple[int, int] | None = (64, 48)
     min_pixels: int = 150
     max_hands: int = 2
     morph_iterations: int = 1
@@ -411,6 +430,12 @@ class AnalyzerConfig:
             w, h = self.occupancy
             if not (1 <= w <= MAX_OCCUPANCY_SIDE and 1 <= h <= MAX_OCCUPANCY_SIDE):
                 raise ValueError(f"occupancy grid sides must be 1..{MAX_OCCUPANCY_SIDE}, got {self.occupancy}")
+        if self.voxels is not None:
+            if len(self.voxels) != 3 or not all(1 <= n <= MAX_VOXEL_SIDE for n in self.voxels):
+                raise ValueError(f"voxel grid sides must be 1..{MAX_VOXEL_SIDE}, got {self.voxels}")
+        if self.surface is not None:
+            if len(self.surface) != 2 or not all(1 <= n <= MAX_SURFACE_SIDE for n in self.surface):
+                raise ValueError(f"surface grid sides must be 1..{MAX_SURFACE_SIDE}, got {self.surface}")
         if not (0 <= self.max_hands <= MAX_HANDS):
             raise ValueError(f"max_hands must be 0..{MAX_HANDS}")
         if not (0 <= self.sample_points <= MAX_POINTS):
@@ -449,6 +474,10 @@ class AnalysisResult:
     #: ``uint8`` array of shape ``(height, width)``, row 0 = top of the ROI; ``None`` when disabled.
     occupancy: np.ndarray | None
     stats: dict[str, float]
+    #: ``uint8`` array of shape ``(nz, ny, nx)``, slab 0 = nearest, row 0 = top; ``None`` when disabled.
+    voxels: np.ndarray | None = None
+    #: ``uint8`` array of shape ``(height, width)``, row 0 = top, 0 = empty else 1 + round(254 w); ``None`` when disabled.
+    surface: np.ndarray | None = None
 
 
 def erode3(mask: np.ndarray, iterations: int = 1) -> np.ndarray:
@@ -501,6 +530,102 @@ def downsample_occupancy(mask: np.ndarray, width: int, height: int) -> np.ndarra
     areas = np.outer(np.diff(rows), np.diff(cols))
     frac = sums / np.maximum(areas, 1)
     return np.clip(np.round(frac * 255.0), 0, 255).astype(np.uint8)
+
+
+def cell_bins(n_pixels: int, n_cells: int) -> np.ndarray:
+    """Cell index of each pixel position along one axis: ``floor((i + 0.5) / n_pixels * n_cells)``.
+
+    Evaluated in integers so the boundaries are exact. A pixel belongs to the
+    cell its centre falls in, which is the same rule the browser uses to look a
+    cell up from a normalized coordinate (``floor(coordinate * n)``), so a
+    blob's reported ``u``/``v`` and the voxel or surface cell holding its
+    pixels agree. Used by :func:`voxelize` and :func:`scan_surface`.
+    """
+    i = np.arange(n_pixels, dtype=np.int64)
+    return ((2 * i + 1) * n_cells) // (2 * n_pixels)
+
+
+@functools.lru_cache(maxsize=8)
+def _voxel_tables(rh: int, rw: int, nx: int, ny: int, nz: int, near_mm: float, far_mm: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Lookup tables for :func:`voxelize`, cached per frame size, grid and depth range (read-only)."""
+    col_bin, row_bin = cell_bins(rw, nx), cell_bins(rh, ny)
+    column = (row_bin[:, None] * nx + col_bin[None, :]).astype(np.int32)  # (rh, rw): flat (y, x) cell of every pixel
+    area = np.outer(np.bincount(row_bin, minlength=ny), np.bincount(col_bin, minlength=nx))  # ROI pixels per (y, x) column
+    mm = np.arange(65536, dtype=np.float64)  # every uint16 depth -> its slab; out-of-range depths clamp to the end slabs
+    slab = np.clip(np.floor((mm - near_mm) / (far_mm - near_mm) * nz), 0, nz - 1).astype(np.int32)
+    return column, area, slab
+
+
+def voxelize(roi_mm: np.ndarray, mask: np.ndarray, near_mm: float, far_mm: float, nx: int, ny: int, nz: int) -> np.ndarray:
+    """Foreground voxel grid as ``uint8`` of shape ``(nz, ny, nx)``.
+
+    Every ``True`` pixel of ``mask`` (the in-range pixels of the ROI) is binned
+    exactly once: its column into ``x``, its row into ``y`` and its depth
+    ``w = (mm - near) / (far - near)`` into ``z``, slab 0 being nearest the
+    camera. The accumulation is a ``bincount`` over flat voxel indices (the
+    vectorised form of ``np.add.at``) using cached lookup tables, so the cost
+    is one scan of the mask plus a few gathers per foreground pixel, and does
+    not depend on the grid size.
+
+    Normalisation: each voxel's count is divided by the number of ROI pixels
+    that project into its ``(x, y)`` column (its "projected pixel area"), then
+    scaled to 0..255 and clipped. Consequences:
+
+    * A surface that fills a column at one depth reads 255 in that slab and 0
+      in the others: a solid hand is a bright slab, not a faint cloud.
+    * A surface crossing a slab boundary splits between the two slabs; they
+      sum to 255. Pick ``nz`` so a slab is thicker than the surface relief you
+      want to read as solid (a hand is ~30-50 mm deep).
+    * One stray pixel in a column of hundreds reads 0 or 1: thin noise is low.
+    * Summed over ``z``, the grid is the occupancy grid of the same lateral
+      cells (up to per-slab rounding).
+
+    ``.tobytes()`` of the result is the wire layout defined in protocol.ts:
+    x fastest, then y (row 0 = top of the ROI), then z (nearest slab first).
+    """
+    rh, rw = mask.shape
+    column, area, slab = _voxel_tables(rh, rw, nx, ny, nz, float(near_mm), float(far_mm))
+    idx = np.flatnonzero(mask)
+    flat = slab[np.take(roi_mm, idx)] * np.int32(nx * ny) + np.take(column, idx)
+    counts = np.bincount(flat, minlength=nx * ny * nz)
+    frac = counts.reshape(nz, ny, nx) / np.maximum(area, 1)[None, :, :]
+    return np.clip(np.round(frac * 255.0), 0, 255).astype(np.uint8)
+
+
+@functools.lru_cache(maxsize=8)
+def _surface_tables(rh: int, rw: int, width: int, height: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Group starts and cell areas for :func:`scan_surface`, cached per frame size and grid (read-only)."""
+    col_bin, row_bin = cell_bins(rw, width), cell_bins(rh, height)
+    row_starts = np.searchsorted(row_bin, np.arange(height))  # first pixel row of each cell row
+    col_starts = np.searchsorted(col_bin, np.arange(width))
+    area = np.outer(np.bincount(row_bin, minlength=height), np.bincount(col_bin, minlength=width))
+    return row_starts, col_starts, area
+
+
+NO_DEPTH = np.uint16(65535)  # sentinel for "no foreground pixel" inside scan_surface
+
+
+def scan_surface(roi_mm: np.ndarray, mask: np.ndarray, near_mm: float, far_mm: float, width: int, height: int) -> np.ndarray:
+    """Nearest foreground depth per cell as ``uint8`` of shape ``(height, width)``: a 3D scan of the foreground.
+
+    Cells tile the ROI with the same pixel-centre rule as :func:`voxelize`
+    (:func:`cell_bins`), row 0 at the top. A cell with no ``True`` pixel of
+    ``mask`` reads 0. Otherwise it holds the NEAREST in-range depth among its
+    pixels, normalized into the box and packed as ``1 + round(254 * w)``
+    (``w = (mm - near) / (far - near)``): 1 is the near plane, 255 the far
+    plane, so a value can never be mistaken for "empty". The minimum is a
+    block reduction (``np.minimum.reduceat`` twice) over the masked depth, so
+    the cost is one pass over the ROI regardless of grid size or foreground.
+    ``.tobytes()`` is the wire layout: row-major, row 0 first.
+    """
+    rh, rw = mask.shape
+    row_starts, col_starts, area = _surface_tables(rh, rw, width, height)
+    masked = np.where(mask, roi_mm, NO_DEPTH)
+    nearest = np.minimum.reduceat(np.minimum.reduceat(masked, row_starts, axis=0), col_starts, axis=1)
+    w = np.clip((nearest.astype(np.float64) - near_mm) / (far_mm - near_mm), 0.0, 1.0)
+    out = (1.0 + np.round(254.0 * w)).astype(np.uint8)
+    out[(nearest == NO_DEPTH) | (area == 0)] = 0  # empty cells, and reduceat's placeholder for zero-pixel cells
+    return out
 
 
 def label_components(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -601,8 +726,9 @@ class BoxAnalyzer:
     morphological opening -> connected components -> keep the largest
     ``max_hands`` blobs with at least ``min_pixels`` -> per blob: centroid,
     nearest-percentile depth, extent, confidence, sample points -> stable ids
-    from :class:`BlobTracker` -> occupancy grid of the mask. All outputs are
-    ROI-normalized (see the module docstring).
+    from :class:`BlobTracker` -> occupancy grid of the mask -> voxel grid of
+    the mask binned by depth (the foreground in 3D) -> surface scan (nearest
+    depth per cell). All outputs are ROI-normalized (see the module docstring).
     """
 
     def __init__(self, box: BoxConfig, config: AnalyzerConfig | None = None) -> None:
@@ -654,6 +780,8 @@ class BoxAnalyzer:
         tracked = tuple(Blob(id=i, u=b.u, v=b.v, w=b.w, extent=b.extent, conf=b.conf, pixels=b.pixels, points=b.points) for i, b in zip(ids, blobs))
 
         occupancy = downsample_occupancy(mask, *cfg.occupancy) if cfg.occupancy else None
+        voxels = voxelize(roi, mask, near_mm, far_mm, *cfg.voxels) if cfg.voxels else None
+        surface = scan_surface(roi, mask, near_mm, far_mm, *cfg.surface) if cfg.surface else None
         fps = self._rate.tick(frame.timestamp)
         stats = {
             "pixels": float(in_range),
@@ -663,7 +791,7 @@ class BoxAnalyzer:
             "frameWidth": float(frame.width),
             "frameHeight": float(frame.height),
         }
-        return AnalysisResult(tracked, occupancy, stats)
+        return AnalysisResult(tracked, occupancy, stats, voxels, surface)
 
 
 # --------------------------------------------------------------------------- #
@@ -680,12 +808,32 @@ def _vec(p: Sequence[float]) -> list[float]:
     return [_unit(p[0]), _unit(p[1]), _unit(p[2])]
 
 
-def encode_occupancy(grid: np.ndarray) -> str:
-    """Base64 of the grid's bytes, row-major, row 0 first (= top)."""
+def _encode_grid(grid: np.ndarray, ndim: int, what: str) -> str:
+    """Base64 of a C-ordered ``uint8`` grid: the last axis varies fastest, index 0 of every axis comes first."""
+    if grid.ndim != ndim:
+        raise ValueError(f"{what} grid must be {ndim}-D, got shape {grid.shape}")
     return base64.b64encode(np.ascontiguousarray(grid, dtype=np.uint8).tobytes()).decode("ascii")
 
 
-def hello_message(source: str, box: BoxConfig, fps: float | None, occupancy: tuple[int, int] | None) -> dict[str, Any]:
+def encode_occupancy(grid: np.ndarray) -> str:
+    """Base64 of the ``(height, width)`` grid's bytes, row-major, row 0 first (= top)."""
+    return _encode_grid(grid, 2, "occupancy")
+
+
+def encode_voxels(grid: np.ndarray) -> str:
+    """Base64 of a ``(nz, ny, nx)`` grid's bytes: x fastest, then y (top first), then z (nearest first)."""
+    return _encode_grid(grid, 3, "voxel")
+
+
+def encode_surface(grid: np.ndarray) -> str:
+    """Base64 of the ``(height, width)`` surface scan's bytes, row-major, row 0 first (= top)."""
+    return _encode_grid(grid, 2, "surface")
+
+
+def hello_message(
+    source: str, box: BoxConfig, fps: float | None, occupancy: tuple[int, int] | None,
+    voxels: tuple[int, int, int] | None = None, surface: tuple[int, int] | None = None,
+) -> dict[str, Any]:
     msg: dict[str, Any] = {
         "type": "hello",
         "version": PROTOCOL_VERSION,
@@ -700,6 +848,10 @@ def hello_message(source: str, box: BoxConfig, fps: float | None, occupancy: tup
         msg["fps"] = float(fps)
     if occupancy is not None:
         msg["occupancy"] = {"width": int(occupancy[0]), "height": int(occupancy[1])}
+    if voxels is not None:
+        msg["voxels"] = {"nx": int(voxels[0]), "ny": int(voxels[1]), "nz": int(voxels[2])}
+    if surface is not None:
+        msg["surface"] = {"width": int(surface[0]), "height": int(surface[1])}
     return msg
 
 
@@ -717,6 +869,10 @@ def frame_message(seq: int, t: float, result: AnalysisResult) -> dict[str, Any]:
     msg: dict[str, Any] = {"type": "frame", "seq": int(seq), "t": round(float(t), 6), "hands": hands}
     if result.occupancy is not None:
         msg["occupancy"] = encode_occupancy(result.occupancy)
+    if result.voxels is not None:
+        msg["voxels"] = encode_voxels(result.voxels)
+    if result.surface is not None:
+        msg["surface"] = encode_surface(result.surface)
     msg["stats"] = {k: float(v) for k, v in result.stats.items()}
     return msg
 
@@ -843,20 +999,46 @@ def dump_frames(source: FrameSource, analyzer: BoxAnalyzer, hello: dict[str, Any
 # --------------------------------------------------------------------------- #
 
 SOURCES: dict[str, type[FrameSource]] = {"synthetic": SyntheticSource, "realsense": RealSenseSource}
+#: Sources implemented in ``leap_source.py`` (imported on demand; they need OpenCV), with their default depth range in metres:
+#: the Leap Motion Controller looks up from the desk and sees about 10-45 cm of height.
+LEAP_SOURCES: dict[str, tuple[float, float]] = {"leap": (0.1, 0.45), "leap-synthetic": (0.1, 0.45)}
+DEFAULT_RANGE_M = (0.4, 1.2)
+LEAP_ORIENTATIONS = ("none", "rot90", "rot180", "rot270", "flip-h", "flip-v", "transpose")  # mirrors leap_stereo.ORIENTATIONS
+
+
+def _import_leap_source() -> Any:
+    try:
+        if __package__:
+            from . import leap_source  # type: ignore[import-not-found]
+        else:
+            import leap_source  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise SystemExit(f"--source leap needs bridge/leap_source.py and OpenCV (pip install opencv-python): {exc}") from exc
+    return leap_source
+
+
+def resolve_range(args: argparse.Namespace) -> tuple[float, float]:
+    """``(near, far)`` in metres: the flags if given, else the source's default range."""
+    near, far = LEAP_SOURCES.get(args.source, DEFAULT_RANGE_M)
+    return (near if args.near is None else args.near, far if args.far is None else args.far)
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Depth-camera bridge: streams blobs inside a physical box to the browser over WebSocket.")
-    p.add_argument("--source", choices=sorted(SOURCES), default="synthetic", help="frame source (default: synthetic)")
+    p.add_argument("--source", choices=sorted(SOURCES) + sorted(LEAP_SOURCES), default="synthetic", help="frame source (default: synthetic)")
     p.add_argument("--host", default=DEFAULT_HOST, help="bind address (default: %(default)s)")
     p.add_argument("--port", type=int, default=DEFAULT_PORT, help="bind port (default: %(default)s)")
-    p.add_argument("--near", type=float, default=0.4, metavar="M", help="nearest plane of the box in metres (default: %(default)s)")
-    p.add_argument("--far", type=float, default=1.2, metavar="M", help="farthest plane of the box in metres (default: %(default)s)")
+    p.add_argument("--near", type=float, default=None, metavar="M", help=f"nearest plane of the box in metres (default: {DEFAULT_RANGE_M[0]}, {LEAP_SOURCES['leap'][0]} for the Leap sources)")
+    p.add_argument("--far", type=float, default=None, metavar="M", help=f"farthest plane of the box in metres (default: {DEFAULT_RANGE_M[1]}, {LEAP_SOURCES['leap'][1]} for the Leap sources)")
     p.add_argument("--roi", type=float, nargs=4, default=(0.0, 0.0, 1.0, 1.0), metavar=("X0", "Y0", "X1", "Y1"), help="image rectangle as fractions of width/height (default: full frame)")
     p.add_argument("--box-x", type=float, nargs=2, default=(-0.5, 0.5), metavar=("MIN", "MAX"), help="metric x extent reported in hello (informational)")
     p.add_argument("--box-y", type=float, nargs=2, default=(-0.4, 0.4), metavar=("MIN", "MAX"), help="metric y extent reported in hello (informational)")
     p.add_argument("--occupancy", type=int, nargs=2, default=(32, 24), metavar=("W", "H"), help="occupancy grid size (default: 32 24)")
     p.add_argument("--no-occupancy", action="store_true", help="do not send an occupancy grid")
+    p.add_argument("--voxels", type=int, nargs=3, default=(32, 24, 16), metavar=("NX", "NY", "NZ"), help=f"foreground voxel grid: cells across, down and deep into the box, each 1..{MAX_VOXEL_SIDE} (default: 32 24 16)")
+    p.add_argument("--no-voxels", action="store_true", help="do not send a voxel grid")
+    p.add_argument("--surface", type=int, nargs=2, default=(64, 48), metavar=("W", "H"), help=f"nearest-depth surface scan size, each side 1..{MAX_SURFACE_SIDE} (default: 64 48)")
+    p.add_argument("--no-surface", action="store_true", help="do not send a surface scan")
     p.add_argument("--min-pixels", type=int, default=150, help="smallest blob in pixels (default: %(default)s)")
     p.add_argument("--max-hands", type=int, default=2, help=f"largest number of blobs to report, 0..{MAX_HANDS} (default: %(default)s)")
     p.add_argument("--fps", type=float, default=30.0, help="capture rate (default: %(default)s)")
@@ -868,6 +1050,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--decimation", type=int, default=0, help="RealSense decimation filter magnitude, 0 = off (default: %(default)s)")
     p.add_argument("--hole-filling", action="store_true", help="RealSense hole-filling filter (off by default)")
     p.add_argument("--synthetic-hands", type=int, choices=(1, 2), default=1, help="hands in the synthetic script (default: %(default)s)")
+    leap = p.add_argument_group("Leap Motion Controller (--source leap / leap-synthetic; see bridge/README.md)")
+    leap.add_argument("--leapc", metavar="PATH", help="LeapC library (default: search the Ultraleap Gemini/Hyperion SDK, then Leap Motion Core Services, then $LEAPC_DLL)")
+    leap.add_argument("--leap-view", type=int, nargs=2, default=(320, 240), metavar=("W", "H"), help="rectified stereo view = depth image size (default: 320 240)")
+    leap.add_argument("--leap-fov", type=float, default=90.0, metavar="DEG", help="horizontal field of view of the rectified view in degrees (default: %(default)s)")
+    leap.add_argument("--leap-min-intensity", type=int, default=16, help="ignore IR pixels darker than this, 0..255; the LEDs do not reach the background (default: %(default)s)")
+    leap.add_argument("--swap-cameras", action="store_true", help="exchange the two cameras before matching (use when the depth image stays empty with a hand over the device)")
+    leap.add_argument("--leap-orient", choices=LEAP_ORIENTATIONS, default="none", help="rotate/flip the depth image before analysis so image right/down mean what the browser expects (default: none)")
     p.add_argument("--log-level", default="info", choices=("debug", "info", "warning", "error"))
     return p
 
@@ -878,17 +1067,40 @@ def make_source(args: argparse.Namespace) -> FrameSource:
         return SyntheticSource(width, height, args.fps, near_m=args.near, far_m=args.far, hands=args.synthetic_hands, paced=args.dump is None)
     if args.source == "realsense":
         return RealSenseSource(width, height, args.fps, decimation=args.decimation, hole_filling=args.hole_filling)
+    if args.source in LEAP_SOURCES:
+        leap = _import_leap_source()
+        try:
+            view = leap.ls.RectifiedView.from_fov(args.leap_view[0], args.leap_view[1], args.leap_fov)
+            params = leap.ls.StereoParams(min_depth_mm=args.near * 1000.0, min_intensity=args.leap_min_intensity)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        if args.source == "leap-synthetic":
+            return leap.LeapSyntheticSource(view, params, args.swap_cameras, args.leap_orient, fps=args.fps, paced=args.dump is None)
+        return leap.LeapStereoSource(args.leapc, view, params, args.swap_cameras, args.leap_orient, fps=args.fps)
     raise SystemExit(f"unknown source {args.source!r}")
+
+
+def _finish(source: FrameSource, code: int) -> int:
+    """Exit code, or a hard exit when a native thread is stuck inside the source (LeapC's 5.0-preview stall)."""
+    if getattr(source, "needs_hard_exit", False):
+        log.warning("a native thread is stuck inside %s; exiting hard", source.name)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(code)
+    return code
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    args.near, args.far = resolve_range(args)
     logging.basicConfig(level=getattr(logging, args.log_level.upper()), stream=sys.stderr, format="%(asctime)s %(levelname)s %(message)s")
     try:
         box = BoxConfig(near_m=args.near, far_m=args.far, roi=tuple(args.roi), box_x=tuple(args.box_x), box_y=tuple(args.box_y))
         config = AnalyzerConfig(
             occupancy=None if args.no_occupancy else tuple(args.occupancy),
+            voxels=None if args.no_voxels else tuple(args.voxels),
+            surface=None if args.no_surface else tuple(args.surface),
             min_pixels=args.min_pixels, max_hands=args.max_hands, morph_iterations=args.morph,
             sample_points=args.points, max_jump=args.max_jump,
         )
@@ -896,7 +1108,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(str(exc))
     source = make_source(args)
     analyzer = BoxAnalyzer(box, config)
-    hello = hello_message(source.name, box, source.fps, config.occupancy)
+    hello = hello_message(source.name, box, source.fps, config.occupancy, config.voxels, config.surface)
 
     if args.dump is not None:
         if hasattr(sys.stdout, "reconfigure"):
@@ -905,8 +1117,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             dump_frames(source, analyzer, hello, args.dump, sys.stdout)
         except (RuntimeError, NotImplementedError) as exc:
             log.error("%s", exc)
-            return 1
-        return 0
+            return _finish(source, 1)
+        return _finish(source, 0)
 
     try:
         source.start()
@@ -920,7 +1132,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         log.info("stopping")
     finally:
         source.stop()
-    return 0
+    return _finish(source, 0)
 
 
 if __name__ == "__main__":

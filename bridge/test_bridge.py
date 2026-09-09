@@ -49,9 +49,25 @@ def depth_at(w: float) -> int:
 
 
 def make_analyzer(**overrides: object) -> db.BoxAnalyzer:
-    cfg: dict[str, object] = {"occupancy": (8, 6), "min_pixels": 50, "max_hands": 2}
+    """Small grids: with a 640x480 frame every 8x6 cell is exactly 80x80 pixels, which keeps the layout tests exact."""
+    cfg: dict[str, object] = {"occupancy": (8, 6), "voxels": (8, 6, 4), "surface": (8, 6), "min_pixels": 50, "max_hands": 2}
     cfg.update(overrides)
     return db.BoxAnalyzer(db.BoxConfig(near_m=NEAR, far_m=FAR), db.AnalyzerConfig(**cfg))  # type: ignore[arg-type]
+
+
+def grid_sizes(hello: dict[str, object]) -> tuple[tuple[int, int] | None, tuple[int, int, int] | None, tuple[int, int] | None]:
+    """``(occupancy, voxels, surface)`` sizes announced by a hello message, ``None`` where absent."""
+    occ, vox, surf = hello.get("occupancy"), hello.get("voxels"), hello.get("surface")
+    return (
+        (occ["width"], occ["height"]) if isinstance(occ, dict) else None,
+        (vox["nx"], vox["ny"], vox["nz"]) if isinstance(vox, dict) else None,
+        (surf["width"], surf["height"]) if isinstance(surf, dict) else None,
+    )
+
+
+def surface_byte(w: float) -> int:
+    """The wire encoding of a normalized depth on the surface scan: 1 + round(254 w)."""
+    return 1 + int(round(254.0 * w))
 
 
 def synthetic(**kw: object) -> db.SyntheticSource:
@@ -60,8 +76,8 @@ def synthetic(**kw: object) -> db.SyntheticSource:
 
 # ---- protocol shape checks (hand-written mirror of protocol.ts) ------------ #
 
-HELLO_REQUIRED, HELLO_OPTIONAL = {"type", "version", "source", "box"}, {"fps", "occupancy"}
-FRAME_REQUIRED, FRAME_OPTIONAL = {"type", "seq", "t", "hands"}, {"occupancy", "stats"}
+HELLO_REQUIRED, HELLO_OPTIONAL = {"type", "version", "source", "box"}, {"fps", "occupancy", "voxels", "surface"}
+FRAME_REQUIRED, FRAME_OPTIONAL = {"type", "seq", "t", "hands"}, {"occupancy", "voxels", "surface", "stats"}
 HAND_REQUIRED, HAND_OPTIONAL = {"id", "pos"}, {"conf", "extent", "openness", "pinch", "points"}
 
 
@@ -103,12 +119,27 @@ class ProtocolAssertions(unittest.TestCase):
             self.assert_number(m["fps"])
             self.assertGreater(m["fps"], 0)  # type: ignore[operator]
         if "occupancy" in m:
-            occ = m["occupancy"]
-            assert isinstance(occ, dict)
-            self.assertEqual(set(occ), {"width", "height"})
-            for side in occ.values():
-                self.assertIsInstance(side, int)
-                self.assertTrue(1 <= side <= 256)
+            self.assert_grid_size(m["occupancy"], {"width", "height"}, 256)
+        if "voxels" in m:
+            self.assert_grid_size(m["voxels"], {"nx", "ny", "nz"}, 128)
+        if "surface" in m:
+            self.assert_grid_size(m["surface"], {"width", "height"}, 512)
+
+    def assert_grid_size(self, size: object, keys: set[str], limit: int) -> None:
+        assert isinstance(size, dict)
+        self.assertEqual(set(size), keys)
+        for side in size.values():
+            self.assertIsInstance(side, int)
+            self.assertTrue(1 <= side <= limit, size)
+
+    def assert_payload(self, m: dict[str, object], key: str, size: tuple[int, ...] | None) -> None:
+        """A base64 grid field is present with exactly prod(size) bytes, or absent when ``size`` is None."""
+        if size is None:
+            self.assertNotIn(key, m)
+            return
+        self.assertIn(key, m)
+        raw = base64.b64decode(m[key], validate=True)  # type: ignore[arg-type]
+        self.assertEqual(len(raw), math.prod(size), key)
 
     def assert_hand(self, h: dict[str, object]) -> None:
         keys = set(h)
@@ -133,7 +164,10 @@ class ProtocolAssertions(unittest.TestCase):
             for p in pts:
                 self.assert_vec(p)
 
-    def assert_frame(self, m: dict[str, object], occupancy: tuple[int, int] | None) -> None:
+    def assert_frame(
+        self, m: dict[str, object], occupancy: tuple[int, int] | None,
+        voxels: tuple[int, int, int] | None = None, surface: tuple[int, int] | None = None,
+    ) -> None:
         keys = set(m)
         self.assertTrue(FRAME_REQUIRED <= keys <= FRAME_REQUIRED | FRAME_OPTIONAL, keys)
         self.assertEqual(m["type"], "frame")
@@ -145,12 +179,9 @@ class ProtocolAssertions(unittest.TestCase):
         self.assertLessEqual(len(hands), 16)
         for h in hands:
             self.assert_hand(h)
-        if occupancy is None:
-            self.assertNotIn("occupancy", m)
-        else:
-            self.assertIn("occupancy", m)
-            raw = base64.b64decode(m["occupancy"], validate=True)  # type: ignore[arg-type]
-            self.assertEqual(len(raw), occupancy[0] * occupancy[1])
+        self.assert_payload(m, "occupancy", occupancy)
+        self.assert_payload(m, "voxels", voxels)
+        self.assert_payload(m, "surface", surface)
         if "stats" in m:
             stats = m["stats"]
             assert isinstance(stats, dict)
@@ -357,6 +388,200 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(result.blobs, ())
         self.assertGreater(result.stats["pixels"], 0)
 
+    def test_grid_sizes_are_validated(self) -> None:
+        for bad in ({"occupancy": (0, 6)}, {"voxels": (0, 6, 4)}, {"voxels": (129, 6, 4)}, {"surface": (0, 6)}, {"surface": (513, 6)}):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                db.AnalyzerConfig(**bad)  # type: ignore[arg-type]
+
+
+# ---- voxels ---------------------------------------------------------------- #
+
+
+class VoxelTests(unittest.TestCase):
+    """The foreground voxel grid: (nz, ny, nx) uint8, x fastest on the wire, top row first, nearest slab first."""
+
+    def test_top_left_nearest_pixel_lands_at_index_zero(self) -> None:
+        depth = backdrop()
+        depth[0:80, 0:80] = depth_at(0.0)  # exactly one 80x80 cell of the 8x6 grid, at the near plane
+        grid = make_analyzer().analyze(frame_from(depth)).voxels
+        assert grid is not None
+        self.assertEqual(grid.shape, (4, 6, 8))
+        self.assertEqual(grid.dtype, np.uint8)
+        self.assertEqual(int(grid[0, 0, 0]), 255)
+        self.assertEqual(int(grid.sum()), 255, "nothing anywhere else")
+        raw = base64.b64decode(db.encode_voxels(grid))
+        self.assertEqual(len(raw), 8 * 6 * 4)
+        self.assertEqual(raw[0], 255)
+        self.assertEqual(set(raw[1:]), {0})
+
+    def test_far_bottom_right_pixel_lands_in_the_last_slab(self) -> None:
+        depth = backdrop()
+        depth[400:480, 560:640] = depth_at(1.0)
+        grid = make_analyzer().analyze(frame_from(depth)).voxels
+        assert grid is not None
+        self.assertEqual(int(grid[3, 5, 7]), 255)
+        self.assertEqual(int(grid.sum()), 255)
+        raw = base64.b64decode(db.encode_voxels(grid))
+        self.assertEqual(raw[-1], 255)
+        self.assertEqual(raw[(3 * 6 + 5) * 8 + 7], 255, "flat index is (z * ny + y) * nx + x")
+
+    def test_slab_index_is_floor_of_w_times_nz(self) -> None:
+        for w, expected in ((0.0, 0), (0.24, 0), (0.26, 1), (0.5, 2), (0.99, 3), (1.0, 3)):
+            depth = backdrop()
+            depth[0:80, 0:80] = depth_at(w)
+            grid = make_analyzer().analyze(frame_from(depth)).voxels
+            assert grid is not None
+            self.assertEqual(int(np.argmax(grid[:, 0, 0])), expected, f"w={w}")
+            self.assertEqual(int(grid[:, 0, 0].max()), 255)
+
+    def test_value_is_the_filled_fraction_of_the_voxel_column(self) -> None:
+        depth = np.full((60, 80), depth_at(0.5), dtype=np.uint16)  # 10x10 pixels per cell of an 8x6 grid
+        mask = np.zeros((60, 80), dtype=bool)
+        mask[0:10, 0:10] = True   # a solid cell reads 255
+        mask[0:5, 10:20] = True   # half a cell reads 128
+        mask[0, 20] = True        # one speckle pixel in a 100-pixel column reads 3: thin noise stays low
+        grid = db.voxelize(depth, mask, NEAR_MM, FAR_MM, 8, 6, 4)  # straight to the kernel, no opening
+        self.assertEqual(int(grid[2, 0, 0]), 255)
+        self.assertEqual(int(grid[2, 0, 1]), 128)
+        self.assertEqual(int(grid[2, 0, 2]), 3)
+        self.assertEqual(int(grid.sum()), 255 + 128 + 3)
+        self.assertEqual(int(db.voxelize(depth, np.zeros_like(mask), NEAR_MM, FAR_MM, 8, 6, 4).sum()), 0)
+
+    def test_a_surface_on_a_slab_boundary_splits_and_columns_sum_to_the_occupancy(self) -> None:
+        depth = backdrop()
+        depth[0:80, 0:80] = depth_at(0.49)   # one cell, its lower half just in front of the w = 0.5 boundary...
+        depth[0:40, 0:80] = depth_at(0.51)   # ...its upper half just behind it
+        result = make_analyzer().analyze(frame_from(depth))
+        assert result.voxels is not None and result.occupancy is not None
+        self.assertEqual((int(result.voxels[1, 0, 0]), int(result.voxels[2, 0, 0])), (128, 128))
+        self.assertEqual(int(result.occupancy[0, 0]), 255)
+        src = synthetic()
+        result = make_analyzer().analyze(frame_from(src.render(2.0), 2.0))
+        assert result.voxels is not None and result.occupancy is not None
+        sums = result.voxels.astype(np.int32).sum(axis=0)
+        self.assertTrue((np.abs(sums - result.occupancy.astype(np.int32)) <= 2).all(), "same lateral cells, per-slab rounding only")
+        self.assertGreater(int(sums.max()), 0)
+
+    def test_grid_finer_than_the_image_reads_empty_cells_as_zero(self) -> None:
+        depth = np.full((4, 4), depth_at(0.5), dtype=np.uint16)
+        mask = np.zeros((4, 4), dtype=bool)
+        mask[0, 0] = True  # pixel centre 0.5/4 = 0.125 -> cell 1 of 8
+        grid = db.voxelize(depth, mask, NEAR_MM, FAR_MM, 8, 8, 2)
+        self.assertEqual(grid.shape, (2, 8, 8))
+        self.assertEqual(int(np.count_nonzero(grid)), 1)
+        self.assertEqual(int(grid[1, 1, 1]), 255)
+
+    def test_synthetic_hand_is_a_dome_at_its_depth(self) -> None:
+        src, t = synthetic(), 2.0
+        hand = src.scripted_hands(t)[0]
+        grid = make_analyzer(voxels=(32, 24, 64)).analyze(frame_from(src.render(t), t)).voxels  # 12.5 mm slabs resolve the 40 mm dome
+        assert grid is not None
+        nz, ny, nx = grid.shape
+        occupied = grid.any(axis=0)
+        nearest = np.where(occupied, grid.astype(bool).argmax(axis=0), nz)  # per column: its nearest occupied slab
+        cy, cx = int(hand.y * ny), int(hand.x * nx)
+        self.assertTrue(occupied[cy, cx])
+        self.assertEqual(int(nearest[cy, cx]), int(hand.z * nz), "the middle of the dome is at the scripted depth")
+        self.assertEqual(int(nearest.min()), int(nearest[cy, cx]), "nothing is nearer than the middle")
+        self.assertGreater(int(nearest[occupied].max()), int(nearest[cy, cx]), "the rim is deeper: a dome, not a disc")
+        deepest = int(np.flatnonzero(grid.reshape(nz, -1).any(axis=1)).max())
+        self.assertLessEqual(deepest, int((hand.z + src.dome_mm / (FAR_MM - NEAR_MM)) * nz) + 1, "nothing deeper than the dome's relief")
+        z, y, x = np.unravel_index(int(np.argmax(grid)), grid.shape)
+        self.assertAlmostEqual((x + 0.5) / nx, hand.x, delta=1.5 / nx)
+        self.assertAlmostEqual((y + 0.5) / ny, hand.y, delta=1.5 / ny)
+        self.assertLessEqual(abs(int(z) - int(hand.z * nz)), 1)
+
+    def test_no_voxels_path(self) -> None:
+        result = make_analyzer(voxels=None).analyze(frame_from(synthetic().render(2.0), 2.0))
+        self.assertIsNone(result.voxels)
+        self.assertIsNotNone(result.occupancy)
+        self.assertIsNotNone(result.surface)
+        self.assertNotIn("voxels", db.frame_message(0, 0.0, result))
+        self.assertNotIn("voxels", db.hello_message("synthetic", db.BoxConfig(), 30.0, (8, 6), None, (8, 6)))
+        with self.assertRaises(ValueError):
+            db.encode_voxels(np.zeros((6, 8), dtype=np.uint8))  # a 2-D grid is not a voxel grid
+
+
+# ---- surface scan ---------------------------------------------------------- #
+
+
+class SurfaceTests(unittest.TestCase):
+    """The nearest-depth scan: (height, width) uint8, row 0 = top; 0 = empty, else 1 + round(254 w)."""
+
+    def test_top_left_nearest_cell_is_index_zero_with_value_one(self) -> None:
+        depth = backdrop()
+        depth[0:80, 0:80] = depth_at(0.0)
+        surf = make_analyzer().analyze(frame_from(depth)).surface
+        assert surf is not None
+        self.assertEqual(surf.shape, (6, 8))
+        self.assertEqual(surf.dtype, np.uint8)
+        self.assertEqual(int(surf[0, 0]), 1, "the near plane is 1, never 0")
+        self.assertEqual(int(np.count_nonzero(surf)), 1, "every empty cell is 0")
+        raw = base64.b64decode(db.encode_surface(surf))
+        self.assertEqual(len(raw), 48)
+        self.assertEqual(raw[0], 1)
+        self.assertEqual(set(raw[1:]), {0})
+
+    def test_far_cell_reads_255_and_a_mid_cell_128(self) -> None:
+        depth = backdrop()
+        depth[400:480, 560:640] = depth_at(1.0)  # bottom-right cell, far plane
+        depth[200:240, 240:320] = depth_at(0.5)  # half of cell (row 2, col 3), mid depth
+        surf = make_analyzer().analyze(frame_from(depth)).surface
+        assert surf is not None
+        self.assertEqual(int(surf[5, 7]), 255)
+        self.assertEqual(int(surf[2, 3]), 128)
+        self.assertEqual(int(np.count_nonzero(surf)), 2)
+        raw = base64.b64decode(db.encode_surface(surf))
+        self.assertEqual(raw[-1], 255)
+        self.assertEqual(raw[2 * 8 + 3], 128, "row-major, row 0 first")
+
+    def test_a_cell_holds_its_nearest_pixel(self) -> None:
+        depth = backdrop()
+        depth[0:80, 0:80] = depth_at(0.8)
+        depth[30:50, 30:50] = depth_at(0.3)  # a nearer patch inside the same cell wins (min, not mean)
+        surf = make_analyzer().analyze(frame_from(depth)).surface
+        assert surf is not None
+        self.assertEqual(int(surf[0, 0]), surface_byte(0.3))
+        self.assertEqual(int(surf[0, 1]), 0)
+
+    def test_scan_surface_edge_cases(self) -> None:
+        depth = np.full((4, 4), depth_at(0.5), dtype=np.uint16)
+        self.assertEqual(int(db.scan_surface(depth, np.zeros((4, 4), dtype=bool), NEAR_MM, FAR_MM, 8, 6).sum()), 0)
+        mask = np.zeros((4, 4), dtype=bool)
+        mask[0, 0] = True
+        surf = db.scan_surface(depth, mask, NEAR_MM, FAR_MM, 8, 8)  # grid finer than the image: pixel (0, 0) -> cell (1, 1)
+        self.assertEqual(int(np.count_nonzero(surf)), 1)
+        self.assertEqual(int(surf[1, 1]), 128)
+        with self.assertRaises(ValueError):
+            db.encode_surface(np.zeros((2, 6, 8), dtype=np.uint8))
+
+    def test_synthetic_hand_scans_as_a_dome(self) -> None:
+        src, t = synthetic(), 2.0
+        hand = src.scripted_hands(t)[0]
+        result = make_analyzer(surface=(64, 48)).analyze(frame_from(src.render(t), t))
+        surf = result.surface
+        assert surf is not None
+        cy, cx = int(hand.y * 48), int(hand.x * 64)
+        centre = int(surf[cy, cx])
+        self.assertAlmostEqual(centre, surface_byte(hand.z), delta=1)
+        lit = surf[surf > 0]
+        self.assertEqual(int(lit.min()), centre, "the middle of the dome is the nearest point")
+        ys, xs = np.nonzero(surf)
+        self.assertGreater(int(surf[ys.min(), cx]), centre, "the rim is deeper")
+        self.assertLessEqual(int(lit.max()), centre + int(round(254 * src.dome_mm / (FAR_MM - NEAR_MM))) + 1, "relief is at most the dome height")
+        self.assertAlmostEqual((xs.min() + xs.max() + 1) / 2 / 64, hand.x, delta=1.5 / 64)
+        self.assertAlmostEqual((ys.min() + ys.max() + 1) / 2 / 48, hand.y, delta=1.5 / 48)
+        small = make_analyzer().analyze(frame_from(src.render(t), t))
+        assert small.surface is not None and small.occupancy is not None
+        self.assertTrue(((small.occupancy > 0) <= (small.surface > 0)).all(), "every cell the occupancy sees is scanned too")
+
+    def test_no_surface_path(self) -> None:
+        result = make_analyzer(surface=None).analyze(frame_from(synthetic().render(2.0), 2.0))
+        self.assertIsNone(result.surface)
+        self.assertIsNotNone(result.voxels)
+        self.assertNotIn("surface", db.frame_message(0, 0.0, result))
+        self.assertNotIn("surface", db.hello_message("synthetic", db.BoxConfig(), 30.0, (8, 6), (8, 6, 4), None))
+
 
 class TrackerTests(unittest.TestCase):
     def test_greedy_nearest_matching_and_new_ids(self) -> None:
@@ -384,19 +609,23 @@ class TrackerTests(unittest.TestCase):
 class MessageTests(ProtocolAssertions):
     def test_hello_message_shape(self) -> None:
         box = db.BoxConfig(near_m=NEAR, far_m=FAR, box_x=(-0.5, 0.5), box_y=(-0.4, 0.4))
-        m = db.hello_message("synthetic", box, 30.0, (8, 6))
+        m = db.hello_message("synthetic", box, 30.0, (8, 6), (8, 6, 4), (16, 12))
         self.assert_hello(m)
         self.assertEqual(set(m), HELLO_REQUIRED | HELLO_OPTIONAL)
         self.assertEqual(m["box"], {"x": [-0.5, 0.5], "y": [-0.4, 0.4], "z": [NEAR, FAR]})
         self.assertEqual(m["occupancy"], {"width": 8, "height": 6})
+        self.assertEqual(m["voxels"], {"nx": 8, "ny": 6, "nz": 4})
+        self.assertEqual(m["surface"], {"width": 16, "height": 12})
+        self.assertEqual(grid_sizes(m), ((8, 6), (8, 6, 4), (16, 12)))
         bare = db.hello_message("realsense", box, None, None)
         self.assert_hello(bare)
         self.assertEqual(set(bare), HELLO_REQUIRED)
+        self.assertEqual(grid_sizes(bare), (None, None, None))
 
     def test_frame_message_shape_and_json_round_trip(self) -> None:
         src, analyzer = synthetic(), make_analyzer()
         m = db.frame_message(7, 12.5, analyzer.analyze(frame_from(src.render(2.0), 2.0)))
-        self.assert_frame(m, (8, 6))
+        self.assert_frame(m, (8, 6), (8, 6, 4), (8, 6))
         self.assertEqual(m["seq"], 7)
         self.assertEqual(m["t"], 12.5)
         self.assertEqual(set(m["hands"][0]), {"id", "pos", "conf", "extent", "points"})
@@ -427,27 +656,75 @@ def run_dump(*extra: str) -> list[dict[str, object]]:
 
 class DumpCliTests(ProtocolAssertions):
     def test_dump_lines_match_the_protocol(self) -> None:
-        lines = run_dump("--dump", "3", "--occupancy", "8", "6")
+        lines = run_dump("--dump", "3", "--occupancy", "8", "6", "--voxels", "8", "6", "4", "--surface", "8", "6")
         self.assertEqual(len(lines), 4)
         hello, frames = lines[0], lines[1:]
         self.assert_hello(hello)
         self.assertEqual(hello["source"], "synthetic")
         self.assertEqual(hello["occupancy"], {"width": 8, "height": 6})
+        self.assertEqual(hello["voxels"], {"nx": 8, "ny": 6, "nz": 4})
+        self.assertEqual(hello["surface"], {"width": 8, "height": 6})
         for seq, frame in enumerate(frames):
-            self.assert_frame(frame, (8, 6))
+            self.assert_frame(frame, *grid_sizes(hello))
             self.assertEqual(frame["seq"], seq)
             self.assertEqual(len(frame["hands"]), 1, "the script starts with one hand present")  # type: ignore[arg-type]
         ts = [f["t"] for f in frames]
         self.assertEqual(ts, sorted(ts))  # type: ignore[type-var]
+
+    def test_dump_payloads_agree_with_the_hand(self) -> None:
+        """The voxel peak and the surface's nearest cell sit at the hand's centroid, in the slab / at the depth it reports."""
+        lines = run_dump("--dump", "3", "--occupancy", "8", "6", "--voxels", "8", "6", "4", "--surface", "8", "6")
+        for frame in lines[1:]:
+            hand = frame["hands"][0]  # type: ignore[index]
+            u, v, w = hand["pos"]
+            vox = base64.b64decode(frame["voxels"])  # type: ignore[arg-type]
+            self.assertEqual(len(vox), 8 * 6 * 4)
+            peak = max(range(len(vox)), key=vox.__getitem__)
+            z, rest = divmod(peak, 8 * 6)
+            y, x = divmod(rest, 8)
+            self.assertAlmostEqual((x + 0.5) / 8, u, delta=1.5 / 8)
+            self.assertAlmostEqual((y + 0.5) / 6, v, delta=1.5 / 6)
+            self.assertLessEqual(abs(z - int(w * 4)), 1)
+            surf = base64.b64decode(frame["surface"])  # type: ignore[arg-type]
+            self.assertEqual(len(surf), 8 * 6)
+            lit = [(val, i) for i, val in enumerate(surf) if val]
+            self.assertTrue(lit)
+            nearest, index = min(lit)
+            self.assertAlmostEqual((nearest - 1) / 254, w, delta=0.02)
+            self.assertAlmostEqual((index % 8 + 0.5) / 8, u, delta=1.5 / 8)
+            self.assertAlmostEqual((index // 8 + 0.5) / 6, v, delta=1.5 / 6)
+
+    def test_dump_default_grids(self) -> None:
+        lines = run_dump("--dump", "1")
+        self.assert_hello(lines[0])
+        self.assertEqual(grid_sizes(lines[0]), ((32, 24), (32, 24, 16), (64, 48)))
+        self.assert_frame(lines[1], (32, 24), (32, 24, 16), (64, 48))
 
     def test_no_occupancy_flag_drops_the_grid_everywhere(self) -> None:
         lines = run_dump("--dump", "2", "--no-occupancy", "--points", "0", "--resolution", "160", "120", "--min-pixels", "20")
         self.assert_hello(lines[0])
         self.assertNotIn("occupancy", lines[0])
         for frame in lines[1:]:
-            self.assert_frame(frame, None)
+            self.assert_frame(frame, None, (32, 24, 16), (64, 48))
             for hand in frame["hands"]:  # type: ignore[union-attr]
                 self.assertEqual(hand["points"], [])
+
+    def test_no_voxels_and_no_surface_flags_drop_those_fields_everywhere(self) -> None:
+        lines = run_dump("--dump", "2", "--no-voxels", "--no-surface", "--occupancy", "8", "6", "--resolution", "160", "120", "--min-pixels", "20")
+        self.assert_hello(lines[0])
+        self.assertEqual(grid_sizes(lines[0]), ((8, 6), None, None))
+        for frame in lines[1:]:
+            self.assert_frame(frame, (8, 6), None, None)
+        lines = run_dump("--dump", "1", "--no-voxels", "--resolution", "160", "120", "--min-pixels", "20")
+        self.assertEqual(grid_sizes(lines[0]), ((32, 24), None, (64, 48)))
+        self.assert_frame(lines[1], (32, 24), None, (64, 48))
+
+    def test_bad_grid_sizes_are_rejected(self) -> None:
+        for flags in (("--voxels", "0", "6", "4"), ("--voxels", "8", "6", "129"), ("--surface", "600", "6")):
+            cmd = [sys.executable, os.path.join(HERE, "depth_bridge.py"), "--dump", "1", *flags]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False)
+            self.assertNotEqual(proc.returncode, 0, flags)
+            self.assertIn("grid sides must be", proc.stderr)
 
     def test_bad_geometry_is_rejected(self) -> None:
         cmd = [sys.executable, os.path.join(HERE, "depth_bridge.py"), "--dump", "1", "--near", "1.5", "--far", "1.0"]
@@ -461,10 +738,10 @@ class DumpCliTests(ProtocolAssertions):
             lines = [json.loads(line) for line in fh if line.strip()]
         self.assertGreaterEqual(len(lines), 2)
         self.assert_hello(lines[0])
-        occ = lines[0].get("occupancy")
-        size = (occ["width"], occ["height"]) if occ else None
+        sizes = grid_sizes(lines[0])
+        self.assertEqual(sizes, ((8, 6), (8, 6, 4), (8, 6)), "the fixture is generated with every field on, at small sizes")
         for frame in lines[1:]:
-            self.assert_frame(frame, size)
+            self.assert_frame(frame, *sizes)
 
 
 if __name__ == "__main__":
