@@ -48,8 +48,8 @@ export class DepthBridgeSource implements InputSource {
         if (message.seq <= this.lastSequence) return; // duplicate or reordered; the tracker would drop it too
         this.lastSequence = message.seq; this.received++;
         let observedAtMs = Math.min(this.clock.observe(message.t, receivedAtMs), receivedAtMs);
-        // A bridge clock that stalls or runs slow would make every frame look stale; start the estimate over.
-        if (receivedAtMs - observedAtMs > 1000) { this.clock.reset(); observedAtMs = receivedAtMs; }
+        // A bridge clock that stalls or runs slow would make every frame look stale; re-base the estimate instead.
+        if (receivedAtMs - observedAtMs > 200) { this.clock.reset(); observedAtMs = Math.min(this.clock.observe(message.t, receivedAtMs), receivedAtMs); }
         this.emit({ ...bridgeFrameToInput(message, observedAtMs, receivedAtMs, this.hello), sequence: this.sequence++ });
       } catch (error) { this.state = { state: 'running', message: error instanceof Error ? error.message : String(error) }; }
     };

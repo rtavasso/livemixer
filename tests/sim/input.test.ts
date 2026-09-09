@@ -172,6 +172,14 @@ describe('bridge protocol', () => {
     expect(Array.from(decodeOccupancy(encodeOccupancy(grid), 3, 2).data)).toEqual(Array.from(grid.data));
     expect(() => decodeOccupancy(encodeOccupancy(grid), 2, 2)).toThrow();
   });
+  it('clock mapper re-based after a reset accepts a slow producer clock', () => {
+    const c = new ClockMapper(5000);
+    c.observe(0, 0);
+    // The producer's clock runs at half speed: apparent lateness grows until a source re-bases.
+    expect(1000 - c.observe(.5, 1000)).toBeCloseTo(500, 6);
+    c.reset();
+    expect(c.observe(.5, 1000)).toBe(1000);
+  });
   it('clock mapper tracks the minimum transport delay', () => {
     const c = new ClockMapper(1000);
     expect(c.observe(1, 1100)).toBe(1100);

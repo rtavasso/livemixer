@@ -125,7 +125,8 @@ export class LeapSource implements InputSource {
       if (frame.id <= this.lastFrameId) return;
       this.lastFrameId = frame.id; this.received++;
       let observedAtMs = Math.min(this.clock.observe(frame.timestamp / 1e6, receivedAtMs), receivedAtMs);
-      if (receivedAtMs - observedAtMs > 1000) { this.clock.reset(); observedAtMs = receivedAtMs; }
+      // A service clock that stalls or runs slow would make frames look ever later; re-base rather than drop them.
+      if (receivedAtMs - observedAtMs > 200) { this.clock.reset(); observedAtMs = Math.min(this.clock.observe(frame.timestamp / 1e6, receivedAtMs), receivedAtMs); }
       const hands = leapFrameToHands(frame, this.box);
       const first = frame.hands[0];
       this.palmMm = first ? [first.palmPosition[0], first.palmPosition[1], first.palmPosition[2]] : null;

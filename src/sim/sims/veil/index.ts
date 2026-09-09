@@ -1,27 +1,45 @@
 /**
- * Veil — a sheer curtain hanging from the top of the frame, breathing in a
- * breeze from a dim window behind it. A hand touches, pushes and sweeps
- * through it; the fabric wraps around the hand and trails behind it.
+ * Veil — a sheer curtain hanging inside the volume, breathing in a breeze
+ * from a dim window on the back wall. The hand is a sphere at its 3D position:
+ * in front of the sheet it hovers without touching, at the sheet it presses
+ * and sweeps, and deeper than the sheet it passes through, the fabric wrapping
+ * around it and trailing behind; from behind, the backlight throws its soft
+ * silhouette onto the fabric.
  *
  * Physics: `cloth.ts` (CPU position-based dynamics, deterministic) driven by
- * `wind.ts` (curl-noise breeze with gusts). Rendering: an indexed triangle
- * mesh whose positions and normals are re-uploaded every frame, drawn with
- * premultiplied blending into a float scene target over a dark background,
- * then a small post pass (exposure, gamma, dither).
+ * `wind.ts` (curl-noise breeze with gusts), hands from `colliders.ts`.
+ * Rendering: the room — floor, back wall and window — is ray-cast in one
+ * full-screen pass; the sheet is an indexed mesh (positions and normals
+ * re-uploaded every frame) projected by the shared window camera and drawn
+ * with premultiplied blending into a float scene target; a small post pass
+ * applies exposure, gamma and dither.
  *
- * Coordinates: uniform units (canvas height = 1, width = aspect). z points
- * TOWARD THE VIEWER: the curtain rests at z = 0, the breeze billows it to +z,
- * and a hand — arriving from the viewer's side — sits in front of the sheet
- * when withdrawn (push = 0) and passes through to −z when pushed in.
+ * Coordinates. The volume is `[0, aspect] × [0, 1] × [0, depth]` in uniform
+ * units with z INTO the scene (`toWorld`, `windowCamera`); the floor is y = 0
+ * and the window sits on the back wall z = depth. The sheet hangs at the plane
+ * z = plane · depth (`plane` param) from a rod above the view. The cloth solver
+ * keeps its own frame — x and y as the volume, z measured from the resting
+ * plane TOWARD THE VIEWER, so the breeze from the window billows it to +z —
+ * and the conversion happens at exactly two boundaries: hands entering
+ * (`HandColliders`: cloth z = plane − world z, cloth vz = −world vz) and
+ * vertices leaving (`CLOTH_VS`: world z = plane − cloth z, normal z negated).
+ * The `depth` signal is reported in the volume's sense: positive = deeper.
+ *
+ * Sizing. The window camera shrinks things at depth z by eye / (eye + z), so
+ * the rod is (eye + z) / eye times as wide as the glass to fill the view at the
+ * sheet's depth and hangs just above the visible top there; the hem stops just
+ * above the floor. Moving the plane (or resizing) re-hangs the sheet and lets
+ * it settle before the signal baselines are retaken.
  */
 import { defineSimulation, type ParamSpecs, type ParamValues, type Quality } from '../../core/types';
-import { approach, clamp, clamp01 } from '../../core/math';
+import { approach, clamp, clamp01, smoothstep } from '../../core/math';
+import { DEFAULT_EYE, windowCamera } from '../../core/camera';
 import { defaultParams, hexToRgb } from '../../core/params';
 import { bindScreen, Fbo, pickFormat } from '../../gl/fbo';
 import { Program } from '../../gl/program';
 import { drawQuad, quadProgram } from '../../gl/quad';
-import { Cloth, type ClothStepParams } from './cloth';
-import { HandColliders } from './colliders';
+import { Cloth, MAX_COLLIDERS, type ClothStepParams } from './cloth';
+import { HandColliders, strengthEase } from './colliders';
 import { WindField } from './wind';
 import { BACKGROUND_FS, CLOTH_FS, CLOTH_VS, POST_FS } from './shaders';
 
@@ -33,12 +51,27 @@ const GRID: Record<Quality, GridSpec> = {
   high: { cols: 56, rows: 84, substeps: 2, iterations: 1 },
 };
 
-/** Rod slightly above the frame, hem just above the floor, side margins so the edges can swing. */
-const ROD_TOP = 1.03, ROD_MARGIN = .08, LENGTH = .99, GATHER = 1.22;
-/** Perspective: the camera sits at z = 1 / PERSPECTIVE_K in front of the canvas centre. */
-const PERSPECTIVE_K = .22;
-/** Settle steps (no hands) before the first frame, and after the rod moves on an aspect change. */
+/** The window camera's eye distance; the sheet is sized from it. */
+const EYE = DEFAULT_EYE;
+/** Rod: overhang past each side of the view at the sheet's depth (fraction of the visible width), height above the visible top there; hem height above the floor. */
+const ROD_MARGIN = -.02, ROD_ABOVE = .03, HEM = .015;
+/** Fabric width over rod span (>1 gathers it into folds), and the fold wavelength at the glass (scaled with depth). */
+const GATHER = 1.22, FOLD_WAVELENGTH = .21;
+/** How far behind the back wall the window's light sits (softens its falloff across the sheet). */
+const LIGHT_BEHIND = .3;
+/** Settle steps (no hands) before the first frame, and after the sheet is re-hung (aspect or plane change). */
 const PREROLL_STEPS = 45, RESETTLE_STEPS = 30;
+
+export interface SheetLayout { x0: number; x1: number; top: number; length: number; scale: number }
+/**
+ * Rod ends, rod height and fabric length for a sheet hanging at world depth `planeZ`, sized to fill the view
+ * there: the visible half-extents at that depth are the glass's times `scale = (eye + z) / eye`.
+ */
+export function layoutFor(aspect: number, planeZ: number): SheetLayout {
+  const scale = (EYE + planeZ) / EYE;
+  const cx = aspect * .5, hw = cx * scale * (1 - 2 * ROD_MARGIN), top = .5 + .5 * scale + ROD_ABOVE;
+  return { x0: cx - hw, x1: cx + hw, top, length: top - HEM, scale };
+}
 
 const PARAMS = {
   wind: { kind: 'number', default: .35, min: 0, max: 1, step: .01, label: 'Wind', description: 'Strength of the breeze through the window behind the curtain.' },
@@ -49,20 +82,20 @@ const PARAMS = {
   opacity: { kind: 'number', default: .2, min: .05, max: .9, step: .01, label: 'Opacity', description: 'Coverage of the sheet seen face-on. Folds seen edge-on are always denser.' },
   backlight: { kind: 'number', default: .7, min: 0, max: 1, step: .01, label: 'Backlight', description: 'Brightness of the warm light behind the curtain.' },
   tint: { kind: 'color', default: '#ffbf80', label: 'Tint', description: 'Colour of the backlight and therefore of the fabric.' },
-  reach: { kind: 'number', default: .4, min: .1, max: 1, step: .01, label: 'Reach', description: 'How far a full push carries the hand through the curtain, in uniform units (canvas height = 1).' },
+  plane: { kind: 'number', default: .45, min: .05, max: .95, step: .01, label: 'Plane', description: 'Depth at which the curtain hangs, as a fraction of the volume depth: 0 at the glass, 1 at the back wall. A hand nearer the glass hovers in front of the sheet; a deeper one passes through it.' },
   weave: { kind: 'number', default: .5, min: 0, max: 1, step: .01, label: 'Weave', description: 'Visibility of the fine thread texture.' },
 } satisfies ParamSpecs;
 
 export default defineSimulation({
   id: 'veil',
   title: 'Veil',
-  description: 'A sheer curtain moving in a breeze from a dim window behind it. The hand touches, pushes and sweeps through the fabric, which wraps around it and trails behind.',
+  description: 'A sheer curtain hanging in the volume, moving in a breeze from a dim window on the back wall. The hand hovers in front of the fabric, presses and sweeps it at its depth, and passes through it beyond, the fabric wrapping around it and trailing behind.',
   params: PARAMS,
   signals: {
     sway: { min: 0, max: 1, description: 'Mean lateral displacement of the fabric from its hanging position, normalised (0.12 units = 1).', smoothing: .2 },
     flutter: { min: 0, max: 1, description: 'Mean speed of the fabric, normalised (0.6 units/s = 1), lightly smoothed.', smoothing: .1 },
-    contact: { min: 0, max: 1, description: 'Share of the fabric within a hand\'s reach (surface + skin), normalised so one hand pressed into the sheet reads about 0.5 (30% of points = 1).', smoothing: .1 },
-    depth: { min: -1, max: 1, description: 'Mean depth of the fabric: positive billows toward the viewer, negative is pushed away (0.2 units = 1).', smoothing: .2 },
+    contact: { min: 0, max: 1, description: 'Share of the fabric touching a hand (on its surface or within a thin skin), normalised so one hand pressed into the sheet reads about 0.5.', smoothing: .1 },
+    depth: { min: -1, max: 1, description: 'Mean displacement of the fabric along the volume\'s depth from its hanging plane: negative billows toward the viewer, positive is pushed deeper (0.3 units = 1).', smoothing: .2 },
     gust: { min: 0, max: 1, description: 'Current gust envelope.', smoothing: .3 },
     tension: { min: 0, max: 1, description: 'Mean constraint strain above the resting level, normalised (6% = 1). Rises when a hand stretches the sheet.', smoothing: .1 },
   },
@@ -70,9 +103,14 @@ export default defineSimulation({
   create(ctx, initial?: ParamValues<typeof PARAMS>) {
     const gl = ctx.gl;
     const grid = GRID[ctx.quality];
+    const depth = ctx.depth;
     let aspect = ctx.aspect;
-    const folds = Math.max(4, Math.round((1 - 2 * ROD_MARGIN) * aspect / .21));
-    const cloth = new Cloth({ cols: grid.cols, rows: grid.rows, rodX0: ROD_MARGIN * aspect, rodX1: (1 - ROD_MARGIN) * aspect, top: ROD_TOP, length: LENGTH, gather: GATHER, folds, seed: 11 });
+    const first = initial ?? defaultParams(PARAMS);
+    let plane = first.plane, planeZ = plane * depth;
+    let layout = layoutFor(aspect, planeZ);
+    let camera = windowCamera(aspect, depth);
+    const folds = Math.max(4, Math.round((layout.x1 - layout.x0) / (FOLD_WAVELENGTH * layout.scale)));
+    const cloth = new Cloth({ cols: grid.cols, rows: grid.rows, rodX0: layout.x0, rodX1: layout.x1, top: layout.top, length: layout.length, gather: GATHER, folds, floor: 0, seed: 11 });
     const wind = new WindField({ cols: cloth.windCols, rows: cloth.windRows, seed: 7, stride: 2 });
     const clothParams: ClothStepParams = { gravity: 3, damping: 1, stiffness: .6, dragNormal: 3, dragTangent: .4, friction: .8, substeps: grid.substeps, iterations: grid.iterations };
     const applyParams = (p: { drape: number; damping: number; stiffness: number }) => {
@@ -83,6 +121,8 @@ export default defineSimulation({
 
     // Hands → sphere colliders that grow in on arrival and shrink out on departure (no snapping).
     const colliders = new HandColliders();
+    // The same spheres in world space for the shaders, and how far behind the sheet each one is (0 in front).
+    const handData = new Float32Array(MAX_COLLIDERS * 4), handAlpha = new Float32Array(MAX_COLLIDERS);
 
     // Interpolation state for rendering between fixed steps.
     const n = cloth.count;
@@ -114,8 +154,9 @@ export default defineSimulation({
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
 
     // Signal baselines: the resting sheet's own fold offset and constraint strain, so `sway` and `tension`
-    // read zero when nothing is happening. Recaptured whenever the rod moves.
-    let swayBase = 0, strainBase = 0;
+    // read zero when nothing is happening. Recaptured whenever the sheet is re-hung. `contactNorm` keeps
+    // "one hand pressed in ≈ 0.5" true whatever the sheet's size (a deeper sheet is larger, the hand is not).
+    let swayBase = 0, strainBase = 0, contactNorm = .3;
     /**
      * Run the sheet with no hands (the current wind is fine: its effect on the baselines is negligible) until it
      * has settled, then take the baselines and put the render history on the settled positions so the next
@@ -124,11 +165,18 @@ export default defineSimulation({
     const settle = (steps: number) => {
       for (let i = 0; i < steps; i++) cloth.step(1 / 60, clothParams, colliders.data, 0);
       swayBase = cloth.meanAbsDx; strainBase = cloth.meanStrain * .9;
+      contactNorm = .3 / (layout.scale * layout.scale);
       renderPrev.set(cloth.pos); renderPos.set(cloth.pos);
+    };
+    /** Re-hang the sheet for the current aspect and plane, then settle it and retake the baselines. */
+    const rehang = () => {
+      layout = layoutFor(aspect, planeZ);
+      cloth.setExtent(layout.x0, layout.x1, layout.top, layout.length);
+      settle(RESETTLE_STEPS);
     };
 
     // --- settle the seeded folds before the first frame (still air, no hands)
-    applyParams(initial ?? defaultParams(PARAMS));
+    applyParams(first);
     settle(PREROLL_STEPS);
 
     const signalValues = { sway: 0, flutter: 0, contact: 0, depth: 0, gust: 0, tension: 0 };
@@ -137,21 +185,24 @@ export default defineSimulation({
     return {
       step(input, params) {
         applyParams(params);
-        colliders.update(input.hands, input.dt, aspect, params.reach);
+        if (params.plane !== plane) { plane = params.plane; planeZ = plane * depth; rehang(); }
+        colliders.update(input.hands, input.dt, aspect, depth, planeZ);
         // A quiet room stays a little calmer; a busy hand stirs the air.
-        const changed = wind.update({ time: input.time, dt: input.dt, wind: params.wind * (.85 + .15 * input.presence), gustiness: params.gustiness, turbulence: .5 * input.activity, x0: cloth.rodX0, x1: cloth.rodX1, top: ROD_TOP, length: LENGTH });
+        const changed = wind.update({ time: input.time, dt: input.dt, wind: params.wind * (.85 + .15 * input.presence), gustiness: params.gustiness, turbulence: .5 * input.activity, x0: cloth.rodX0, x1: cloth.rodX1, top: cloth.top, length: cloth.length });
         if (changed) cloth.wind.set(wind.data);
         renderPrev.set(cloth.pos);
         cloth.step(input.dt, clothParams, colliders.data, colliders.count);
         flutter = approach(flutter, clamp01(cloth.meanSpeed / .6), input.dt, .12);
         signalValues.sway = clamp01(Math.max(0, cloth.meanAbsDx - swayBase) / .12);
         signalValues.flutter = flutter;
-        signalValues.contact = clamp01(cloth.contactFraction / .3);
-        signalValues.depth = clamp(cloth.meanZ / .2, -1, 1);
+        signalValues.contact = clamp01(cloth.contactFraction / contactNorm);
+        // The cloth measures z toward the viewer; the volume's z runs the other way.
+        signalValues.depth = clamp(-cloth.meanZ / .3, -1, 1);
         signalValues.gust = clamp01(wind.gust);
         signalValues.tension = clamp01(Math.max(0, cloth.meanStrain - strainBase) / .06);
       },
       render(frame, params) {
+        if (frame.aspect !== camera.aspect) camera = windowCamera(frame.aspect, depth);
         // Interpolate between the last two physics states, rebuild normals, upload.
         const a = frame.alpha, pos = cloth.pos;
         for (let i = 0; i < n * 3; i++) renderPos[i] = renderPrev[i] + (pos[i] - renderPrev[i]) * a;
@@ -160,20 +211,36 @@ export default defineSimulation({
         gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
         gl.bufferSubData(gl.ARRAY_BUFFER, 0, vertexData);
         gl.bindBuffer(gl.ARRAY_BUFFER, null);
+        // Hands as world-space spheres (the eased radius the cloth actually uses). A hand becomes a silhouette
+        // in the room pass as its sphere crosses the plane; in front of the sheet it is not drawn at all.
+        let handCount = 0;
+        for (const c of colliders.list) {
+          const r = c.r * strengthEase(c.strength);
+          if (r < 1e-3 || handCount >= MAX_COLLIDERS) continue;
+          handData.set([c.x, c.y, planeZ - c.z, r], handCount * 4);
+          handAlpha[handCount] = smoothstep(-r, 0, -c.z);
+          handCount++;
+        }
 
         const [tr, tg, tb] = hexToRgb(params.tint);
         const cx = aspect * .5;
-        // 1. background into the scene target
+        // The window on the back wall, sized from the wall's visible extent so it reads alike at any volume depth.
+        const wallScale = (EYE + depth) / EYE, wallHalfH = .5 * wallScale;
+        const wx = cx, wy = .5 + .12 * wallHalfH, ww = .38 * cx * wallScale, wh = .44 * wallHalfH;
+        // 1. the room (and the hands behind the sheet) into the scene target
         scene.bind();
         gl.disable(gl.BLEND); gl.disable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
-        background.use().f1('u_aspect', aspect).f3('u_tint', tr, tg, tb).f1('u_backlight', params.backlight).f4('u_window', cx, .56, .27 * aspect, .3);
+        background.use().f1('u_aspect', aspect).f1('u_depth', depth).f1('u_eye', EYE).f1('u_plane', planeZ)
+          .f3('u_tint', tr, tg, tb).f1('u_backlight', params.backlight).f4('u_window', wx, wy, ww, wh)
+          .i1('u_handCount', handCount).f4v('u_hands', handData).f1v('u_handAlpha', handAlpha);
         drawQuad(gl);
         // 2. the sheet, both faces, premultiplied over
         gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-        clothProgram.use().f1('u_aspect', aspect).f1('u_k', PERSPECTIVE_K)
+        clothProgram.use().matrix4('u_matrix', camera.matrix).f1('u_plane', planeZ)
           .f1('u_opacity', params.opacity).f1('u_backlight', params.backlight).f1('u_weave', params.weave)
-          .f3('u_tint', tr, tg, tb).f3('u_cam', cx, .5, 1 / PERSPECTIVE_K).f3('u_light', cx, .62, -.9)
-          .f2('u_threads', 340, 230).f2('u_fade', 1.5 / (cloth.cols - 1), 1.5 / (cloth.rows - 1));
+          .f3('u_tint', tr, tg, tb).f3('u_cam', cx, .5, -EYE).f3('u_light', wx, wy, depth + LIGHT_BEHIND)
+          .f2('u_threads', 340, 230).f2('u_fade', 1.5 / (cloth.cols - 1), 1.5 / (cloth.rows - 1))
+          .i1('u_handCount', handCount).f4v('u_hands', handData);
         gl.bindVertexArray(vao);
         gl.drawElements(gl.TRIANGLES, cloth.indices.length, gl.UNSIGNED_SHORT, 0);
         gl.bindVertexArray(null);
@@ -192,8 +259,8 @@ export default defineSimulation({
           // The rod follows the frame; the sheet reflows with it and settles before the baselines are retaken,
           // otherwise `tension` pegs for a second and `sway` keeps a permanent offset.
           aspect = next;
-          cloth.setExtent(ROD_MARGIN * aspect, (1 - ROD_MARGIN) * aspect);
-          settle(RESETTLE_STEPS);
+          camera = windowCamera(aspect, depth);
+          rehang();
         }
       },
       dispose() {

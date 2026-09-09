@@ -8,14 +8,18 @@
  * host can build UI, validate values, and publish a machine-readable schema
  * without knowing anything about the simulation internals.
  *
- * Sim space:
+ * Sim space is a VOLUME, and hands live in it:
  *   x in [0, 1]  left → right as seen by the viewer, spanning the full canvas width
  *   y in [0, 1]  bottom → top, spanning the full canvas height
- *   z in [0, 1]  0 = withdrawn / far from the display, 1 = pushed in / near
+ *   z in [0, 1]  depth INTO the scene: 0 = at the glass (nearest the viewer), 1 = the back wall
  *
- * Because x and y span the full canvas independently, a simulation that needs
- * uniform units (circles that look round) must divide by `aspect`; use
- * `toUniform` from `math.ts`.
+ * In uniform units (canvas height = 1) the volume is `[0, aspect] × [0, 1] × [0, depth]`
+ * (`toUniform3` in math.ts); `depth` comes from the host settings. The display is the
+ * front face, a window into the volume: `windowCamera` in camera.ts is the shared
+ * perspective camera whose frustum passes exactly through that face, so a point at
+ * z = 0 lands where a 2D drawing would and deeper points shrink toward the centre.
+ * A simulation may use any camera it likes (top-down for a bowl on a table, say);
+ * the hand's x, y, z are world coordinates either way.
  */
 import type { HandState } from '../input/types';
 import type { GestureEvent } from '../input/gestures';
@@ -110,6 +114,8 @@ export interface SimContext {
   height: number;
   /** width / height. Kept current like width/height. */
   aspect: number;
+  /** Depth of the volume in uniform units (canvas height = 1). Constant for the life of the instance. */
+  depth: number;
   dpr: number;
   quality: Quality;
   capabilities: GlCapabilities;
@@ -125,6 +131,8 @@ export interface RenderFrame {
   width: number;
   height: number;
   aspect: number;
+  /** Volume depth in uniform units, same as `SimContext.depth`. */
+  depth: number;
 }
 
 export interface SimulationInstance<P extends ParamSpecs = ParamSpecs, S extends SignalSpecs = SignalSpecs> {

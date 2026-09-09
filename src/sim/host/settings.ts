@@ -21,6 +21,8 @@ export const settingsSchema = z.object({
   quality: z.enum(['low', 'medium', 'high']).default('medium'),
   /** Device pixel ratio cap. 1.0 is plenty for a projector; retina laptops render 4× the pixels at 2.0. */
   maxDpr: z.number().min(.5).max(3).default(1.25),
+  /** Depth of the simulation volume in uniform units (canvas height = 1). */
+  volumeDepth: z.number().min(.25).max(3).default(1),
   overlay: z.boolean().default(true),
   mappings: z.record(sourceId, spaceMappingSchema).default({}),
   params: z.record(z.string(), z.record(z.string(), z.union([z.number(), z.boolean(), z.string()]))).default({}),
@@ -75,6 +77,7 @@ export function applyUrlOverrides(settings: Settings, search: string): Settings 
   const bridge = q.get('bridge'); if (bridge) next.depth.url = bridge;
   const leap = q.get('leap'); if (leap) next.leap.url = leap;
   const dpr = Number(q.get('dpr')); if (Number.isFinite(dpr) && dpr > 0) next.maxDpr = Math.min(3, Math.max(.5, dpr));
+  const depth = Number(q.get('depth')); if (Number.isFinite(depth) && depth > 0) next.volumeDepth = Math.min(3, Math.max(.25, depth));
   const rate = Number(q.get('rate')); if (Number.isFinite(rate) && rate > 0) next.telemetry.rateHz = Math.min(120, Math.max(1, rate));
   return next;
 }

@@ -3,6 +3,12 @@
  * in uv/s), a 16×16 probe, and the composite. Signed quantities go through
  * `readV/packV` (vec2) and `readS/packS` (float) so an RGBA8 fallback still
  * runs: with PACKED defined they are offset-encoded around 128/255.
+ *
+ * The grid is the water plane seen from above: grid x is world x, grid y is
+ * world z (the glass edge at the bottom of the screen). Hands reach the fluid
+ * only through their footprint on the water and a grip that is 0 above the
+ * surface; the composite draws each hand's shadow on the floor and, once it
+ * touches, a meniscus ring at its waterline.
  */
 import { GLSL_HEADER } from '../../gl/program';
 import { CAUSTIC_LACUNARITY, CAUSTIC_PERIOD, PACKED_VELOCITY_SCALE, PROBE_ENC, PROBE_SIZE, PROBE_SUB } from './model';
@@ -33,7 +39,8 @@ vec4 packS(float x) { return vec4(x, 0.0, 0.0, 1.0); }
 `;
 
 /**
- * Advect velocity (semi-Lagrangian), dissipate, then add hand drag, radial presses, drop impulses and a slow drift.
+ * Advect velocity (semi-Lagrangian), dissipate, then add hand drag, downward presses, drop impulses and a slow drift.
+ * A hand's grip (`u_handMeta.w`) is 0 above the water, so a hovering hand leaves the water alone entirely.
  * `u_driftPhase` holds the four drift phases in cycles, already reduced modulo 1 (see model.ts `driftPhases`).
  */
 export const advectVelocity = (packed: boolean) => `${prelude(packed)}
@@ -41,8 +48,8 @@ uniform sampler2D u_velocity;
 uniform float u_dt, u_decay, u_decayFloor, u_drift, u_couple;
 uniform vec4 u_driftPhase;
 uniform int u_handCount;
-uniform vec4 u_hands[${MAX_HANDS}];     // x, y, vx, vy (grid uv, uv/s)
-uniform vec4 u_handMeta[${MAX_HANDS}];  // radius, coupling, radial press (uv/s²), 0
+uniform vec4 u_hands[${MAX_HANDS}];     // x, y, vx, vy (grid uv, uv/s) on the water plane
+uniform vec4 u_handMeta[${MAX_HANDS}];  // footprint radius, velocity gain, radial press (uv/s²), grip 0..1 (0 above the surface)
 uniform int u_dropCount;
 uniform vec4 u_drops[${MAX_DROPS}];     // x, y, radius, impulse (uv/s)
 void main() {
@@ -63,9 +70,9 @@ void main() {
     vec2 d = uv - h.xy;
     float q = dot(d, d) / (m.x * m.x);
     float g = exp(-q * 2.0);
-    // The water under the hand relaxes toward the hand's velocity (bounded, stable).
-    v += (h.zw * m.y - v) * g * u_couple;
-    // Pressing in pushes water outward in a ring around the hand.
+    // The water under the hand relaxes toward the hand's velocity (bounded, stable), as hard as the hand grips it.
+    v += (h.zw * m.y - v) * g * u_couple * m.w;
+    // Pressing down in the water pushes it outward in a ring around the hand.
     float len = length(d) + 1e-5;
     v += (d / len) * m.z * exp(-q * 1.2) * min(sqrt(q), 1.0) * u_dt;
   }
@@ -199,8 +206,11 @@ void main() {
 /**
  * Composite: dark water over a shadowed bowl floor with faint caustics, ink
  * from the dye field, a fake surface normal (ink density + vortex dimples)
- * that catches the reflection of a window, a meniscus at the wall, and a thin
- * ceramic lip outside. Runs once at canvas resolution.
+ * that catches the reflection of a window, a meniscus at the wall, a thin
+ * ceramic lip outside, and the hands: a shadow on the floor for each (soft
+ * and displaced when the hand is high, crisp and dark when it is down or in
+ * the water, with the forearm trailing toward the glass edge) and a bright
+ * meniscus ring where a hand breaks the surface. Runs once at canvas resolution.
  */
 export const composite = (packed: boolean) => `${prelude(packed)}
 uniform sampler2D u_dye, u_velocity, u_pressure;
@@ -209,6 +219,9 @@ uniform float u_aspect, u_domain, u_light, u_caustics, u_presence;
 // Caustic scroll offsets in lattice units, each in [0, HASH_PERIOD): layer a in xy, layer b in zw;
 // u_caustT for the first value-noise octave, u_caustT2 for the second (see model.ts causticOffsets).
 uniform vec4 u_caustT, u_caustT2;
+uniform int u_shadowCount;
+uniform vec4 u_shadows[${MAX_HANDS}];     // x, y (grid uv), full hand radius (uv), clearance of the underside above the surface (uniform units; ≤ 0 touching)
+uniform vec4 u_shadowMeta[${MAX_HANDS}];  // immersion 0..1, opacity 0..1 (fades after the hand leaves), waterline radius (uv), unused
 
 // The lattice hash is periodic so the scroll offsets can wrap without a seam, and so fp32 never
 // sees a large lattice coordinate (a raw, unbounded time coarsened the web after a few hours).
@@ -236,6 +249,41 @@ void main() {
   float px = u_pixel.y / u_domain;
   float inside = 1.0 - smoothstep(R - px, R + px, d);
 
+  // A camera above the bowl; a window up and to the left whose reflection lands inside the bowl.
+  vec3 Ld = normalize(vec3(-0.16, 0.21, 0.96));
+  vec2 L2 = normalize(Ld.xy);
+
+  // Hands over the water. Each casts a shadow on the floor that sharpens, darkens and slides in under
+  // the hand as it comes down (the window is up and to the left, so a raised hand's shadow falls down
+  // and to the right), with the forearm trailing back toward the glass edge at the bottom of the
+  // screen. Once a hand breaks the surface: a bright meniscus ring at its waterline, and the surface
+  // climbing the hand around it so the window reflection catches there.
+  float shade = 1.0, ringLit = 0.0, ringBand = 0.0;
+  vec2 ringTilt = vec2(0.0);
+  for (int i = 0; i < ${MAX_HANDS}; i++) {
+    if (i >= u_shadowCount) break;
+    vec4 s = u_shadows[i]; vec4 sm = u_shadowMeta[i];
+    float h = max(s.w, 0.0);
+    vec2 c = s.xy + vec2(0.167, -0.219) * (h / u_domain);
+    vec2 hr = g - c;
+    // The floor is nearly black, so the shadow stays fairly dark even when the hand is high; its
+    // softness and displacement are what read as height.
+    float core = s.z * 0.85, pen = 0.012 + h * 0.35;
+    float disc = 1.0 - smoothstep(core, core + pen, length(hr));
+    float len = s.z * 2.4;
+    float t = clamp(-hr.y / len, 0.0, 1.0);
+    float arm = (1.0 - smoothstep(core * 0.7, core * 0.7 + pen, length(hr + vec2(0.0, t * len)))) * (1.0 - t) * 0.7;
+    float dark = (0.45 + 0.2 / (1.0 + h * 4.0)) * sm.y;
+    shade *= 1.0 - dark * max(disc, arm);
+    vec2 wr = g - s.xy;
+    float wd = length(wr), dr = wd - sm.z;
+    float wet = smoothstep(0.0, 0.06, sm.x) * sm.y;
+    vec2 wdir = wr / max(wd, 1e-5);
+    ringLit += exp(-dr * dr / (0.006 * 0.006)) * wet * (0.06 + 0.94 * max(0.0, dot(wdir, L2)));
+    float band = exp(-dr * dr / (0.012 * 0.012)) * wet;
+    ringBand += band; ringTilt += wdir * band;
+  }
+
   // Dye: centre plus a cross two dye texels out (halo and a smooth gradient).
   vec2 t = u_dyeTexel;
   vec3 dC = texture(u_dye, g).rgb;
@@ -254,11 +302,9 @@ void main() {
   vec3 n = normalize(vec3(-grad, 1.0));
   float men = smoothstep(R - 0.028, R, d);
   n = normalize(mix(n, vec3(dir * 0.9, 0.42), men));
+  n = normalize(mix(n, vec3(ringTilt * 0.9, 0.45), min(ringBand, 1.0)));
 
-  // A camera above the bowl; a window up and to the left whose reflection lands inside the bowl.
   vec3 V = normalize(vec3(-rel * 1.2, 1.0));
-  vec3 Ld = normalize(vec3(-0.16, 0.21, 0.96));
-  vec2 L2 = normalize(Ld.xy);
   vec3 rr = reflect(-V, n);
   float ndv = max(dot(n, V), 0.0);
   float fres = 0.03 + 0.97 * pow(1.0 - ndv, 5.0);
@@ -283,15 +329,16 @@ void main() {
   vec3 inkCol = ink * 0.75 + halo * 0.12;
   float shadow = 1.0 - 0.8 * (1.0 - exp(-hC * 3.0));
 
-  // Floor and water.
+  // Floor and water; the hands' shadows fall on everything lit from above.
   float wall = exp(-(R - d) / 0.035);
   vec3 floorCol = vec3(0.007, 0.013, 0.022) * (1.0 - 0.3 * smoothstep(0.0, R, d));
   floorCol += vec3(0.30, 0.50, 0.60) * caustic * 0.06;
   floorCol *= shadow;
-  vec3 water = (floorCol + inkCol) * (1.0 - 0.8 * wall);
+  vec3 water = (floorCol + inkCol) * (1.0 - 0.8 * wall) * shade;
   vec3 bowlCol = water * (1.0 - fres) + reflected;
-  // Glints where ink filaments ripple the surface.
+  // Glints where ink filaments ripple the surface, and the waterline rings around the hands.
   bowlCol += vec3(0.95, 0.97, 1.0) * core * u_light * 0.2 * min(hC * 2.0, 1.0);
+  bowlCol += vec3(0.85, 0.9, 1.0) * ringLit * 0.35 * u_light;
 
   // Outside: a dark table, a soft shadow hugging the bowl, and a thin lit ceramic lip.
   float lipDist = d - R;
@@ -300,7 +347,7 @@ void main() {
   vec3 lipCol = vec3(0.22, 0.21, 0.20) * lipLight * lip;
   float ao = 1.0 - 0.7 * exp(-max(lipDist, 0.0) / 0.04);
   vec3 table = vec3(0.016, 0.015, 0.017) * ao * (0.75 + 0.25 * dot(dir, L2));
-  vec3 outside = table + lipCol;
+  vec3 outside = (table + lipCol) * mix(1.0, shade, 0.6);
 
   vec3 col = mix(outside, bowlCol, inside);
   vec2 q = v_uv - 0.5; q.x *= u_aspect;

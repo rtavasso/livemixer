@@ -33,6 +33,8 @@ export class Overlay {
   private status = el('div', { class: 'status' }); private hands = el('div'); private events = el('div', { class: 'events' });
   private presence = el('span'); private activity = el('span');
   private minimap = el('canvas', { class: 'minimap', width: 320, height: 180 });
+  /** Top-down view of the volume: x across, z (depth into the scene) upward. */
+  private topmap = el('canvas', { class: 'minimap topmap', width: 320, height: 70 });
   private fps = el('div', { class: 'fps' }); private warnings = el('div', { class: 'warnings' });
   private telemetryStatus = el('div', { class: 'status' }); private lastFrame = el('pre'); private showFrame = false;
   private mappingBox = el('div'); private calibrationStatus = el('div', { class: 'status' });
@@ -80,7 +82,7 @@ export class Overlay {
       el('div', { class: 'row' }, el('button', { onclick: () => this.host.toggleFullscreen() }, 'Fullscreen'), el('button', { onclick: () => { this.visible = false; } }, 'Hide overlay')),
       el('details', { open: true }, el('summary', {}, el('h2', {}, 'Simulation')), el('div', { class: 'row' }, el('label', {}, this.simSelect)), this.paramsBox),
       el('details', { open: true }, el('summary', {}, el('h2', {}, 'Input'), el('span', { class: 'badge' }, this.presence, ' · ', this.activity)),
-        el('div', { class: 'row' }, el('label', {}, this.sourceSelect)), this.status, this.sourceBox, this.minimap, this.hands, this.events),
+        el('div', { class: 'row' }, el('label', {}, this.sourceSelect)), this.status, this.sourceBox, this.minimap, this.topmap, this.hands, this.events),
       el('details', {}, el('summary', {}, el('h2', {}, 'Mapping & calibration')), this.mappingBox, this.calibrationStatus),
       el('details', { open: true }, el('summary', {}, el('h2', {}, 'Signals → audio')), this.signalsBox),
       el('details', {}, el('summary', {}, el('h2', {}, 'Telemetry')), this.telemetrySection(), this.telemetryStatus, this.lastFrame),
@@ -260,10 +262,13 @@ export class Overlay {
     quality.addEventListener('change', () => this.host.setQuality(quality.value as 'low' | 'medium' | 'high'));
     const dpr = el('select'); for (const d of ['1', '1.25', '1.5', '2']) dpr.appendChild(el('option', { value: d }, `${d}×`)); dpr.value = String(settings.maxDpr);
     dpr.addEventListener('change', () => this.host.setMaxDpr(Number(dpr.value)));
+    const depth = el('input', { type: 'number', min: .25, max: 3, step: .05, value: settings.volumeDepth });
+    depth.addEventListener('change', () => this.host.setVolumeDepth(Number(depth.value)));
     const tracker = this.host.tracker.settings;
     const num = (key: 'enterMs' | 'leaveMs' | 'minCutoff' | 'beta', step: number) => { const i = el('input', { type: 'number', step, value: tracker[key] }); i.addEventListener('change', () => this.host.setTrackerSettings({ [key]: Number(i.value) })); return el('label', {}, key, i); };
     return el('div', {},
-      el('div', { class: 'row' }, el('label', {}, 'Quality', quality), el('label', {}, 'Max pixel ratio', dpr)),
+      el('div', { class: 'row' }, el('label', {}, 'Quality', quality), el('label', {}, 'Max pixel ratio', dpr), el('label', {}, 'Volume depth', depth)),
+      el('p', { class: 'hint' }, 'Volume depth is the z size of the 3D space in units of the canvas height; hands live inside it.'),
       el('div', { class: 'row' }, num('enterMs', 10), num('leaveMs', 10), num('minCutoff', .1), num('beta', .005)),
       el('p', { class: 'hint' }, 'enter/leave: presence hysteresis. minCutoff lower = calmer at rest; beta higher = less lag when moving.'),
     );
@@ -310,11 +315,23 @@ export class Overlay {
     }
     ctx.strokeStyle = '#2c342f'; ctx.strokeRect(.5, .5, w - 1, h - 1);
     for (const hand of s.tracked.hands) {
-      const x = hand.position.x * w, y = (1 - hand.position.y) * h;
+      // Front view: nearer hands (z → 0) draw larger, as the window camera would show them.
+      const x = hand.position.x * w, y = (1 - hand.position.y) * h, size = 4 + 10 * (1 - hand.position.z);
       ctx.strokeStyle = 'rgba(185, 236, 128, .5)'; ctx.strokeRect(hand.extent.min.x * w, (1 - hand.extent.max.y) * h, (hand.extent.max.x - hand.extent.min.x) * w, (hand.extent.max.y - hand.extent.min.y) * h);
-      ctx.beginPath(); ctx.arc(x, y, 4 + 10 * hand.push, 0, Math.PI * 2); ctx.fillStyle = `rgba(185, 236, 128, ${.4 + .6 * hand.openness})`; ctx.fill();
+      ctx.beginPath(); ctx.arc(x, y, size, 0, Math.PI * 2); ctx.fillStyle = `rgba(185, 236, 128, ${.4 + .6 * hand.openness})`; ctx.fill();
       ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + hand.velocity.x * w * .25, y - hand.velocity.y * h * .25); ctx.strokeStyle = '#e5e9e4'; ctx.stroke();
       ctx.fillStyle = '#9aa79e'; ctx.fillText(`#${hand.id}`, x + 8, y - 8);
+    }
+    // Top view: x across, depth upward (the glass at the bottom edge, the back wall at the top).
+    const t = this.topmap, tc = t.getContext('2d');
+    if (!tc) return;
+    tc.fillStyle = '#070908'; tc.fillRect(0, 0, t.width, t.height);
+    tc.strokeStyle = '#2c342f'; tc.strokeRect(.5, .5, t.width - 1, t.height - 1);
+    tc.fillStyle = '#4a5a4c'; tc.fillText('glass', 4, t.height - 4); tc.fillText('back', 4, 10);
+    for (const hand of s.tracked.hands) {
+      const x = hand.position.x * t.width, y = (1 - hand.position.z) * t.height;
+      tc.beginPath(); tc.arc(x, y, 4, 0, Math.PI * 2); tc.fillStyle = `rgba(185, 236, 128, ${.4 + .6 * hand.openness})`; tc.fill();
+      tc.beginPath(); tc.moveTo(x, y); tc.lineTo(x + hand.velocity.x * t.width * .25, y - hand.velocity.z * t.height * .25); tc.strokeStyle = '#e5e9e4'; tc.stroke();
     }
   }
 }

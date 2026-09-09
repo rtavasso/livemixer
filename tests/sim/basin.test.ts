@@ -1,49 +1,64 @@
 import { describe, expect, it } from 'vitest';
 import type { HandState } from '../../src/sim/input/types';
-import type { GestureEvent } from '../../src/sim/input/gestures';
 import {
-  CAUSTIC_LACUNARITY, CAUSTIC_PERIOD, CAUSTIC_RATES, DEFAULT_PALETTE, DRIFT_RATES, DropScheduler, PACKED_DECAY_STRIDE, PACKED_FADE_STRIDE,
-  PACKED_MIN_STEP, PACKED_VELOCITY_SCALE, PALETTES, PALETTE_NAMES, PROBE_ENC, PROBE_SIZE, PROBE_SUB, SignalSmoother,
+  CAUSTIC_LACUNARITY, CAUSTIC_PERIOD, CAUSTIC_RATES, DEFAULT_PALETTE, DRIFT_RATES, DropScheduler, HAND_HALF_HEIGHT_MAX, HAND_HALF_HEIGHT_MIN,
+  PACKED_DECAY_STRIDE, PACKED_FADE_STRIDE, PACKED_MIN_STEP, PACKED_VELOCITY_SCALE, PALETTES, PALETTE_NAMES, PLUNGE_COOLDOWN, PLUNGE_FULL, PLUNGE_SPEED,
+  PROBE_ENC, PROBE_SIZE, PROBE_SUB, SignalSmoother, WET_BAND,
   bowlDistance, causticOffsets, clampToBowl, decodeProbe, decodeSigned, decodeUnsigned, dissipation, dissipationFloor, domainScale, driftPhases,
-  encodeSigned, encodeUnsigned, handToGrid, insideBowl, measuresToSignals, probeWeights, resolvePalette, simToGrid, simVelocityToGrid, wrap,
+  emptyGridHand, encodeSigned, encodeUnsigned, footprint, handClearance, handHalfHeight, handImmersion, handToGrid, immersionSignal, insideBowl,
+  measuresToSignals, plungeImpulse, probeWeights, resolvePalette, simToGrid, simVelocityToGrid, stirStrength, wrap,
 } from '../../src/sim/sims/basin/model';
 import { advectVelocity, composite } from '../../src/sim/sims/basin/shaders';
 
-const hand = (id: number, x: number, y: number, push = .3, extra: Partial<HandState> = {}): HandState => ({
-  id, position: { x, y, z: push }, velocity: { x: 0, y: 0, z: 0 }, speed: 0,
-  extent: { min: { x: x - .04, y: y - .06, z: push }, max: { x: x + .04, y: y + .06, z: push } },
-  radius: .06, openness: 1, pinch: 0, confidence: 1, ageMs: 100, staleMs: 0, push, points: [], ...extra,
+const SURFACE = .35;
+/** A hand in the volume: x left→right, z depth (the water plane's second axis), y its HEIGHT. The body is 0.12 tall. */
+const hand = (id: number, x: number, z: number, y = .6, extra: Partial<HandState> = {}): HandState => ({
+  id, position: { x, y, z }, velocity: { x: 0, y: 0, z: 0 }, speed: 0,
+  extent: { min: { x: x - .04, y: y - .06, z }, max: { x: x + .04, y: y + .06, z } },
+  radius: .06, openness: 1, pinch: 0, confidence: 1, ageMs: 100, staleMs: 0, push: z, points: [], ...extra,
 });
-const enter = (handId: number, x: number, y: number): GestureEvent => ({ type: 'enter', handId, atMs: 0, position: { x, y, z: .3 } });
-const push = (handId: number, x: number, y: number, depth = .9): GestureEvent => ({ type: 'push', handId, atMs: 0, position: { x, y, z: depth }, depth });
+/** The same hand moving vertically at `vy` (uniform units/s; negative = coming down). */
+const falling = (id: number, x: number, z: number, y: number, vy: number) => hand(id, x, z, y, { velocity: { x: 0, y: vy, z: 0 } });
 
 describe('basin geometry', () => {
-  it('maps sim space onto a centred square grid in uniform units', () => {
+  it('maps the water plane (sim x, sim z) onto a centred square grid in uniform units', () => {
     expect(domainScale(16 / 9)).toBe(1);
     expect(domainScale(.5)).toBe(.5);
-    const c = simToGrid({ x: .5, y: .5 }, 16 / 9);
+    const c = simToGrid({ x: .5, z: .5 }, 16 / 9);
     expect(c.x).toBeCloseTo(.5, 9); expect(c.y).toBeCloseTo(.5, 9);
-    // Landscape: the grid spans one canvas height horizontally, centred.
-    const right = simToGrid({ x: 1, y: 0 }, 2);
+    // Landscape: the grid spans one canvas height horizontally, centred; depth z runs up the screen.
+    const right = simToGrid({ x: 1, z: 0 }, 2);
     expect(right.x).toBeCloseTo(1.5, 9); expect(right.y).toBeCloseTo(0, 9);
+    expect(simToGrid({ x: .5, z: 1 }, 2).y).toBeCloseTo(1, 9);   // the far edge of the table is the top of the screen
     // Portrait: the domain shrinks to the width so the bowl still fits.
-    const p = simToGrid({ x: 1, y: 1 }, .5);
+    const p = simToGrid({ x: 1, z: 1 }, .5);
     expect(p.x).toBeCloseTo(1, 9); expect(p.y).toBeCloseTo(1.5, 9);
-    const v = simVelocityToGrid({ x: 1, y: 1 }, 2);
+    const v = simVelocityToGrid({ x: 1, z: 1 }, 2);
     expect(v.x).toBeCloseTo(2, 9); expect(v.y).toBeCloseTo(1, 9);
+    // The hand's height never reaches the plane mapping.
+    expect(simToGrid({ x: .5, y: .9, z: .5 } as never, 1)).toEqual(simToGrid({ x: .5, y: .1, z: .5 } as never, 1));
   });
-  it('converts hands with a clamped splat radius and clamped push', () => {
-    const h = handToGrid(hand(1, .5, .5, 1.4, { radius: 5, velocity: { x: .5, y: -.25, z: 0 } }), 16 / 9);
-    expect(h.radius).toBe(.16); expect(h.push).toBe(1);
-    expect(h.vx).toBeCloseTo(.5 * 16 / 9, 9); expect(h.vy).toBeCloseTo(-.25, 9);
-    expect(handToGrid(hand(1, .5, .5, .2, { radius: .001 }), 1).radius).toBe(.035);
-    // Agrees with the point/velocity mappings and writes into a caller-owned record when given.
-    const src = hand(2, .8, .3, .5, { velocity: { x: .2, y: .1, z: 0 } });
-    const out = { x: 0, y: 0, vx: 0, vy: 0, radius: 0, push: 0 };
-    expect(handToGrid(src, .5, out)).toBe(out);
-    const p = simToGrid(src.position, .5), v = simVelocityToGrid(src.velocity, .5);
-    expect(out.x).toBeCloseTo(p.x, 12); expect(out.y).toBeCloseTo(p.y, 12); expect(out.vx).toBeCloseTo(v.x, 12); expect(out.vy).toBeCloseTo(v.y, 12);
-    expect(out).toEqual(handToGrid(src, .5));
+  it('converts hands: plane from x/z, footprint from the immersion, clamped splat radii', () => {
+    const src = hand(1, .8, .3, .6, { velocity: { x: .2, y: -.3, z: .1 } });
+    const h = handToGrid(src, 16 / 9, SURFACE);
+    const p = simToGrid(src.position, 16 / 9), v = simVelocityToGrid(src.velocity, 16 / 9);
+    expect(h.x).toBeCloseTo(p.x, 12); expect(h.y).toBeCloseTo(p.y, 12); expect(h.vx).toBeCloseTo(v.x, 12); expect(h.vy).toBeCloseTo(v.y, 12);
+    expect(h.descent).toBeCloseTo(.3, 12);
+    expect(handToGrid(hand(1, .5, .5, .6, { velocity: { x: 0, y: .4, z: 0 } }), 1, SURFACE).descent).toBe(0);   // rising: no descent
+    // Above the water: no immersion, positive clearance, the smallest splat (nothing touches the water) but a full-size shadow.
+    expect(h.immersion).toBe(0); expect(h.clearance).toBeCloseTo(.6 - .06 - SURFACE, 12);
+    expect(h.extent).toBeCloseTo(.06 * 16 / 9 * .8, 12); expect(h.radius).toBe(.035);
+    // Touching: a partial footprint. Plunged: the whole hand.
+    const touching = handToGrid(hand(1, .5, .5, .38), 16 / 9, SURFACE), plunged = handToGrid(hand(1, .5, .5, .2), 16 / 9, SURFACE);
+    expect(touching.immersion).toBeCloseTo(.25, 9); expect(touching.radius).toBeGreaterThan(.035); expect(touching.radius).toBeLessThan(touching.extent);
+    expect(plunged.immersion).toBe(1); expect(plunged.radius).toBeCloseTo(plunged.extent, 12); expect(plunged.clearance).toBeLessThan(-.1);
+    // Splat bounds.
+    expect(handToGrid(hand(1, .5, .5, .2, { radius: 5 }), 16 / 9, SURFACE).radius).toBe(.16);
+    expect(handToGrid(hand(1, .5, .5, .2, { radius: .001 }), 1, SURFACE).radius).toBe(.035);
+    // Writes into a caller-owned record when given.
+    const out = emptyGridHand();
+    expect(handToGrid(src, .5, SURFACE, out)).toBe(out);
+    expect(out).toEqual(handToGrid(src, .5, SURFACE));
   });
   it('knows the bowl and pulls points inside it', () => {
     expect(insideBowl({ x: .5, y: .5 }, .4)).toBe(true);
@@ -53,6 +68,50 @@ describe('basin geometry', () => {
     expect(bowlDistance(q)).toBeCloseTo(.32, 9); expect(q.y).toBeCloseTo(.5, 9);
     const inside = { x: .55, y: .52 };
     expect(clampToBowl(inside, .4)).toEqual(inside);
+  });
+});
+
+describe('basin height', () => {
+  it('gives every hand a bounded body height', () => {
+    expect(handHalfHeight(hand(1, .5, .5))).toBeCloseTo(.06, 12);
+    expect(handHalfHeight({ extent: { min: { x: 0, y: .5, z: 0 }, max: { x: 0, y: .51, z: 0 } } })).toBe(HAND_HALF_HEIGHT_MIN);
+    expect(handHalfHeight({ extent: { min: { x: 0, y: 0, z: 0 }, max: { x: 0, y: 1, z: 0 } } })).toBe(HAND_HALF_HEIGHT_MAX);
+  });
+  it('is dry above the surface, partly wet when touching, fully wet when plunged', () => {
+    expect(handImmersion(hand(1, .5, .5, .6), SURFACE)).toBe(0);
+    expect(handClearance(hand(1, .5, .5, .6), SURFACE)).toBeCloseTo(.19, 12);
+    expect(handImmersion(hand(1, .5, .5, .41), SURFACE)).toBeCloseTo(0, 12);   // the underside exactly on the surface
+    const touching = handImmersion(hand(1, .5, .5, .38), SURFACE);
+    expect(touching).toBeGreaterThan(0); expect(touching).toBeLessThan(1); expect(touching).toBeCloseTo(.25, 9);
+    expect(handClearance(hand(1, .5, .5, .38), SURFACE)).toBeCloseTo(-.03, 12);
+    expect(handImmersion(hand(1, .5, .5, .29), SURFACE)).toBeCloseTo(1, 9);   // the top of the hand at the surface
+    expect(handImmersion(hand(1, .5, .5, .05), SURFACE)).toBe(1);
+    // A higher water level wets the same hand.
+    expect(handImmersion(hand(1, .5, .5, .6), .8)).toBeGreaterThan(.9);
+    // Monotone in height.
+    let last = 1;
+    for (let y = 0; y <= 1; y += .01) { const i = handImmersion(hand(1, .5, .5, y), SURFACE); expect(i).toBeLessThanOrEqual(last + 1e-12); expect(i).toBeGreaterThanOrEqual(0); expect(i).toBeLessThanOrEqual(1); last = i; }
+  });
+  it('turns immersion into a grip: none above, partial touching, full plunged', () => {
+    expect(stirStrength(0)).toBe(0); expect(stirStrength(-1)).toBe(0);
+    const light = stirStrength(.1), half = stirStrength(.5);
+    expect(light).toBeGreaterThan(0); expect(light).toBeLessThan(.25); expect(half).toBeGreaterThan(light); expect(half).toBeLessThan(1);
+    expect(stirStrength(1)).toBe(1); expect(stirStrength(2)).toBe(1);
+    for (let i = 0; i < 1; i += .05) expect(stirStrength(i + .05)).toBeGreaterThan(stirStrength(i));
+    // Through the pipeline: the same hand at three heights.
+    const grip = (y: number) => stirStrength(handToGrid(hand(1, .5, .5, y), 16 / 9, SURFACE).immersion);
+    expect(grip(.6)).toBe(0); expect(grip(.38)).toBeGreaterThan(.3); expect(grip(.38)).toBeLessThan(.6); expect(grip(.2)).toBe(1);
+  });
+  it('sizes the footprint like a sphere breaking the surface', () => {
+    expect(footprint(0)).toBe(0); expect(footprint(.5)).toBeCloseTo(1, 12); expect(footprint(1)).toBe(1);
+    expect(footprint(.125)).toBeCloseTo(.5, 12);
+  });
+  it('gates the immersion signal to the bowl', () => {
+    expect(immersionSignal({ x: .5, y: .5, immersion: 1 }, .42)).toBe(1);
+    expect(immersionSignal({ x: .5, y: .5, immersion: .3 }, .42)).toBeCloseTo(.3, 12);
+    expect(immersionSignal({ x: .5, y: .5 + .42, immersion: 1 }, .42)).toBeCloseTo(.5, 6);   // on the rim
+    expect(immersionSignal({ x: .99, y: .5, immersion: 1 }, .42)).toBe(0);                    // plunged onto the table
+    expect(immersionSignal({ x: .5, y: .5, immersion: 7 }, .42)).toBe(1);
   });
 });
 
@@ -113,6 +172,15 @@ describe('basin shader time', () => {
     expect(c).not.toContain('u_time');
     expect(advectVelocity(false)).not.toContain('u_time');
     expect(advectVelocity(true)).toContain('u_decayFloor');
+  });
+  it('gates the hand force by the grip and draws the hands over the water', () => {
+    // The relaxation toward the hand's velocity is multiplied by the grip (meta.w), so a hovering hand with grip 0 is not a brake.
+    expect(advectVelocity(false)).toContain('* g * u_couple * m.w');
+    for (const packed of [false, true]) {
+      const c = composite(packed);
+      expect(c).toContain('u_shadows['); expect(c).toContain('u_shadowMeta['); expect(c).toContain('u_shadowCount');
+      expect(c).toContain('* shade');
+    }
   });
 });
 
@@ -223,35 +291,43 @@ describe('basin probe', () => {
 describe('basin signals', () => {
   it('maps measures into the declared ranges', () => {
     const still = measuresToSignals({ speed: 0, curl: 0, angular: 0, ink: 0 });
-    expect(still).toEqual({ energy: 0, swirl: 0, rotation: 0, ink: 0 });
-    const wild = measuresToSignals({ speed: 50, curl: 1e4, angular: 9, ink: 3 });
+    expect(still).toEqual({ energy: 0, swirl: 0, rotation: 0, ink: 0, immersion: 0 });
+    const wild = measuresToSignals({ speed: 50, curl: 1e4, angular: 9, ink: 3 }, 4);
     expect(wild.energy).toBeLessThanOrEqual(1); expect(wild.energy).toBeGreaterThan(.99);
-    expect(wild.swirl).toBeLessThanOrEqual(1); expect(wild.rotation).toBeLessThanOrEqual(1); expect(wild.ink).toBe(1);
+    expect(wild.swirl).toBeLessThanOrEqual(1); expect(wild.rotation).toBeLessThanOrEqual(1); expect(wild.ink).toBe(1); expect(wild.immersion).toBe(1);
     expect(measuresToSignals({ speed: 0, curl: 0, angular: -9, ink: 0 }).rotation).toBeGreaterThanOrEqual(-1);
     expect(measuresToSignals({ speed: 0, curl: 0, angular: -.02, ink: 0 }).rotation).toBeLessThan(0);
     expect(measuresToSignals({ speed: .09, curl: 0, angular: 0, ink: 0 }).energy).toBeCloseTo(1 - Math.exp(-1), 6);
+    expect(measuresToSignals({ speed: 0, curl: 0, angular: 0, ink: 0 }, .6).immersion).toBeCloseTo(.6, 12);
+    expect(measuresToSignals({ speed: 0, curl: 0, angular: 0, ink: 0 }, -1).immersion).toBe(0);
   });
   it('smooths toward the raw values and derives calm from a slower energy', () => {
     const s = new SignalSmoother();
-    expect(s.values.calm).toBe(1);
-    const raw = { energy: 1, swirl: .5, rotation: -1, ink: .8 };
+    expect(s.values.calm).toBe(1); expect(s.values.immersion).toBe(0);
+    const raw = { energy: 1, swirl: .5, rotation: -1, ink: .8, immersion: 1 };
     s.update(raw, 0);
     expect(s.values.energy).toBe(0);
     for (let i = 0; i < 60; i++) s.update(raw, 1 / 60);
     expect(s.values.energy).toBeGreaterThan(.95); expect(s.values.energy).toBeLessThanOrEqual(1);
     expect(s.values.rotation).toBeLessThan(-.85); expect(s.values.rotation).toBeGreaterThanOrEqual(-1);
     expect(s.values.swirl).toBeCloseTo(.5, 1); expect(s.values.ink).toBeGreaterThan(.6);
+    expect(s.values.immersion).toBeGreaterThan(.98); expect(s.values.immersion).toBeLessThanOrEqual(1);
     // Calm lags: after one second of full energy it has only partly fallen.
     expect(s.values.calm).toBeLessThan(.8); expect(s.values.calm).toBeGreaterThan(.3);
     for (let i = 0; i < 600; i++) s.update(raw, 1 / 60);
     expect(s.values.calm).toBeLessThan(.02);
-    for (let i = 0; i < 600; i++) s.update({ energy: 0, swirl: 0, rotation: 0, ink: 0 }, 1 / 60);
-    expect(s.values.calm).toBeGreaterThan(.98); expect(s.values.energy).toBeLessThan(.01);
+    for (let i = 0; i < 600; i++) s.update({ energy: 0, swirl: 0, rotation: 0, ink: 0, immersion: 0 }, 1 / 60);
+    expect(s.values.calm).toBeGreaterThan(.98); expect(s.values.energy).toBeLessThan(.01); expect(s.values.immersion).toBeLessThan(.01);
+    // Immersion responds quickly (a lifted hand reads as dry within a fraction of a second) and stays in range.
+    const q = new SignalSmoother();
+    for (let i = 0; i < 12; i++) q.update(raw, 1 / 60);
+    expect(q.values.immersion).toBeGreaterThan(.7);
+    for (let i = 0; i < 100; i++) { q.update({ ...raw, immersion: i % 2 ? 9 : -9 }, 1 / 60); expect(q.values.immersion).toBeGreaterThanOrEqual(0); expect(q.values.immersion).toBeLessThanOrEqual(1); }
   });
 });
 
 describe('basin drop scheduler', () => {
-  const base = { time: 0, events: [] as GestureEvent[], hands: [] as HandState[], aspect: 16 / 9, bowl: .42, ink: .05, palette: 'ember', dropOnEnter: true, inkLevel: .5 };
+  const base = { time: 0, hands: [] as HandState[], aspect: 16 / 9, bowl: .42, surface: SURFACE, ink: .05, palette: 'ember', dropOnEnter: true, inkLevel: .5 };
   it('seeds initial beads inside the bowl, cycling the palette, deterministically', () => {
     const a = new DropScheduler(3).initial(4, .42, 'ember', .05), b = new DropScheduler(3).initial(4, .42, 'ember', .05);
     expect(a).toEqual(b);
@@ -261,51 +337,74 @@ describe('basin drop scheduler', () => {
     expect(hueOf(a[0].color)).toBe(hueOf(PALETTES.ember[0])); expect(hueOf(a[1].color)).toBe(hueOf(PALETTES.ember[1]));
     expect(new DropScheduler(4).initial(4, .42, 'ember', .05)).not.toEqual(a);
   });
-  it('drops on enter (when enabled, inside the bowl) and on push gestures with an impulse', () => {
-    const s = new DropScheduler();
-    const inBowl = s.update({ ...base, events: [enter(1, .5, .5)] });
-    expect(inBowl).toHaveLength(1); expect(inBowl[0].impulse).toBe(0);
-    expect(inBowl[0].x).toBeCloseTo(.5, 9); expect(inBowl[0].y).toBeCloseTo(.5, 9);
-    expect(s.update({ ...base, events: [enter(2, .02, .02)] })).toHaveLength(0);
-    expect(new DropScheduler().update({ ...base, dropOnEnter: false, events: [enter(1, .5, .5)] })).toHaveLength(0);
-    const pushed = s.update({ ...base, time: 1, events: [push(1, .55, .5, .9)], hands: [hand(1, .55, .5, .9)] });
-    expect(pushed).toHaveLength(1); expect(pushed[0].impulse).toBeGreaterThan(.2);
-    // The same push must not be counted twice by the threshold rule on the next step.
-    expect(s.update({ ...base, time: 1.02, hands: [hand(1, .55, .5, .95)] })).toHaveLength(0);
+  it('scales the splash with the descent speed', () => {
+    expect(plungeImpulse(0)).toBeCloseTo(.25, 12); expect(plungeImpulse(PLUNGE_SPEED)).toBeCloseTo(.25, 12);
+    expect(plungeImpulse(PLUNGE_FULL)).toBeCloseTo(.6, 12); expect(plungeImpulse(99)).toBeCloseTo(.6, 12);
+    const mid = plungeImpulse((PLUNGE_SPEED + PLUNGE_FULL) / 2);
+    expect(mid).toBeGreaterThan(.25); expect(mid).toBeLessThan(.6);
   });
-  it('fires on a slow push crossing the threshold, with hysteresis and a cooldown', () => {
+  it('splashes a bead once when a hand plunges through the surface, with hysteresis and a cooldown', () => {
     const s = new DropScheduler();
     let t = 0;
-    const step = (p: number) => s.update({ ...base, time: (t += 1 / 60), hands: [hand(1, .5, .5, p)] });
-    expect(step(.3)).toHaveLength(0);
-    expect(step(.5)).toHaveLength(0);
-    expect(step(.7)).toHaveLength(1);
-    expect(step(.9)).toHaveLength(0);
-    expect(step(.5)).toHaveLength(0);   // between OFF and ON: still armed off
-    expect(step(.7)).toHaveLength(0);   // never dipped below OFF: no re-fire
-    expect(step(.4)).toHaveLength(0);   // released
-    expect(step(.7)).toHaveLength(0);   // re-crossed but inside the cooldown
-    t += 1;
-    expect(step(.4)).toHaveLength(0);
-    expect(step(.7)).toHaveLength(1);
-    // A hand that first appears already pushed does not drop until it releases and pushes again.
+    const step = (y: number, vy = 0) => s.update({ ...base, time: (t += 1 / 60), hands: [falling(1, .55, .5, y, vy)] });
+    expect(step(.6)).toHaveLength(0);                       // first seen, dry
+    expect(step(.5, -.8)).toHaveLength(0);                  // still above the water
+    const splash = step(.38, -.8);                          // underside through the surface, fast
+    expect(splash).toHaveLength(1); expect(splash[0].impulse).toBeCloseTo(plungeImpulse(.8), 12); expect(splash[0].impulse).toBeGreaterThan(.25);
+    expect(splash[0].x).toBeCloseTo(simToGrid({ x: .55, z: .5 }, 16 / 9).x, 9); expect(splash[0].y).toBeCloseTo(.5, 9);
+    expect(step(.3, -.8)).toHaveLength(0);                  // deeper: no re-fire
+    expect(step(.41, .3)).toHaveLength(0);                  // hovering inside the band: still wet
+    expect(step(.39, -.9)).toHaveLength(0);                 // never lifted clear: no re-fire
+    expect(step(.45, .5)).toHaveLength(0);                  // lifted clear (above the band)
+    expect(step(.38, -.8)).toHaveLength(0);                 // re-plunged inside the cooldown
+    t += PLUNGE_COOLDOWN;
+    expect(step(.45, .5)).toHaveLength(0);
+    expect(step(.38, -.8)).toHaveLength(1);                 // clear and past the cooldown: splashes again
+    // The band is symmetric around the surface and small.
+    expect(WET_BAND).toBeGreaterThan(0); expect(WET_BAND).toBeLessThan(.03);
+  });
+  it('drops a gentle bead on a slow dip only when asked, and nothing for a hand first seen wet', () => {
+    const dip = (dropOnEnter: boolean) => {
+      const s = new DropScheduler();
+      s.update({ ...base, dropOnEnter, time: 0, hands: [hand(1, .5, .5, .6)] });
+      return s.update({ ...base, dropOnEnter, time: .5, hands: [falling(1, .5, .5, .38, -.1)] });
+    };
+    const gentle = dip(true);
+    expect(gentle).toHaveLength(1); expect(gentle[0].impulse).toBe(0); expect(gentle[0].amount).toBeLessThan(1);
+    expect(dip(false)).toHaveLength(0);
+    // A fast plunge splashes regardless of the setting.
+    const s = new DropScheduler();
+    s.update({ ...base, dropOnEnter: false, time: 0, hands: [hand(1, .5, .5, .6)] });
+    expect(s.update({ ...base, dropOnEnter: false, time: .5, hands: [falling(1, .5, .5, .38, -.6)] })).toHaveLength(1);
+    // Already wet when first tracked (or re-tracked after a flicker): nothing until it lifts out and comes back.
     const fresh = new DropScheduler();
-    expect(fresh.update({ ...base, time: 5, hands: [hand(9, .5, .5, .9)] })).toHaveLength(0);
+    expect(fresh.update({ ...base, time: 5, hands: [falling(9, .5, .5, .3, -.9)] })).toHaveLength(0);
+    expect(fresh.update({ ...base, time: 5.1, hands: [falling(9, .5, .5, .25, -.9)] })).toHaveLength(0);
+    expect(fresh.update({ ...base, time: 5.5, hands: [hand(9, .5, .5, .6)] })).toHaveLength(0);
+    expect(fresh.update({ ...base, time: 6, hands: [falling(9, .5, .5, .38, -.9)] })).toHaveLength(1);
+    // A plunge onto the table outside the bowl drops nothing.
+    const table = new DropScheduler();
+    table.update({ ...base, time: 0, hands: [hand(1, .02, .5, .6)] });
+    expect(table.update({ ...base, time: .5, hands: [falling(1, .02, .5, .38, -.9)] })).toHaveLength(0);
+    // Hands are independent.
+    const two = new DropScheduler();
+    two.update({ ...base, time: 0, hands: [hand(1, .5, .5, .6), hand(2, .5, .6, .6)] });
+    expect(two.update({ ...base, time: .5, hands: [falling(1, .5, .5, .38, -.9), hand(2, .5, .6, .6)] })).toHaveLength(1);
+    expect(two.update({ ...base, time: .6, hands: [falling(1, .5, .5, .3, -.9), falling(2, .5, .6, .38, -.9)] })).toHaveLength(1);
   });
   it('appends into a caller-owned queue and allocates nothing when nothing happens', () => {
     const s = new DropScheduler();
     const queue = [] as ReturnType<DropScheduler['update']>;
-    expect(s.update({ ...base, events: [enter(1, .5, .5)] }, queue)).toBe(queue);
-    expect(queue).toHaveLength(1);
-    expect(s.update({ ...base, time: .1, hands: [hand(1, .5, .5)] }, queue)).toBe(queue);
+    expect(s.update({ ...base, hands: [hand(1, .5, .5, .6)] }, queue)).toBe(queue);
+    expect(queue).toHaveLength(0);
+    expect(s.update({ ...base, time: .5, hands: [falling(1, .5, .5, .38, -.9)] }, queue)).toBe(queue);
+    expect(queue).toHaveLength(1); expect(queue[0].impulse).toBeGreaterThan(0);
+    // The scratch set is reused between calls: hand bookkeeping still works across many steps.
+    for (let i = 0; i < 100; i++) s.update({ ...base, time: 1 + i / 60, hands: [hand(1, .5, .5, .3)] }, queue);
     expect(queue).toHaveLength(1);   // untouched: nothing new was appended, nothing was removed
-    s.update({ ...base, time: 1, events: [push(1, .55, .5)], hands: [hand(1, .55, .5, .9)] }, queue);
-    expect(queue).toHaveLength(2); expect(queue[1].impulse).toBeGreaterThan(0);
-    // The scratch sets are reused between calls: hand bookkeeping still works across many steps.
-    for (let i = 0; i < 100; i++) s.update({ ...base, time: 2 + i / 60, hands: [hand(1, .55, .5, .3)] }, queue);
+    s.update({ ...base, time: 3, hands: [hand(1, .5, .5, .6)] }, queue);
+    s.update({ ...base, time: 3.1, hands: [falling(1, .5, .5, .38, -.9)] }, queue);
     expect(queue).toHaveLength(2);
-    s.update({ ...base, time: 5, hands: [hand(1, .55, .5, .9)] }, queue);
-    expect(queue).toHaveLength(3);
   });
   it('re-seeds a lone bead when nobody has been there for a while and the ink is gone', () => {
     const s = new DropScheduler();

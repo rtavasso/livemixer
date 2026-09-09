@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { Cloth, COLLIDER_STRIDE, CONTACT_SKIN, MAX_COLLIDERS, type ClothStepParams } from '../../src/sim/sims/veil/cloth';
-import { type ColliderHand, HandColliders, HOVER_GAP } from '../../src/sim/sims/veil/colliders';
+import { type ColliderHand, HandColliders, handRadius, RADIUS_MAX, RADIUS_PAD } from '../../src/sim/sims/veil/colliders';
 import { WindField } from '../../src/sim/sims/veil/wind';
-import veil from '../../src/sim/sims/veil';
+import { DEFAULT_EYE, windowCamera } from '../../src/sim/core/camera';
+import veil, { layoutFor } from '../../src/sim/sims/veil';
 
 const ASPECT = 16 / 9;
 const DT = 1 / 60;
@@ -14,6 +15,7 @@ function makeCloth(seed = 11) {
 const noColliders = new Float32Array(COLLIDER_STRIDE * MAX_COLLIDERS);
 const allFinite = (a: ArrayLike<number>) => { for (let i = 0; i < a.length; i++) if (!Number.isFinite(a[i])) return false; return true; };
 function hemY(cloth: Cloth) { let y = 0; for (let c = 0; c < cloth.cols; c++) y += cloth.pos[((cloth.rows - 1) * cloth.cols + c) * 3 + 1]; return y / cloth.cols; }
+function minZ(cloth: Cloth) { let z = Infinity; for (let i = 0; i < cloth.count; i++) z = Math.min(z, cloth.pos[i * 3 + 2]); return z; }
 
 describe('veil cloth solver', () => {
   it('settles under gravity without NaN over 600 steps and hangs to its rest length', () => {
@@ -66,6 +68,22 @@ describe('veil cloth solver', () => {
     expect(allFinite(cloth.pos)).toBe(true);
     expect(cloth.contactFraction).toBe(0);
     expect(cloth.meanSpeed).toBeLessThan(.15);
+  });
+
+  it('never lets a hand push fabric below the floor', () => {
+    const cloth = makeCloth();
+    for (let i = 0; i < 200; i++) cloth.step(DT, PARAMS, noColliders, 0);
+    const colliders = new Float32Array(COLLIDER_STRIDE * MAX_COLLIDERS);
+    // A sphere straddling the hem, pressing down and back.
+    colliders.set([ASPECT * .5, .08, .02, .16, 0, -.6, 0, 1], 0);
+    for (let i = 0; i < 60; i++) {
+      colliders[1] = Math.max(-.1, colliders[1] - .6 * DT);
+      cloth.step(DT, PARAMS, colliders, 1);
+      let lowest = Infinity; for (let p = 0; p < cloth.count; p++) lowest = Math.min(lowest, cloth.pos[p * 3 + 1]);
+      expect(lowest).toBeGreaterThanOrEqual(cloth.floor);
+    }
+    expect(cloth.floor).toBe(0);
+    expect(allFinite(cloth.pos)).toBe(true);
   });
 
   it('is moved by wind toward the viewer', () => {
@@ -158,47 +176,83 @@ describe('veil cloth solver', () => {
       expect(cloth.meanSpeed).toBeLessThan(.05);
     }
   });
+
+  it('re-hangs at a new rod height and length on setExtent, scaling the sheet about the rod', () => {
+    const cloth = makeCloth();
+    for (let i = 0; i < 200; i++) cloth.step(DT, PARAMS, noColliders, 0);
+    const strainBefore = cloth.meanStrain;
+    // A deeper sheet: wider, taller rod, longer fabric, as the simulation lays it out to fill the view there.
+    const x0 = -.2, x1 = ASPECT + .2, top = 1.21, length = 1.195;
+    cloth.setExtent(x0, x1, top, length);
+    expect(cloth.top).toBe(top); expect(cloth.length).toBe(length);
+    for (let c = 0; c < cloth.cols; c++) { expect(cloth.pos[c * 3 + 1]).toBe(top); expect(cloth.pos[c * 3]).toBeCloseTo(x0 + (x1 - x0) * c / (cloth.cols - 1), 12); }
+    // The hem lands at the new length straight away, and nothing hangs below the floor.
+    expect(Math.abs(hemY(cloth) - (top - length))).toBeLessThan(.02);
+    cloth.step(DT, PARAMS, noColliders, 0);
+    expect(cloth.meanStrain).toBeLessThan(strainBefore * 1.5 + .002);
+    for (let i = 0; i < 29; i++) cloth.step(DT, PARAMS, noColliders, 0);
+    expect(cloth.meanStrain).toBeLessThan(strainBefore * 1.5 + .002);
+    expect(Math.abs(hemY(cloth) - (top - length))).toBeLessThan(.03);
+    for (let i = 0; i < cloth.count; i++) expect(cloth.pos[i * 3 + 1]).toBeGreaterThanOrEqual(0);
+    expect(cloth.meanSpeed).toBeLessThan(.05);
+    expect(allFinite(cloth.pos)).toBe(true);
+  });
 });
 
 describe('veil hand colliders', () => {
-  const REACH = .4;
-  const hand = (id: number, x = .5, y = .5, push = 0): ColliderHand => ({
-    id, position: { x, y, z: 0 }, velocity: { x: 0, y: 0, z: 0 }, push,
-    extent: { min: { x: x - .05, y: y - .08, z: 0 }, max: { x: x + .05, y: y + .08, z: 0 } },
+  const DEPTH = 1, PLANE = .45;
+  const hand = (id: number, x = .5, y = .5, z = .2): ColliderHand => ({
+    id, position: { x, y, z }, velocity: { x: 0, y: 0, z: 0 },
+    extent: { min: { x: x - .05, y: y - .08, z }, max: { x: x + .05, y: y + .08, z } },
   });
+  const update = (t: HandColliders, hands: ColliderHand[]) => t.update(hands, DT, ASPECT, DEPTH, PLANE);
   const ids = (t: HandColliders) => t.list.map(c => c.id).sort((a, b) => a - b);
   const strengthOf = (t: HandColliders, id: number) => t.find(id)!.strength;
 
-  it('grows a collider in on arrival, places it in front of the sheet, and fades it out after the hand leaves', () => {
+  it('grows a collider in on arrival, places the sphere at the hand\'s world position in the sheet\'s frame, and fades it out after the hand leaves', () => {
     const table = new HandColliders();
-    table.update([hand(1)], DT, ASPECT, REACH);
+    update(table, [hand(1)]);
     expect(table.count).toBe(1);
     expect(table.data[7]).toBeGreaterThan(0); expect(table.data[7]).toBeLessThan(.5);
-    for (let i = 0; i < 60; i++) table.update([hand(1)], DT, ASPECT, REACH);
+    for (let i = 0; i < 60; i++) update(table, [hand(1)]);
     expect(table.data[7]).toBeGreaterThan(.99);
-    // Withdrawn: centre at hand position in uniform units, front of the sphere hovering HOVER_GAP before the sheet.
-    const r = table.data[3];
+    // World x, y in uniform units; z measured from the plane toward the viewer: sim z .2 is .25 in front of a plane at .45.
     expect(table.data[0]).toBeCloseTo(.5 * ASPECT, 6); expect(table.data[1]).toBeCloseTo(.5, 6);
-    expect(table.data[2]).toBeCloseTo(r + HOVER_GAP, 5);
-    // Pushed: the centre goes `reach` behind the sheet.
-    for (let i = 0; i < 5; i++) table.update([hand(1, .5, .5, 1)], DT, ASPECT, REACH);
-    expect(table.data[2]).toBeCloseTo(-REACH, 5);
+    expect(table.data[2]).toBeCloseTo(PLANE - .2 * DEPTH, 6);
+    // Radius from the hand's box in uniform units (x half-extent .05 sim → .089 at 16:9 beats the y half-extent .08), plus padding.
+    expect(table.data[3]).toBeCloseTo(.05 * ASPECT + RADIUS_PAD, 6);
+    expect(table.data[3]).toBeCloseTo(handRadius(hand(1), ASPECT, DEPTH), 6);
+    // Deeper than the plane: negative z. Velocity converts the same way: x scales with the aspect, z with the depth and flips.
+    const deep: ColliderHand = { ...hand(1, .5, .5, .8), velocity: { x: .1, y: .2, z: .5 } };
+    for (let i = 0; i < 5; i++) update(table, [deep]);
+    expect(table.data[2]).toBeCloseTo(PLANE - .8 * DEPTH, 6);
+    expect(table.data[4]).toBeCloseTo(.1 * ASPECT, 6); expect(table.data[5]).toBeCloseTo(.2, 6); expect(table.data[6]).toBeCloseTo(-.5 * DEPTH, 6);
     // Departure: the collider stays, marked absent, and fades rather than vanishing.
-    table.update([], DT, ASPECT, REACH);
+    update(table, []);
     expect(table.count).toBe(1); expect(table.list[0].present).toBe(false);
     expect(table.data[7]).toBeLessThan(1); expect(table.data[7]).toBeGreaterThan(.9);
-    for (let i = 0; i < 120; i++) table.update([], DT, ASPECT, REACH);
+    for (let i = 0; i < 120; i++) update(table, []);
     expect(table.count).toBe(0); expect(table.list).toHaveLength(0);
+  });
+
+  it('scales z with the volume depth and bounds the radius, taking the z extent into account', () => {
+    const table = new HandColliders();
+    table.update([hand(1, .5, .5, .2)], DT, ASPECT, 2, .9);
+    expect(table.data[2]).toBeCloseTo(.9 - .2 * 2, 6);
+    // A tall z extent (fingertips reaching in) sets the radius, capped at RADIUS_MAX before padding.
+    const reaching: ColliderHand = { ...hand(2), extent: { min: { x: .45, y: .42, z: 0 }, max: { x: .55, y: .58, z: .3 } } };
+    expect(handRadius(reaching, ASPECT, 2)).toBeCloseTo(RADIUS_MAX + RADIUS_PAD, 6);
+    expect(handRadius(reaching, ASPECT, 1)).toBeCloseTo(.15 + RADIUS_PAD, 6);
   });
 
   it('never holds more than MAX_COLLIDERS and ignores a new hand only while every slot is a present hand', () => {
     const table = new HandColliders();
     const five = [1, 2, 3, 4, 5].map(id => hand(id, id / 6));
-    for (let i = 0; i < 30; i++) table.update(five, DT, ASPECT, REACH);
+    for (let i = 0; i < 30; i++) update(table, five);
     expect(table.count).toBe(MAX_COLLIDERS); expect(table.list).toHaveLength(MAX_COLLIDERS);
     expect(ids(table)).toEqual([1, 2, 3, 4]); expect(table.find(5)).toBeUndefined();
     // Once a hand leaves, the waiting hand takes its slot on the very next step (not after the fade-out).
-    table.update([five[0], five[2], five[3], five[4]], DT, ASPECT, REACH);
+    update(table, [five[0], five[2], five[3], five[4]]);
     expect(ids(table)).toEqual([1, 3, 4, 5]); expect(table.find(5)!.present).toBe(true);
     expect(table.count).toBe(MAX_COLLIDERS);
   });
@@ -206,16 +260,16 @@ describe('veil hand colliders', () => {
   it('a new hand on a full table evicts the faintest departed collider, never a present hand', () => {
     const table = new HandColliders();
     const [h1, h2, h3, h4] = [1, 2, 3, 4].map(id => hand(id, id / 5));
-    for (let i = 0; i < 60; i++) table.update([h1, h2, h3, h4], DT, ASPECT, REACH);
+    for (let i = 0; i < 60; i++) update(table, [h1, h2, h3, h4]);
     // Hand 2 leaves first, hand 4 later: 2 has faded further than 4 when hand 5 arrives.
-    for (let i = 0; i < 12; i++) table.update([h1, h3, h4], DT, ASPECT, REACH);
-    for (let i = 0; i < 6; i++) table.update([h1, h3], DT, ASPECT, REACH);
+    for (let i = 0; i < 12; i++) update(table, [h1, h3, h4]);
+    for (let i = 0; i < 6; i++) update(table, [h1, h3]);
     expect(ids(table)).toEqual([1, 2, 3, 4]);
     const s2 = strengthOf(table, 2), s4 = strengthOf(table, 4);
     expect(s2).toBeLessThan(s4); expect(s2).toBeGreaterThan(.01);
     // The newcomer is listed before the present hands, so a naive first-come scan would evict one of them.
     const h5 = hand(5, .9);
-    table.update([h5, h1, h3], DT, ASPECT, REACH);
+    update(table, [h5, h1, h3]);
     expect(ids(table)).toEqual([1, 3, 4, 5]);
     expect(table.find(5)!.present).toBe(true); expect(strengthOf(table, 5)).toBeGreaterThan(0);
     expect(table.find(1)!.present).toBe(true); expect(table.find(3)!.present).toBe(true);
@@ -224,18 +278,101 @@ describe('veil hand colliders', () => {
     expect(table.count).toBe(4);
     for (let i = 0; i < table.count; i++) { const c = table.list[i], o = i * COLLIDER_STRIDE; expect(table.data[o]).toBeCloseTo(c.x, 5); expect(table.data[o + 3]).toBeCloseTo(c.r, 5); expect(table.data[o + 7]).toBeCloseTo(c.strength, 5); }
     // A sixth hand with the last departed collider still fading takes that slot too; a seventh finds only present hands and waits.
-    table.update([h5, h1, h3, hand(6, .1)], DT, ASPECT, REACH);
+    update(table, [h5, h1, h3, hand(6, .1)]);
     expect(ids(table)).toEqual([1, 3, 5, 6]);
-    table.update([h5, h1, h3, hand(6, .1), hand(7, .3)], DT, ASPECT, REACH);
+    update(table, [h5, h1, h3, hand(6, .1), hand(7, .3)]);
     expect(ids(table)).toEqual([1, 3, 5, 6]); expect(table.find(7)).toBeUndefined();
+  });
+});
+
+describe('veil contact in the volume', () => {
+  const DEPTH = 1, PLANE = .45, X = .5, Y = .5;
+  const handAt = (z: number, vz = 0): ColliderHand => ({
+    id: 1, position: { x: X, y: Y, z }, velocity: { x: 0, y: 0, z: vz },
+    extent: { min: { x: X - .05, y: Y - .07, z }, max: { x: X + .05, y: Y + .07, z } },
+  });
+  const R = handRadius(handAt(0), ASPECT, DEPTH);
+  const settled = () => { const c = makeCloth(); for (let i = 0; i < 200; i++) c.step(DT, PARAMS, noColliders, 0); return c; };
+  const drive = (cloth: Cloth, table: HandColliders, hands: ColliderHand[], steps: number) => {
+    for (let i = 0; i < steps; i++) { table.update(hands, DT, ASPECT, DEPTH, PLANE); cloth.step(DT, PARAMS, table.data, table.count); }
+  };
+
+  it('a hand in front of the plane leaves the cloth untouched', () => {
+    const cloth = settled(), twin = settled();
+    const table = new HandColliders();
+    // The sphere's near side plus the contact skin stops a good way short of the sheet and its resting folds.
+    drive(cloth, table, [handAt(PLANE - R - CONTACT_SKIN - .1)], 60);
+    for (let i = 0; i < 60; i++) twin.step(DT, PARAMS, noColliders, 0);
+    expect(table.count).toBe(1); expect(table.data[2]).toBeGreaterThan(R + CONTACT_SKIN);
+    expect(cloth.contactFraction).toBe(0);
+    expect(cloth.pos).toEqual(twin.pos);
+  });
+
+  it('a hand at the plane presses into the sheet: fabric is displaced, wraps the sphere and none of it ends inside', () => {
+    const cloth = settled();
+    const before = Float64Array.from(cloth.pos);
+    const table = new HandColliders();
+    drive(cloth, table, [handAt(PLANE)], 90);
+    const c = table.list[0];
+    expect(c.z).toBeCloseTo(0, 6);
+    expect(cloth.contactFraction).toBeGreaterThan(.02);
+    expect(cloth.anyInside(c.x, c.y, c.z, c.r)).toBe(false);
+    let moved = 0, maxMove = 0;
+    for (let i = 0; i < cloth.count; i++) {
+      const o = i * 3, d = Math.hypot(cloth.pos[o] - before[o], cloth.pos[o + 1] - before[o + 1], cloth.pos[o + 2] - before[o + 2]);
+      if (d > .01) moved++; maxMove = Math.max(maxMove, d);
+    }
+    expect(moved).toBeGreaterThan(10); expect(maxMove).toBeGreaterThan(.05);
+    expect(allFinite(cloth.pos)).toBe(true);
+  });
+
+  it('a hand that moves deeper than the plane passes through it and pulls the sheet past the plane', () => {
+    const cloth = settled();
+    const table = new HandColliders();
+    // Approach from in front, cross the plane, and stop with the sphere just behind it (0.6 sim units/s).
+    const z0 = PLANE - R - .1, z1 = PLANE + .5 * R, steps = 60, vz = (z1 - z0) / (steps * DT);
+    for (let i = 0; i < steps; i++) { table.update([handAt(z0 + (z1 - z0) * i / (steps - 1), vz)], DT, ASPECT, DEPTH, PLANE); cloth.step(DT, PARAMS, table.data, table.count); }
+    drive(cloth, table, [handAt(z1)], 30);
+    const c = table.list[0];
+    expect(c.z).toBeCloseTo(PLANE - z1, 6);
+    // The fabric it pushed ahead of it lies deeper than the plane (cloth z < 0 ⇔ world z > plane), wrapped over the sphere.
+    expect(minZ(cloth)).toBeLessThan(-.1);
+    expect(cloth.contactFraction).toBeGreaterThan(.02);
+    expect(cloth.anyInside(c.x, c.y, c.z, c.r)).toBe(false);
+    // In the volume's sense the sheet is displaced deeper: the `depth` signal (−meanZ) is positive.
+    expect(cloth.meanZ).toBeLessThan(0);
+    // Carrying on to the back of the volume leaves the sheet behind the hand, sane and untangled.
+    drive(cloth, table, [handAt(.95)], 120);
+    expect(cloth.anyInside(table.list[0].x, table.list[0].y, table.list[0].z, table.list[0].r)).toBe(false);
+    expect(allFinite(cloth.pos)).toBe(true);
+    expect(cloth.meanSpeed).toBeLessThan(.5);
+  });
+});
+
+describe('veil layout', () => {
+  it('sizes the rod so the sheet fills the view at its depth and hangs above the floor', () => {
+    for (const [aspect, depth, plane] of [[16 / 9, 1, .45], [4 / 3, 1.5, .2], [16 / 9, 2, .9]] as const) {
+      const planeZ = plane * depth, camera = windowCamera(aspect, depth), l = layoutFor(aspect, planeZ);
+      expect(l.scale).toBeCloseTo((DEFAULT_EYE + planeZ) / DEFAULT_EYE, 9);
+      // The rod ends project just outside the frame at the sheet's depth, and its top is above the visible top there.
+      const left = camera.project({ x: l.x0, y: l.top, z: planeZ }), right = camera.project({ x: l.x1, y: l.top, z: planeZ });
+      expect(left.x).toBeLessThan(-.9); expect(left.x).toBeGreaterThan(-1.2); expect(right.x).toBeGreaterThan(.9); expect(left.y).toBeGreaterThan(1);
+      // The hem stays just above the floor, inside the volume.
+      expect(l.top - l.length).toBeGreaterThan(0); expect(l.top - l.length).toBeLessThan(.05);
+      // At the glass the layout is the glass itself, plus the rod's small overhang past each side.
+      const atGlass = layoutFor(aspect, 0);
+      expect(atGlass.scale).toBe(1); expect(atGlass.x0).toBeLessThan(0); expect(atGlass.x1).toBeGreaterThan(aspect);
+      expect(atGlass.x1 - atGlass.x0).toBeLessThan(aspect * 1.1);
+    }
   });
 });
 
 describe('veil definition', () => {
   it('declares the contract', () => {
     expect(veil.id).toBe('veil'); expect(veil.title).toBe('Veil'); expect(veil.stepHz).toBe(60);
-    expect(Object.keys(veil.params).sort()).toEqual(['backlight', 'damping', 'drape', 'gustiness', 'opacity', 'reach', 'stiffness', 'tint', 'weave', 'wind']);
+    expect(Object.keys(veil.params).sort()).toEqual(['backlight', 'damping', 'drape', 'gustiness', 'opacity', 'plane', 'stiffness', 'tint', 'weave', 'wind']);
+    expect(veil.params.plane.default).toBeCloseTo(.45, 6); expect(veil.params.plane.min).toBeGreaterThan(0); expect(veil.params.plane.max).toBeLessThan(1);
     expect(Object.keys(veil.signals).sort()).toEqual(['contact', 'depth', 'flutter', 'gust', 'sway', 'tension']);
-    expect(veil.signals.depth.min).toBe(-1);
+    expect(veil.signals.depth.min).toBe(-1); expect(veil.signals.depth.max).toBe(1);
   });
 });

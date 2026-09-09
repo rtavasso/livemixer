@@ -31,6 +31,8 @@ export const toUniform = (p: Vec2 | Vec3, aspect: number): Vec2 => ({ x: p.x * a
 export const fromUniform = (p: Vec2, aspect: number): Vec2 => ({ x: p.x / aspect, y: p.y });
 /** A hand's `radius` is in sim x units; this is the same radius in uniform units. */
 export const uniformRadius = (radiusSimX: number, aspect: number) => radiusSimX * aspect;
+/** Sim space [0,1]³ → uniform units: width = aspect, height = 1, depth = `depth` (z into the scene). */
+export const toUniform3 = (p: Vec3, aspect: number, depth: number): Vec3 => ({ x: p.x * aspect, y: p.y, z: p.z * depth });
 
 /** Deterministic pseudo-random generator (mulberry32). Simulations must not use Math.random for anything replayable. */
 export function rng(seed: number): () => number {

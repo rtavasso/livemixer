@@ -40,6 +40,7 @@
 .sim-overlay td, .sim-overlay th { padding: 2px 4px; text-align: right; border-bottom: 1px solid #1f2723; font-weight: 500; }
 .sim-overlay th:first-child, .sim-overlay td:first-child { text-align: left; }
 .sim-overlay .minimap { width: 100%; aspect-ratio: 16 / 9; background: #070908; border: 1px solid #2c342f; border-radius: 6px; display: block; }
+.sim-overlay .topmap { aspect-ratio: 32 / 7; margin-top: 4px; }
 .sim-overlay .status { color: #b6c0b9; margin: 4px 0; white-space: pre-wrap; }
 .sim-overlay .status.error { color: #ffb48a; }
 .sim-overlay .status.ok { color: #b9ec80; }

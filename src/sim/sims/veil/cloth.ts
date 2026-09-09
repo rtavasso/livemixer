@@ -2,10 +2,13 @@
  * Position-based cloth for the Veil simulation. Plain TypeScript, no WebGL,
  * fully deterministic (no Math.random, no wall clock), typed arrays only.
  *
- * Space: "uniform" units — canvas height = 1, x in [0, aspect] left→right,
- * y up (0 = floor, 1 = ceiling), z TOWARD THE VIEWER. The sheet hangs in the
- * plane z = 0; a breeze from behind (the window) pushes it to +z and a hand
- * arriving from the viewer's side pushes it to −z.
+ * Space: the solver's own frame — x and y as the volume in uniform units
+ * (canvas height = 1, x in [0, aspect], y up with the floor at 0), and z
+ * measured from the sheet's resting plane TOWARD THE VIEWER. The sheet hangs
+ * in the plane z = 0; a breeze from behind (the window) pushes it to +z and a
+ * hand arriving from the viewer's side pushes it to −z. The volume's z runs
+ * the other way (into the scene), so `colliders.ts` and the vertex shader
+ * convert at the boundary: cloth z = plane − world z.
  *
  * Layout: `cols × rows` points, row 0 is the top (pinned to the rod), row
  * rows−1 is the hem. Point index = row * cols + col.
@@ -33,6 +36,8 @@ export interface ClothOptions {
   gather: number;
   /** Number of folds seeded across the width so the sheet starts near equilibrium. */
   folds: number;
+  /** Height (uniform y) below which no point may be pushed: the room's floor. Default 0. */
+  floor?: number;
   seed?: number;
 }
 
@@ -96,7 +101,8 @@ export class Cloth {
   meanAbsDx = 0;
 
   rodX0: number; rodX1: number;
-  readonly top: number; readonly length: number; readonly gather: number; readonly folds: number;
+  top: number; length: number;
+  readonly floor: number; readonly gather: number; readonly folds: number;
   private readonly seed: number;
   private dy = 0;
   // Constraints: horizontal/vertical structural, shear, horizontal/vertical bend, long-range attachment.
@@ -115,7 +121,8 @@ export class Cloth {
     if (cols * rows > 65535) throw new Error('Cloth grid too large for 16-bit indices.');
     this.cols = cols; this.rows = rows; this.count = cols * rows;
     this.rodX0 = options.rodX0; this.rodX1 = options.rodX1;
-    this.top = options.top; this.length = options.length; this.gather = Math.max(1, options.gather); this.folds = Math.max(1, options.folds);
+    this.top = options.top; this.length = options.length; this.floor = options.floor ?? 0;
+    this.gather = Math.max(1, options.gather); this.folds = Math.max(1, options.folds);
     this.seed = options.seed ?? 1;
     const n = this.count;
     this.pos = new Float64Array(n * 3); this.prev = new Float64Array(n * 3); this.normal = new Float64Array(n * 3);
@@ -168,22 +175,24 @@ export class Cloth {
   }
 
   /**
-   * Move the rod ends (e.g. after the canvas aspect changes). The sheet reflows with the rod: x and z are
-   * scaled about the rod's left end by the new/old span ratio (y is untouched), so every horizontal rest
-   * length and every fold scale together and the constraints stay as satisfied as they were. Merely moving
-   * the pins would leave the whole sheet to swing sideways for seconds, with strain well above resting
-   * while it does.
+   * Move the rod ends (after the canvas aspect changes, or the sheet's depth: a deeper sheet must be larger
+   * to fill the view) and optionally re-hang the sheet at a new rod height and length. The sheet reflows
+   * with the rod: x and z are scaled about the rod's left end by the new/old span ratio, y about the rod by
+   * the new/old length ratio, so every rest length and every fold scale together and the constraints stay
+   * as satisfied as they were. Merely moving the pins would leave the whole sheet to swing for seconds,
+   * with strain well above resting while it does.
    */
-  setExtent(rodX0: number, rodX1: number) {
-    const oldX0 = this.rodX0, oldSpan = this.rodX1 - this.rodX0, span = rodX1 - rodX0;
-    const ratio = oldSpan > 1e-9 ? span / oldSpan : 1;
-    this.rodX0 = rodX0; this.rodX1 = rodX1;
+  setExtent(rodX0: number, rodX1: number, top = this.top, length = this.length) {
+    const oldX0 = this.rodX0, oldSpan = this.rodX1 - this.rodX0, span = rodX1 - rodX0, oldTop = this.top, oldLength = this.length;
+    const ratio = oldSpan > 1e-9 ? span / oldSpan : 1, ratioY = oldLength > 1e-9 ? length / oldLength : 1;
+    this.rodX0 = rodX0; this.rodX1 = rodX1; this.top = top; this.length = length;
     this.buildRests();
     const cols = this.cols, pos = this.pos, prev = this.prev;
     for (let r = 0; r < this.rows; r++) for (let c = 0; c < cols; c++) this.restX[r * cols + c] = rodX0 + span * c / (cols - 1);
     for (let i = 0; i < this.count; i++) {
       const o = i * 3;
       pos[o] = rodX0 + (pos[o] - oldX0) * ratio; prev[o] = rodX0 + (prev[o] - oldX0) * ratio;
+      pos[o + 1] = top + (pos[o + 1] - oldTop) * ratioY; prev[o + 1] = top + (prev[o + 1] - oldTop) * ratioY;
       pos[o + 2] *= ratio; prev[o + 2] *= ratio;
     }
     for (let c = 0; c < cols; c++) { const i = c * 3; pos[i] = prev[i] = this.restX[c]; pos[i + 1] = prev[i + 1] = this.top; pos[i + 2] = prev[i + 2] = 0; }
@@ -303,6 +312,8 @@ export class Cloth {
       // Colliders last, so no point ends a substep inside a hand.
       const count = s === sub - 1;
       for (let k = 0; k < nCol; k++) contacts += this.collide(colliders, k * COLLIDER_STRIDE, h, p.friction, count);
+      // Only a hand can push fabric below the floor (the attachment keeps the hem at top − length otherwise).
+      if (nCol > 0) { const floor = this.floor; for (let i = cols; i < n; i++) { const o = i * 3 + 1; if (pos[o] < floor) pos[o] = floor; } }
     }
     // --- signals
     this.meanSpeed = speedSum / (sub * n) * invH;

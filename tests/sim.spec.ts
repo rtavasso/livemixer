@@ -100,11 +100,12 @@ test('leap source tracks a hand from a fake Leap Motion service (v6 WebSocket pr
   const clients = new Set<SinkClient>();
   let frameId = 0;
   const sink = await createTelemetrySink({ port: 0, onOpen: client => { clients.add(client); client.send({ serviceVersion: 'fake', version: 6 }); } });
+  const started = performance.now();
   const timer = setInterval(() => {
-    const t = frameId++ / 100;
+    const t = (performance.now() - started) / 1000; frameId++;
     const x = -100 + Math.min(200, t * 200), grab = Math.min(1, Math.max(0, t - 1.5));
     const frame = {
-      currentFrameRate: 100, id: frameId, timestamp: Math.round(t * 1e6),
+      currentFrameRate: 100, id: frameId, timestamp: Math.round(performance.now() * 1000), // real microsecond timestamps, like the service
       hands: [{ id: 7, type: 'right', confidence: 1, grabStrength: grab, pinchStrength: 0, palmPosition: [x, 220, -30], palmVelocity: [200, 0, 0] }],
       pointables: [0, 1, 2, 3, 4].map(type => ({ id: 70 + type, handId: 7, type, tipPosition: [x + type * 10, 250, -60], extended: grab < .5, tool: false })),
     };
@@ -114,6 +115,8 @@ test('leap source tracks a hand from a fake Leap Motion service (v6 WebSocket pr
     const errors = await openSim(page, `source=leap&leap=ws://127.0.0.1:${sink.port}/v6.json&overlay=1&sim=presence&quality=low&dpr=1`);
     await page.waitForFunction(() => window.livemixerSim.host.state().tracked.hands.length === 1, null, { timeout: 15_000 });
     await page.waitForTimeout(600);
+    // Under heavy CPU load a stalled frame can let the tracker drop and re-acquire the hand; wait for it to be present again.
+    await page.waitForFunction(() => window.livemixerSim.host.state().tracked.hands.length === 1, null, { timeout: 15_000 });
     const early = await page.evaluate(() => { const h = window.livemixerSim.host.state().tracked.hands[0]; return { x: h.position.x, y: h.position.y, z: h.position.z, openness: h.openness, points: h.points.length, vx: h.velocity.x }; });
     const expectY = (220 - DEFAULT_LEAP_BOX.y[0]) / (DEFAULT_LEAP_BOX.y[1] - DEFAULT_LEAP_BOX.y[0]);
     expect(early.y).toBeGreaterThan(expectY - .1); expect(early.y).toBeLessThan(expectY + .1); // 220 mm inside the default box

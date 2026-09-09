@@ -154,7 +154,7 @@ export class SimHost {
 
   private context(): SimContext {
     const { width, height } = this.canvas;
-    return { gl: this.gl, canvas: this.canvas, width, height, aspect: width / Math.max(1, height), dpr: Math.min(this.settings.value.maxDpr, window.devicePixelRatio || 1), quality: this.settings.value.quality, capabilities: this.capabilities, warn: message => this.warn(message) };
+    return { gl: this.gl, canvas: this.canvas, width, height, aspect: width / Math.max(1, height), depth: this.settings.value.volumeDepth, dpr: Math.min(this.settings.value.maxDpr, window.devicePixelRatio || 1), quality: this.settings.value.quality, capabilities: this.capabilities, warn: message => this.warn(message) };
   }
 
   private createInstance() {
@@ -219,6 +219,8 @@ export class SimHost {
   }
 
   setQuality(quality: Quality) { this.settings.update(s => { s.quality = quality; }); this.createInstance(); }
+  /** The volume's depth in uniform units; instances are rebuilt because they size their worlds from it. */
+  setVolumeDepth(depth: number) { this.settings.update(s => { s.volumeDepth = Math.min(3, Math.max(.25, depth)); }); this.createInstance(); }
   setMaxDpr(dpr: number) { this.settings.update(s => { s.maxDpr = Math.min(3, Math.max(.5, dpr)); }); this.resize(true); }
 
   async setSource(id: SourceId, options: { recording?: string } = {}): Promise<void> {
@@ -372,7 +374,7 @@ export class SimHost {
     try {
       const { width, height } = this.canvas;
       // Render time follows simulation time (plus the fraction of a step not yet simulated) so the two never drift apart.
-      this.instance.render({ time: this.simTime + result.alpha * this.stepper.stepMs / 1000, alpha: result.alpha, width, height, aspect: width / Math.max(1, height) }, this.params as never);
+      this.instance.render({ time: this.simTime + result.alpha * this.stepper.stepMs / 1000, alpha: result.alpha, width, height, aspect: width / Math.max(1, height), depth: this.settings.value.volumeDepth }, this.params as never);
       const clamped = clampSignals(this.definition.signals, this.instance.signals() as Record<string, number>);
       this.signals = clamped.values; this.signalViolations = clamped.violations;
     } catch (error) { this.warn(`render failed: ${error instanceof Error ? error.message : String(error)}`); this.disposeInstance(); return; }

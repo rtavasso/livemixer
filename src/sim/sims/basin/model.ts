@@ -1,8 +1,17 @@
 /**
  * Basin — CPU-side model. Everything here is pure and free of WebGL so it can
- * be unit-tested: bowl geometry and the sim-space → grid mapping, palettes,
- * probe encoding/decoding and the analytic probe weights, signal shaping and
- * smoothing, and the ink-drop scheduler that turns gesture events into drops.
+ * be unit-tested: bowl geometry and the volume → grid mapping, the hand's
+ * height against the water surface, palettes, probe encoding/decoding and the
+ * analytic probe weights, signal shaping and smoothing, and the ink-drop
+ * scheduler that turns hand motion into drops.
+ *
+ * The bowl sits on the floor of the volume and is seen from above, so the
+ * water plane is the volume's horizontal plane: grid x is sim x (left → right)
+ * and grid y is sim z (depth: the glass edge at the bottom of the screen, the
+ * far edge of the table at the top). The top-down camera frames the whole
+ * floor, so sim z maps onto the screen height directly whatever the volume's
+ * `depth` setting. Sim y is the hand's HEIGHT; the water surface sits at the
+ * `surface` parameter and decides whether the hand touches the water.
  *
  * Grid space: the fluid lives on a square grid whose uv ∈ [0, 1]² covers a
  * square of side `domain = min(1, aspect)` uniform units centred on the
@@ -13,8 +22,7 @@
  */
 import type { Quality } from '../../core/types';
 import type { HandState } from '../../input/types';
-import type { GestureEvent } from '../../input/gestures';
-import { clamp, clamp01, rng } from '../../core/math';
+import { clamp, clamp01, rng, smoothstep } from '../../core/math';
 
 // ---------------------------------------------------------------------------
 // Quality → resources
@@ -28,30 +36,56 @@ export const JACOBI_BY_QUALITY: Record<Quality, number> = { low: 16, medium: 24,
 // ---------------------------------------------------------------------------
 
 export interface GridPoint { x: number; y: number }
-export interface GridHand { x: number; y: number; vx: number; vy: number; radius: number; push: number }
+
+/** A hand on the water plane, in grid units, with its relation to the surface. */
+export interface GridHand {
+  /** Planar position (grid uv) and velocity (uv/s): x from sim x, y from sim z. */
+  x: number; y: number; vx: number; vy: number;
+  /** Radius of the hand's footprint on the water, grid uv: the whole hand once plunged, a fingertip's worth when barely touching. */
+  radius: number;
+  /** Full radius of the hand, grid uv, for its shadow. */
+  extent: number;
+  /** 0 with the underside above the surface … 1 with the whole hand under (`handImmersion`). */
+  immersion: number;
+  /** Height of the hand's underside above the surface, uniform units; ≤ 0 once it touches. */
+  clearance: number;
+  /** Downward speed, uniform units per second; 0 while rising. */
+  descent: number;
+}
+export const emptyGridHand = (): GridHand => ({ x: 0, y: 0, vx: 0, vy: 0, radius: 0, extent: 0, immersion: 0, clearance: 0, descent: 0 });
 
 /** Side of the grid domain in uniform units: the shorter canvas side. */
 export const domainScale = (aspect: number) => Math.min(1, Math.max(1e-3, aspect));
 
-/** Sim-space point (each axis spans the canvas) → grid uv. */
-export function simToGrid(p: { x: number; y: number }, aspect: number): GridPoint {
+/** Sim-space point → grid uv on the water plane: x from sim x, y from sim z (depth). */
+export function simToGrid(p: { x: number; z: number }, aspect: number): GridPoint {
   const s = domainScale(aspect);
-  return { x: (p.x * aspect - aspect * .5) / s + .5, y: (p.y - .5) / s + .5 };
+  return { x: (p.x * aspect - aspect * .5) / s + .5, y: (p.z - .5) / s + .5 };
 }
 
-/** Sim-space velocity (sim units/s) → grid uv per second. */
-export function simVelocityToGrid(v: { x: number; y: number }, aspect: number): GridPoint {
+/** Sim-space velocity (sim units/s) → grid uv per second on the water plane. */
+export function simVelocityToGrid(v: { x: number; z: number }, aspect: number): GridPoint {
   const s = domainScale(aspect);
-  return { x: v.x * aspect / s, y: v.y / s };
+  return { x: v.x * aspect / s, y: v.z / s };
 }
 
-/** A conditioned hand in grid units: position, velocity, splat radius (clamped to something sensible). Writes into `out` when given (no allocation per step). */
-export function handToGrid(hand: Pick<HandState, 'position' | 'velocity' | 'radius' | 'push'>, aspect: number, out: GridHand = { x: 0, y: 0, vx: 0, vy: 0, radius: 0, push: 0 }): GridHand {
+/** Splat radius bounds, grid uv: never below a few texels, never a wall. */
+const SPLAT_MIN = .035, SPLAT_MAX = .16;
+
+/**
+ * A conditioned hand in grid units: planar position and velocity, the footprint it makes on the
+ * water, and its height against the surface. Writes into `out` when given (no allocation per step).
+ */
+export function handToGrid(hand: Pick<HandState, 'position' | 'velocity' | 'radius' | 'extent'>, aspect: number, surface: number, out: GridHand = emptyGridHand()): GridHand {
   const s = domainScale(aspect);
-  out.x = (hand.position.x * aspect - aspect * .5) / s + .5; out.y = (hand.position.y - .5) / s + .5;
-  out.vx = hand.velocity.x * aspect / s; out.vy = hand.velocity.y / s;
-  out.radius = clamp(hand.radius * aspect / s * .8, .035, .16);
-  out.push = clamp01(hand.push);
+  out.x = (hand.position.x * aspect - aspect * .5) / s + .5; out.y = (hand.position.z - .5) / s + .5;
+  out.vx = hand.velocity.x * aspect / s; out.vy = hand.velocity.z / s;
+  const half = handHalfHeight(hand), bottom = hand.position.y - half;
+  out.clearance = bottom - surface;
+  out.immersion = clamp01((surface - bottom) / (2 * half));
+  out.descent = Math.max(0, -hand.velocity.y);
+  out.extent = clamp(hand.radius * aspect / s * .8, SPLAT_MIN, SPLAT_MAX);
+  out.radius = Math.max(SPLAT_MIN, out.extent * footprint(out.immersion));
   return out;
 }
 
@@ -64,6 +98,41 @@ export function clampToBowl(p: GridPoint, bowl: number, margin = .08): GridPoint
   if (d <= limit) return p;
   const k = limit / d;
   return { x: .5 + (p.x - .5) * k, y: .5 + (p.y - .5) * k };
+}
+
+// ---------------------------------------------------------------------------
+// Height. Sim y is the hand's height in the volume (uniform units: the canvas
+// height is 1) and the water surface sits at `surface`. A hand has a body: its
+// underside is `position.y − halfHeight`, so immersion ramps from 0 as the
+// underside meets the surface to 1 when the whole hand is under. Sources
+// without a real extent get the tracker's default box, which still works.
+// ---------------------------------------------------------------------------
+
+export const HAND_HALF_HEIGHT_MIN = .03, HAND_HALF_HEIGHT_MAX = .12;
+
+/** Vertical half-extent of a hand, uniform units, bounded so a point source still has a body and a spread hand is not a wall. */
+export const handHalfHeight = (hand: Pick<HandState, 'extent'>) => clamp((hand.extent.max.y - hand.extent.min.y) * .5, HAND_HALF_HEIGHT_MIN, HAND_HALF_HEIGHT_MAX);
+
+/** Height of the hand's underside above the surface, uniform units; ≤ 0 once it touches, −2·halfHeight when fully under. */
+export const handClearance = (hand: Pick<HandState, 'position' | 'extent'>, surface: number) => hand.position.y - handHalfHeight(hand) - surface;
+
+/** 0 with the underside above the surface … 1 with the whole hand under; linear in between. */
+export function handImmersion(hand: Pick<HandState, 'position' | 'extent'>, surface: number): number {
+  const half = handHalfHeight(hand);
+  return clamp01((surface - (hand.position.y - half)) / (2 * half));
+}
+
+/** How hard a hand grips the water: nothing above the surface, gently when a fingertip touches, fully once plunged. */
+export const stirStrength = (immersion: number) => { const i = clamp01(immersion); return i * (2 - i); };
+
+/** Waterline footprint relative to the hand's radius: a sphere's cross-section at the surface, the full radius once the centre is under. */
+export const footprint = (immersion: number) => Math.sqrt(Math.min(1, 2 * clamp01(immersion)));
+
+/** Immersion for the signal: a hand plunged onto the table outside the bowl reads as dry (soft at the rim). */
+export function immersionSignal(hand: Pick<GridHand, 'x' | 'y' | 'immersion'>, bowl: number): number {
+  const dx = hand.x - .5, dy = hand.y - .5;
+  const gate = 1 - smoothstep(bowl - .04, bowl + .04, Math.sqrt(dx * dx + dy * dy));
+  return clamp01(hand.immersion * gate);
 }
 
 // ---------------------------------------------------------------------------
@@ -213,27 +282,28 @@ export function decodeProbe(bytes: ArrayLike<number>, weights: Float32Array): Me
 // Signals
 // ---------------------------------------------------------------------------
 
-export interface RawSignals { energy: number; swirl: number; rotation: number; ink: number }
+export interface RawSignals { energy: number; swirl: number; rotation: number; ink: number; immersion: number }
 export interface BasinSignals extends RawSignals { calm: number }
 
 /** Saturating curve: 0 at 0, ~0.63 at `scale`, → 1. */
 const soft = (x: number, scale: number) => 1 - Math.exp(-Math.max(0, x) / scale);
 
-/** Map physical means to the declared 0..1 / -1..1 ranges. */
-export function measuresToSignals(m: Measures): RawSignals {
+/** Map physical means (and the primary hand's immersion, computed on the CPU) to the declared 0..1 / -1..1 ranges. */
+export function measuresToSignals(m: Measures, immersion = 0): RawSignals {
   return {
     energy: soft(m.speed, .09),
     swirl: soft(m.curl, 5),
     rotation: clamp(Math.tanh(m.angular / .035), -1, 1),
     ink: clamp01(m.ink),
+    immersion: clamp01(immersion),
   };
 }
 
 /** Exponential smoothing so the audio side sees stable values; `calm` follows a slower energy. */
 export class SignalSmoother {
-  readonly values: BasinSignals = { energy: 0, swirl: 0, rotation: 0, ink: 0, calm: 1 };
+  readonly values: BasinSignals = { energy: 0, swirl: 0, rotation: 0, ink: 0, immersion: 0, calm: 1 };
   private slowEnergy = 0;
-  constructor(private readonly tau = { energy: .15, swirl: .2, rotation: .35, ink: .4, calm: 1.2 }) {}
+  constructor(private readonly tau = { energy: .15, swirl: .2, rotation: .35, ink: .4, immersion: .12, calm: 1.2 }) {}
   update(raw: RawSignals, dt: number): BasinSignals {
     const k = (tau: number) => (dt <= 0 ? 0 : 1 - Math.exp(-dt / tau));
     const v = this.values;
@@ -241,6 +311,7 @@ export class SignalSmoother {
     v.swirl = clamp01(v.swirl + (raw.swirl - v.swirl) * k(this.tau.swirl));
     v.rotation = clamp(v.rotation + (raw.rotation - v.rotation) * k(this.tau.rotation), -1, 1);
     v.ink = clamp01(v.ink + (raw.ink - v.ink) * k(this.tau.ink));
+    v.immersion = clamp01(v.immersion + (raw.immersion - v.immersion) * k(this.tau.immersion));
     this.slowEnergy = clamp01(this.slowEnergy + (raw.energy - this.slowEnergy) * k(this.tau.calm));
     v.calm = clamp01(1 - this.slowEnergy);
     return v;
@@ -265,34 +336,44 @@ export interface Drop {
 
 export interface DropContext {
   time: number;
-  events: readonly GestureEvent[];
   hands: readonly HandState[];
   aspect: number;
   bowl: number;
+  /** Height of the water surface, sim y. */
+  surface: number;
   /** Drop radius scale from the `ink` param, grid uv. */
   ink: number;
   palette: string;
+  /** Drop a gentle bead wherever a hand dips into the water (a plunge always drops one). */
   dropOnEnter: boolean;
   /** Current smoothed ink coverage signal, for the idle re-seeding rule. */
   inkLevel: number;
 }
 
-const PUSH_ON = .62, PUSH_OFF = .45, PUSH_COOLDOWN = .8;
+/** Wet/dry hysteresis, uniform units: the underside must sink this far below the surface to count as in, and rise this far above it to count as out. */
+export const WET_BAND = .012;
+/** Descent speed (uniform units/s) at which a dip becomes a plunge, and the speed at which the splash is strongest. */
+export const PLUNGE_SPEED = .25, PLUNGE_FULL = 1.1;
+export const PLUNGE_COOLDOWN = .8;
 const IDLE_AFTER = 14, IDLE_INK_BELOW = .05, IDLE_SPACING = 9;
 
+/** Radial impulse (grid uv/s) of a plunge at a given descent speed: the old push's range, now earned by real motion. */
+export const plungeImpulse = (descent: number) => .25 + .35 * clamp01((descent - PLUNGE_SPEED) / (PLUNGE_FULL - PLUNGE_SPEED));
+
 /**
- * Turns events and hand state into ink drops. Deterministic given its inputs
- * (seeded rng for colour and size variation). Rules:
- *  - `enter` (when `dropOnEnter`) → a bead where the hand arrived.
- *  - `push` gesture, or `hand.push` crossing PUSH_ON with hysteresis → a bead plus a radial impulse.
+ * Turns hand motion into ink drops. Deterministic given its inputs (seeded rng
+ * for colour and size variation). Rules:
+ *  - A hand's underside crossing the water surface downward (with hysteresis so a hand hovering at
+ *    the surface does not chatter) → a bead where it went in: with a radial splash when it came
+ *    down faster than PLUNGE_SPEED, gently (and only when `dropOnEnter`) otherwise. Once per
+ *    PLUNGE_COOLDOWN per hand. A hand first seen already wet drops nothing until it lifts out.
  *  - Nobody for IDLE_AFTER seconds and hardly any ink left → a lone bead so the bowl never goes dead.
  */
 export class DropScheduler {
   private readonly random: () => number;
   private index = 0;
-  private readonly pushed = new Map<number, { on: boolean; lastMs: number }>();
-  // Scratch sets reused across calls so a step allocates nothing when nothing happens.
-  private readonly pushedNow = new Set<number>();
+  private readonly wet = new Map<number, { wet: boolean; lastMs: number }>();
+  // Scratch set reused across calls so a step allocates nothing when nothing happens.
   private readonly seen = new Set<number>();
   private lastHandTime = -Infinity;
   private lastDropTime = -Infinity;
@@ -310,36 +391,29 @@ export class DropScheduler {
 
   /** Appends this step's drops to `drops` (a fresh array when omitted) and returns it. */
   update(ctx: DropContext, drops: Drop[] = []): Drop[] {
-    const pushedNow = this.pushedNow, seen = this.seen;
-    pushedNow.clear(); seen.clear();
+    const seen = this.seen;
+    seen.clear();
     let added = 0;
-    for (const e of ctx.events) {
-      if (e.type === 'enter' && ctx.dropOnEnter) {
-        const p = simToGrid(e.position, ctx.aspect);
-        if (insideBowl(p, ctx.bowl)) { drops.push(this.make(p, ctx.bowl, ctx.palette, ctx.ink, .9, 0)); added++; }
-      } else if (e.type === 'push') {
-        const p = simToGrid(e.position, ctx.aspect);
-        pushedNow.add(e.handId);
-        const s = this.pushed.get(e.handId) ?? { on: false, lastMs: -Infinity };
-        s.on = true; s.lastMs = ctx.time; this.pushed.set(e.handId, s);
-        if (insideBowl(p, ctx.bowl)) { drops.push(this.make(p, ctx.bowl, ctx.palette, ctx.ink, 1.2, .25 + .35 * clamp01(e.depth))); added++; }
-      }
-    }
     if (ctx.hands.length) this.lastHandTime = ctx.time;
     for (const hand of ctx.hands) {
       seen.add(hand.id);
-      let s = this.pushed.get(hand.id);
-      if (!s) { s = { on: hand.push >= PUSH_ON, lastMs: -Infinity }; this.pushed.set(hand.id, s); continue; }
-      if (!s.on && hand.push >= PUSH_ON) {
-        s.on = true;
-        if (!pushedNow.has(hand.id) && ctx.time - s.lastMs >= PUSH_COOLDOWN) {
-          s.lastMs = ctx.time;
+      const under = -handClearance(hand, ctx.surface);
+      const s = this.wet.get(hand.id);
+      if (!s) { this.wet.set(hand.id, { wet: under >= WET_BAND, lastMs: -Infinity }); continue; }
+      if (!s.wet && under >= WET_BAND) {
+        s.wet = true;
+        const descent = -hand.velocity.y, plunge = descent >= PLUNGE_SPEED;
+        if ((plunge || ctx.dropOnEnter) && ctx.time - s.lastMs >= PLUNGE_COOLDOWN) {
           const p = simToGrid(hand.position, ctx.aspect);
-          if (insideBowl(p, ctx.bowl)) { drops.push(this.make(p, ctx.bowl, ctx.palette, ctx.ink, 1.1, .3)); added++; }
+          if (insideBowl(p, ctx.bowl)) {
+            s.lastMs = ctx.time;
+            drops.push(plunge ? this.make(p, ctx.bowl, ctx.palette, ctx.ink, 1.2, plungeImpulse(descent)) : this.make(p, ctx.bowl, ctx.palette, ctx.ink, .9, 0));
+            added++;
+          }
         }
-      } else if (s.on && hand.push <= PUSH_OFF) s.on = false;
+      } else if (s.wet && under <= -WET_BAND) s.wet = false;
     }
-    if (this.pushed.size) for (const id of this.pushed.keys()) if (!seen.has(id) && !pushedNow.has(id)) this.pushed.delete(id);
+    if (this.wet.size) for (const id of this.wet.keys()) if (!seen.has(id)) this.wet.delete(id);
     if (!ctx.hands.length && ctx.time - this.lastHandTime > IDLE_AFTER && ctx.inkLevel < IDLE_INK_BELOW && ctx.time - this.lastDropTime > IDLE_SPACING) {
       const a = this.random() * Math.PI * 2, r = ctx.bowl * (.1 + .45 * Math.sqrt(this.random()));
       drops.push(this.make({ x: .5 + Math.cos(a) * r, y: .5 + Math.sin(a) * r }, ctx.bowl, ctx.palette, ctx.ink, 1, 0)); added++;

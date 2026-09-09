@@ -9,21 +9,29 @@ float peak(vec3 c) { return max(c.r, max(c.g, c.b)); }
 
 /**
  * Decay the previous frame, subtract the black floor, then deposit every
- * pending stroke segment with a distance-to-segment brush. Deposits saturate
- * against what is already there so overlaps bloom toward white gracefully.
+ * pending stroke segment with a distance-to-segment brush. Segments arrive
+ * already projected onto the glass (uniform units, apparent radius), so this
+ * pass is purely 2D. Deposits saturate against what is already there so
+ * overlaps bloom toward white gracefully.
+ *
+ * The alpha channel is a second, monochrome accumulation: the pool of light
+ * each segment casts on the floor of the volume, decayed the same way. The
+ * composite colours it and gates it by presence.
  */
 export function accumulateShader(maxSegments: number) {
   return `${GLSL_HEADER}${COMMON}
 in vec2 v_uv; out vec4 o;
 uniform sampler2D u_prev;
-uniform float u_decay, u_floor, u_aspect, u_headK;
+uniform float u_decay, u_floor, u_aspect, u_headK, u_eye;
 uniform int u_count;
-uniform vec4 u_segPos[${maxSegments}];   // ax, ay, bx, by in uniform units
-uniform vec4 u_segCol[${maxSegments}];   // rgb premultiplied by amplitude, radius
+uniform vec4 u_segPos[${maxSegments}];   // ax, ay, bx, by on the glass, uniform units
+uniform vec4 u_segCol[${maxSegments}];   // rgb premultiplied by amplitude, apparent radius
+uniform vec4 u_segPool[${maxSegments}];  // floor pool: cx, cy on the glass, apparent half-width, amplitude
 void main() {
-  vec3 old = max(texture(u_prev, v_uv).rgb * u_decay - u_floor, 0.0);
+  vec4 old = max(texture(u_prev, v_uv) * u_decay - u_floor, 0.0);
   vec2 p = vec2(v_uv.x * u_aspect, v_uv.y);
   vec3 add = vec3(0.0);
+  float pool = 0.0;
   for (int i = 0; i < ${maxSegments}; i++) {
     if (i >= u_count) break;
     vec4 s = u_segPos[i]; vec4 c = u_segCol[i];
@@ -31,25 +39,35 @@ void main() {
     float len2 = dot(ab, ab);
     float t = len2 > 1e-10 ? clamp(dot(p - s.xy, ab) / len2, 0.0, 1.0) : 0.0;
     float d = distance(p, s.xy + ab * t) / max(c.w, 1e-5);
-    if (d >= 1.0) continue;
-    float w = 1.0 - d * d; w = w * w * w;
-    // Coloured brush plus a tighter warm-white core.
-    add += c.rgb * w + vec3(peak(c.rgb) * 0.35) * (w * w * w);
+    if (d < 1.0) {
+      float w = 1.0 - d * d; w = w * w * w;
+      // Coloured brush plus a tighter warm-white core.
+      add += c.rgb * w + vec3(peak(c.rgb) * 0.35) * (w * w * w);
+    }
+    vec4 f = u_segPool[i];
+    // The pool lies on the floor (y = 0), whose screen height alone gives the perspective scale there: cy = (1 - scale) / 2.
+    // A disc on the floor is foreshortened to an ellipse scale / (2 eye) as tall as it is wide.
+    float scale = max(1.0 - 2.0 * f.y, 1e-3);
+    vec2 e = (p - f.xy) / vec2(max(f.z, 1e-5), max(f.z * 0.5 * scale / u_eye, 1e-5));
+    float d2 = dot(e, e);
+    if (d2 < 1.0) { float pw = 1.0 - d2; pool += f.w * pw * pw; }
   }
-  float head = exp(-u_headK * peak(old));
-  o = vec4(old + add * head, 1.0);
+  float head = exp(-u_headK * peak(old.rgb));
+  float poolHead = exp(-u_headK * old.a);
+  o = vec4(old.rgb + add * head, old.a + pool * poolHead);
 }`;
 }
 
-/** Sparkles: additive point sprites drawn over the composited picture, in display space. Positions in uniform units. */
+/** Sparkles: additive point sprites drawn over the composited picture. Positions are world units in the volume; the window camera projects them. */
 export const POINTS_VS = `${GLSL_HEADER}
-in vec2 a_pos; in float a_size; in vec3 a_col;
+in vec3 a_pos; in float a_size; in vec3 a_col;
 out vec3 v_col;
-uniform float u_aspect, u_pointScale;
+uniform mat4 u_matrix;
+uniform float u_eye, u_pointScale;
 void main() {
-  vec2 uv = vec2(a_pos.x / u_aspect, a_pos.y);
-  gl_Position = vec4(uv * 2.0 - 1.0, 0.0, 1.0);
-  gl_PointSize = max(1.5, a_size * u_pointScale);
+  gl_Position = u_matrix * vec4(a_pos, 1.0);
+  float scale = u_eye / (u_eye + a_pos.z);   // apparent size shrinks with depth
+  gl_PointSize = max(1.5, a_size * u_pointScale * scale);
   v_col = a_col;
 }`;
 
@@ -91,16 +109,19 @@ void main() {
 }`;
 
 /**
- * Final image: exposure, bloom, filmic tone-map, gamma, a little grain in lit areas, and a 1-LSB dither so fades do not band.
+ * Final image: exposure, bloom, the floor pool (accumulation alpha, coloured and gated by presence), filmic tone-map, gamma,
+ * a little grain in lit areas, and a 1-LSB dither so fades do not band.
  * `u_time` seeds the grain and must be wrapped by the caller (it is hashed in fp32, which loses the fractional bits after hours of uptime).
  */
 export const COMPOSITE_FS = `${GLSL_HEADER}${COMMON}
 in vec2 v_uv; out vec4 o;
 uniform sampler2D u_accum, u_bloom;
-uniform float u_exposure, u_bloomAmount, u_grain, u_time;
+uniform float u_exposure, u_bloomAmount, u_grain, u_time, u_pool;
+uniform vec3 u_poolColor;
 float hash(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
 void main() {
-  vec3 hdr = texture(u_accum, v_uv).rgb * u_exposure + texture(u_bloom, v_uv).rgb * u_bloomAmount;
+  vec4 acc = texture(u_accum, v_uv);
+  vec3 hdr = acc.rgb * u_exposure + texture(u_bloom, v_uv).rgb * u_bloomAmount + u_poolColor * (acc.a * u_exposure * u_pool);
   vec3 c = aces(hdr);
   // Dim light leans into its hue (deep amber, rose) instead of fading through brown-grey.
   float lin = luma(c);
