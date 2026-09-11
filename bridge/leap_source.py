@@ -350,6 +350,10 @@ MAX_TRACKED_HANDS = 16                       # an event claiming more is garbage
 MAX_JOINT_DISTANCE_MM = 3000.0               # the controller tracks to ~80 cm; anything farther is not a hand
 HAND_TYPE_NAMES = {0: "left", 1: "right"}
 FOREARM_STUB_MM = 70.0                       # how much forearm is kept past the wrist before projecting
+#: Where the rectification maps come from: ``LeapRectilinearToPixel`` (what the service computes, exact) or the 64x64
+#: distortion lattice attached to every image event (:class:`leap_stereo.GridCalibration`; the same answer in the
+#: centre of the sensor, a few pixels off towards its edges, but built without a per-point call into LeapC).
+CALIBRATIONS = ("function", "lattice")
 
 
 @dataclass(frozen=True)
@@ -910,12 +914,15 @@ class LeapStereoSource(FrameSource):
         self, dll_path: str | None = None, view: ls.RectifiedView | None = None, params: ls.StereoParams | None = None,
         swap: bool = False, orient: str = "none", fps: float = 30.0, stall_after: float = 3.0, restart_after: float = 20.0,
         poll_timeout_ms: int = 100, sample_step: int = 4, baseline_mm: float | None = None,
-        hand_frame: str = "auto", tracking_window_s: float = 0.05,
+        hand_frame: str = "auto", tracking_window_s: float = 0.05, alignment: str = "auto", calibration: str = "function",
+        align_every: int = 3,
     ) -> None:
         if orient not in ls.ORIENTATIONS:
             raise ValueError(f"orient must be one of {ls.ORIENTATIONS}")
         if hand_frame != "auto" and hand_frame not in HAND_FRAME_BY_NAME:
             raise ValueError(f"unknown hand frame {hand_frame!r}; use 'auto' or one of {', '.join(HAND_FRAME_NAMES)}")
+        if calibration not in CALIBRATIONS:
+            raise ValueError(f"calibration must be one of {CALIBRATIONS}")
         self.dll_path = dll_path
         self.view = view or ls.RectifiedView()
         self.params = params or ls.StereoParams()
@@ -926,6 +933,12 @@ class LeapStereoSource(FrameSource):
         self.forced_baseline_mm = baseline_mm
         self.hand_frame = hand_frame
         self.tracking_window_us = int(tracking_window_s * 1e6)
+        self.calibration = calibration
+        self.alignment_mode = alignment
+        self.alignment = ls.CameraAlignment() if alignment == "auto" else ls.CameraAlignment.parse(alignment)
+        self.align_estimator: ls.AlignmentEstimator | None = ls.AlignmentEstimator(self.view) if alignment == "auto" else None
+        self.align_every = max(1, int(align_every))
+        self._reads = 0
         self.projector: HandProjector | None = None
         self._tracking: deque[TrackingFrame] = deque(maxlen=64)  # ~0.25 s at the service's tracking rate
         self.tracking_frames = 0
@@ -945,8 +958,9 @@ class LeapStereoSource(FrameSource):
         self._error: str | None = None
         self._seq = 0
         self.rectifier: ls.Rectifier | None = None
-        self._maps_key: tuple[int, int, int] | None = None
+        self._maps_key: tuple[int, int, int, ls.CameraAlignment] | None = None
         self._maps_attempt_at = 0.0
+        self.image_properties: tuple[float, float, float, float] | None = None  # (x_scale, y_scale, x_offset, y_offset) of the first image
         self.stereo: ls.StereoDepth | None = None
         self._stuck = False
         self._last_return: float | None = None
@@ -1137,8 +1151,12 @@ class LeapStereoSource(FrameSource):
             self._seq += 1
             self._latest = StereoPair(images[0], images[1], int(event.image[0].matrix_version), int(event.info.frame_id), stamp, self._seq, int(event.info.timestamp))
             if self._seq == 1:
+                p0 = event.image[0].properties
                 self.image_size = (images[0].shape[1], images[0].shape[0])
-                log.info("LeapC images: %dx%d, format 0x%x, matrix_version %d", images[0].shape[1], images[0].shape[0], int(event.image[0].properties.format), int(event.image[0].matrix_version))
+                self.image_properties = (float(p0.x_scale), float(p0.y_scale), float(p0.x_offset), float(p0.y_offset))
+                log.info("LeapC images: %dx%d, format 0x%x, matrix_version %d, ray scale/offset x %.4f/%.3f y %.4f/%.3f (0.125/0.5 = the lattice spans slopes -4..4)",
+                         images[0].shape[1], images[0].shape[0], int(p0.format), int(event.image[0].matrix_version),
+                         self.image_properties[0], self.image_properties[2], self.image_properties[1], self.image_properties[3])
             self._cond.notify_all()
 
     def _on_tracking(self, event: _TrackingEvent) -> None:
@@ -1172,7 +1190,48 @@ class LeapStereoSource(FrameSource):
         tracking = f"{self.tracking_frames} frames, {len(newest.hands) if newest else 0} hand(s) in the newest"
         hand_frame = self.projector.describe() if self.projector is not None else f"{self.hand_frame} (pending)"
         return (f"connected={self.connected}, device={device}, policy={policy}, images={self._seq}, tracking={tracking}, "
-                f"hand frame={hand_frame}, events: {counts or 'none'}")
+                f"hand frame={hand_frame}, alignment={self.describe_alignment()}, events: {counts or 'none'}")
+
+    def describe_alignment(self) -> str:
+        if self.align_estimator is None:
+            return f"{self.alignment.name} (fixed)" if not self.alignment.identity else "none"
+        if self.align_estimator.fit is not None:
+            return f"{self.alignment.name} (auto: {self.align_estimator.describe()})"
+        return f"{self.alignment.name} (auto, {self.align_estimator.describe()})"
+
+    def _ray_to_pixel(self) -> ls.RayToPixel:
+        """The calibration the rectifier is built from: the LeapC function, or the images' lattice when asked for and delivered."""
+        assert self.lib is not None and self._conn is not None
+        if self.calibration == "lattice" and all(cam in self.last_distortion for cam in ls.CAMERAS) and self.image_size is not None:
+            grids = {cam: self.last_distortion[cam].astype(np.float64) for cam in ls.CAMERAS}
+            if all(np.isfinite(g).all() for g in grids.values()):
+                return ls.GridCalibration(grids, self.image_size[0], self.image_size[1], normalized=True)
+            log.warning("the image events' distortion lattice holds NaN; using LeapRectilinearToPixel instead")
+        lib, conn, device = self.lib, self._conn, self._device
+
+        def ray_to_pixel(camera: int, tx: float, ty: float) -> tuple[float, float]:
+            return lib.rectilinear_to_pixel(conn, camera, tx, ty, device)
+
+        return ray_to_pixel
+
+    def sample_calibration(self) -> dict[int, np.ndarray]:
+        """``LeapRectilinearToPixel`` sampled on the distortion lattice's own grid, per camera, as ``(64, 64, 2)`` raw pixels.
+
+        Saved by ``--dump-images`` next to the lattice so that ``stereo_lab.py``
+        can rectify offline exactly as the bridge did live.
+        """
+        assert self.lib is not None and self._conn is not None
+        n, r = ls.DISTORTION_GRID_N, ls.DISTORTION_SLOPE_RANGE
+        out: dict[int, np.ndarray] = {}
+        for cam in ls.CAMERAS:
+            grid = np.empty((n, n, 2), dtype=np.float32)
+            for j in range(n):
+                ty = r - 2.0 * r * j / (n - 1)
+                for i in range(n):
+                    tx = -r + 2.0 * r * i / (n - 1)
+                    grid[j, i] = self.lib.rectilinear_to_pixel(self._conn, cam, tx, ty, self._device)
+            out[cam] = grid
+        return out
 
     def _wait_for_pair(self) -> StereoPair:
         waited_from = time.monotonic()
@@ -1206,21 +1265,18 @@ class LeapStereoSource(FrameSource):
         """
         assert self.lib is not None and self._conn is not None
         h, w = pair.left.shape
-        current = (w, h, pair.matrix_version)
+        current = (w, h, pair.matrix_version, self.alignment)
         if self.rectifier is None or self._maps_key != current:
             now = time.monotonic()
             if self.rectifier is None or now - self._maps_attempt_at >= 1.0:
                 self._maps_attempt_at = now
-                lib, conn, device = self.lib, self._conn, self._device
-
-                def ray_to_pixel(camera: int, tx: float, ty: float) -> tuple[float, float]:
-                    return lib.rectilinear_to_pixel(conn, camera, tx, ty, device)
-
+                ray_to_pixel = self._ray_to_pixel()
                 started = time.perf_counter()
-                rectifier = ls.Rectifier(ray_to_pixel, w, h, self.view, sample_step=self.sample_step)
+                rectifier = ls.Rectifier(ray_to_pixel, w, h, self.view, sample_step=self.sample_step, alignment=self.alignment)
                 cov = rectifier.coverage
-                log.info("rectification maps built for %dx%d raw -> %dx%d view (%.0f deg), matrix_version %d, %.0f ms, coverage L %.2f R %.2f",
-                         w, h, self.view.width, self.view.height, self.view.hfov_deg, pair.matrix_version, (time.perf_counter() - started) * 1000.0, cov[ls.CAMERA_LEFT], cov[ls.CAMERA_RIGHT])
+                log.info("rectification maps built for %dx%d raw -> %dx%d view (%.0f deg, f %.0f px) from %s, matrix_version %d, alignment %s, %.0f ms, coverage L %.2f R %.2f",
+                         w, h, self.view.width, self.view.height, self.view.hfov_deg, self.view.fx, "the distortion lattice" if isinstance(ray_to_pixel, ls.GridCalibration) else "LeapRectilinearToPixel",
+                         pair.matrix_version, self.alignment.name if not self.alignment.identity else "none", (time.perf_counter() - started) * 1000.0, cov[ls.CAMERA_LEFT], cov[ls.CAMERA_RIGHT])
                 if min(cov.values()) >= 0.5:
                     self.rectifier, self._maps_key = rectifier, current
                 else:
@@ -1230,8 +1286,10 @@ class LeapStereoSource(FrameSource):
         baseline = self.forced_baseline_mm or (self.device_info.baseline_mm if self.device_info and self.device_info.baseline_um > 0 else ls.CONTROLLER_BASELINE_MM)
         if self.stereo is None or abs(self.stereo.baseline_mm - baseline) > 1e-6:
             self.stereo = ls.StereoDepth(baseline, self.view.fx, self.params, self.swap)
-            log.info("stereo matcher %s: baseline %.1f mm, f %.1f px, %d disparities (near plane %.0f mm), swap=%s",
-                     self.stereo.matcher_name, baseline, self.view.fx, self.stereo.num_disparities, self.params.min_depth_mm, self.swap)
+            p = self.params
+            log.info("stereo matcher %s/%s block %d: baseline %.1f mm, f %.1f px, %d disparities (near plane %.0f mm), swap=%s; rules: intensity [%d, %d), lit %d @ %.0f mm, texture %d, uniqueness %d, lr %d",
+                     self.stereo.matcher_name, p.mode, p.block_size, baseline, self.view.fx, self.stereo.num_disparities, p.min_depth_mm, self.swap,
+                     p.min_intensity, p.max_intensity, p.min_lit, p.lit_reference_mm, p.min_texture, p.uniqueness, p.disp12_max_diff)
         if self.projector is None:
             self.projector = HandProjector(self.view, baseline, self.swap, self.orient, self.hand_frame)
             log.info("hand skeletons projected with hand frame %s", self.projector.describe())
@@ -1245,6 +1303,20 @@ class LeapStereoSource(FrameSource):
             if now < due:
                 time.sleep(due - now)
 
+    def _observe_alignment(self, left: np.ndarray, right: np.ndarray) -> None:
+        """Feed every ``align_every``-th rectified pair to the alignment estimator; adopt its fit (the maps are rebuilt on the next frame)."""
+        estimator = self.align_estimator
+        if estimator is None or estimator.done or self._reads % self.align_every:
+            return
+        started = time.perf_counter()
+        fit = estimator.observe(left, right)
+        if fit is not None:
+            self.alignment = fit.alignment
+            log.info("camera alignment fitted from the images: %s (%.0f ms); the right camera's rays are now rotated by it and the maps rebuilt",
+                     fit.describe(), (time.perf_counter() - started) * 1000.0)
+        elif estimator.done:
+            log.warning("camera alignment: %s; put a hand or something textured 20-40 cm above the device, or pass --leap-align PITCH,ROLL", estimator.describe())
+
     def read(self) -> DepthFrame:
         if self._thread is None:
             raise RuntimeError("LeapStereoSource.read() before start()")
@@ -1253,6 +1325,8 @@ class LeapStereoSource(FrameSource):
         self._ensure_pipeline(pair)
         assert self.rectifier is not None and self.stereo is not None and self.projector is not None
         left, right = self.rectifier.rectify_pair(pair.left, pair.right)
+        self._reads += 1
+        self._observe_alignment(left, right)
         depth = ls.reorient(self.stereo.compute(left, right), self.orient)
         hands = self.projector.resolve(self._hands_at(pair.timestamp_us), depth)
         self.last_pair, self.last_rectified, self.last_depth, self.last_hands = pair, (left, right), depth, hands
@@ -1291,7 +1365,7 @@ class LeapSyntheticSource(FrameSource):
         self, view: ls.RectifiedView | None = None, params: ls.StereoParams | None = None, swap: bool = False,
         orient: str = "none", fps: float = 30.0, paced: bool = True, raw_model: ls.FisheyeModel | None = None,
         baseline_mm: float = ls.CONTROLLER_BASELINE_MM, speed: float = 1.0, absences: bool = True, sample_step: int = 4,
-        hand_frame: str = "auto", true_frame: str = DEFAULT_HAND_FRAME, skeletons: bool = True,
+        hand_frame: str = "auto", true_frame: str = DEFAULT_HAND_FRAME, skeletons: bool = True, alignment: str = "none",
     ) -> None:
         if orient not in ls.ORIENTATIONS:
             raise ValueError(f"orient must be one of {ls.ORIENTATIONS}")
@@ -1304,7 +1378,8 @@ class LeapSyntheticSource(FrameSource):
         self.swap, self.orient, self.fps, self.paced = bool(swap), orient, float(fps), paced
         self.raw_model = raw_model or ls.FisheyeModel()
         self.baseline_mm, self.speed, self.absences = float(baseline_mm), float(speed), absences
-        self.rectifier = ls.Rectifier(self.raw_model.ray_to_pixel, self.raw_model.width, self.raw_model.height, self.view, sample_step=sample_step)
+        self.alignment = ls.CameraAlignment() if alignment == "auto" else ls.CameraAlignment.parse(alignment)  # the stand-in cameras are co-aligned: auto means none
+        self.rectifier = ls.Rectifier(self.raw_model.ray_to_pixel, self.raw_model.width, self.raw_model.height, self.view, sample_step=sample_step, alignment=self.alignment)
         self.stereo = ls.StereoDepth(self.baseline_mm, self.view.fx, self.params, self.swap)
         self.projector = HandProjector(self.view, self.baseline_mm, self.swap, self.orient, hand_frame)
         self.true_frame = HAND_FRAME_BY_NAME[true_frame]
@@ -1370,8 +1445,50 @@ class LeapSyntheticSource(FrameSource):
 
 
 # --------------------------------------------------------------------------- #
-# CLI: dump images for inspection
+# CLI: the stereo flags shared with depth_bridge, and dumping images for inspection
 # --------------------------------------------------------------------------- #
+
+#: The rectified view the bridge matches by default: 480x360 over 90 deg, f = 240 px. The controller's raw image has
+#: only 2.4 px/deg horizontally and 1.2 rows/deg vertically at the centre of the sensor (rising to 4-6 px/deg at 45 deg
+#: off-axis), so a hand over the device is already oversampled at 320x240 (2.8 px/deg); the larger view is for the
+#: matcher, whose 5x5 blocks and smoothness then span 2 deg instead of 3 and stop bridging the gaps between spread
+#: fingers. With the parallel 3-way SGBM it costs about what 320x240 five-direction SGBM did.
+DEFAULT_VIEW = (480, 360)
+DEFAULT_FOV_DEG = 90.0
+#: The bridge's surface scan for the Leap sources: 3 view pixels per cell at the default view, so a finger (13 px) spans 4 cells.
+DEFAULT_SURFACE = (160, 120)
+STEREO_MODES = ("sgbm", "hh", "3way")
+STEREO_MATCHERS = ("sgbm", "bm")
+
+
+def add_stereo_arguments(p: argparse.ArgumentParser | Any, prefix: str = "leap-") -> None:
+    """The matcher and invalidation flags, once for ``leap_source.py`` (no prefix) and once, verbatim, in ``depth_bridge.py`` (``leap-``).
+
+    ``depth_bridge.build_parser`` cannot import this module (OpenCV is
+    optional there), so it repeats these with the same defaults; a test pins
+    the two parsers to each other.
+    """
+    d = ls.StereoParams()
+    p.add_argument(f"--{prefix}min-intensity", type=int, default=d.min_intensity, help="ignore IR pixels darker than this, 0..255; the LEDs do not reach the background (default: %(default)s)")
+    p.add_argument(f"--{prefix}max-intensity", type=int, default=d.max_intensity, help="ignore IR pixels at or above this, 0..255: a hand close to the LEDs saturates and matches anywhere; 255 = off (default: %(default)s)")
+    p.add_argument(f"--{prefix}min-lit", type=int, default=d.min_lit, help="ignore a match darker than N * (300 mm / depth)^2 in a 5x5 neighbourhood: a dark wall cannot be 25 cm from the LEDs; 0 = off (default: %(default)s)")
+    p.add_argument(f"--{prefix}min-texture", type=int, default=d.min_texture, help="ignore pixels whose 7x7 neighbourhood spans fewer grey levels than this; 0 = off (default: %(default)s; skin is smooth, so this hollows a hand before it removes phantoms)")
+    p.add_argument(f"--{prefix}uniqueness", type=int, default=d.uniqueness, help="percent margin the best disparity must win by, 0..100 (default: %(default)s)")
+    p.add_argument(f"--{prefix}block", type=int, default=d.block_size, help="matching block size, odd (default: %(default)s)")
+    p.add_argument(f"--{prefix}mode", choices=STEREO_MODES, default=d.mode, help="SGBM path aggregation: 3way (parallel, fastest), sgbm (5 directions), hh (8 directions, slowest) (default: %(default)s)")
+    p.add_argument(f"--{prefix}matcher", choices=STEREO_MATCHERS, default=d.matcher, help="sgbm or plain block matching (bm: faster, far sparser on skin) (default: %(default)s)")
+    p.add_argument(f"--{prefix}align", default="auto", metavar="MODE", help="right-camera alignment: 'auto' (fitted from feature matches in the first frames, default), 'none', or PITCH,ROLL[,YAW] in degrees")
+    p.add_argument(f"--{prefix}calibration", choices=CALIBRATIONS, default="function", help="rectify with LeapRectilinearToPixel (function, default) or the images' 64x64 distortion lattice")
+
+
+def stereo_params_from_args(args: argparse.Namespace, min_depth_mm: float, prefix: str = "leap_") -> ls.StereoParams:
+    """:class:`leap_stereo.StereoParams` from the flags :func:`add_stereo_arguments` declares (``prefix`` with underscores)."""
+    def get(name: str) -> Any:
+        return getattr(args, prefix + name)
+    return ls.StereoParams(
+        min_depth_mm=min_depth_mm, min_intensity=get("min_intensity"), max_intensity=get("max_intensity"), min_lit=get("min_lit"),
+        min_texture=get("min_texture"), uniqueness=get("uniqueness"), block_size=get("block"), mode=get("mode"), matcher=get("matcher"),
+    )
 
 
 def _write_png(path: str, image: np.ndarray) -> None:
@@ -1410,6 +1527,9 @@ def dump_images(source: LeapStereoSource | LeapSyntheticSource, count: int, out_
                 _write_png(stem + "_raw_right.png", source.last_pair.right)
                 for cam, matrix in source.last_distortion.items():
                     np.save(os.path.join(out_dir, f"leap_distortion_{'left' if cam == ls.CAMERA_LEFT else 'right'}.npy"), matrix)
+                if i == 0:
+                    for cam, grid in source.sample_calibration().items():
+                        np.save(os.path.join(out_dir, f"leap_r2p_{'left' if cam == ls.CAMERA_LEFT else 'right'}.npy"), grid)
             inbox = int(((depth >= near_mm) & (depth <= far_mm)).sum())
             valid = int((depth > 0).sum())
             stereo = source.stereo
@@ -1421,6 +1541,13 @@ def dump_images(source: LeapStereoSource | LeapSyntheticSource, count: int, out_
                 hint = " <- the OTHER camera order puts far more pixels in the box: " + ("drop" if stereo.swap else "add") + " --swap-cameras"
             log.info("frame %d: %dx%d, %d valid px, %d in [%.0f, %.0f] mm (swapped order: %d)%s, left mean %.1f",
                      i, depth.shape[1], depth.shape[0], valid, inbox, near_mm, far_mm, inbox_other, hint, float(left.mean()))
+            matches = ls.match_pair(left, right)
+            if len(matches):
+                rows = matches[:, 3] - matches[:, 1]
+                log.info("frame %d: %d feature matches between the eyes, row offset median %+.2f px (std %.2f) with alignment %s; 0 is a rectified pair",
+                         i, len(matches), float(np.median(rows)), float(rows.std()), source.alignment.name if not source.alignment.identity else "none")
+            else:
+                log.info("frame %d: no feature matches between the eyes (nothing textured in view?)", i)
             hands = frame.hands or ()
             if hands:
                 on_scan = sum(joint_hits(h.joints[SCORED_JOINTS], depth, 30.0) for h in hands)
@@ -1434,6 +1561,8 @@ def dump_images(source: LeapStereoSource | LeapSyntheticSource, count: int, out_
         log.info("%s", projector.detector.table())
     elif projector is not None:
         log.info("hand frame %s", projector.describe())
+    if isinstance(source, LeapStereoSource):
+        log.info("camera alignment: %s", source.describe_alignment())
     log.info("wrote %d frame(s) to %s", written, out_dir)
     return written
 
@@ -1444,11 +1573,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", default=os.path.join("test-results", "leap"), help="output directory (default: %(default)s)")
     p.add_argument("--synthetic", action="store_true", help="use the rendered scene instead of hardware")
     p.add_argument("--leapc", metavar="PATH", help="LeapC library (default: search Ultraleap, then Leap Motion Core Services, then $LEAPC_DLL)")
-    p.add_argument("--view", type=int, nargs=2, default=(320, 240), metavar=("W", "H"), help="rectified view size (default: 320 240)")
-    p.add_argument("--fov", type=float, default=90.0, metavar="DEG", help="horizontal field of view of the view (default: %(default)s)")
+    p.add_argument("--view", type=int, nargs=2, default=DEFAULT_VIEW, metavar=("W", "H"), help="rectified view size (default: %d %d)" % DEFAULT_VIEW)
+    p.add_argument("--fov", type=float, default=DEFAULT_FOV_DEG, metavar="DEG", help="horizontal field of view of the view (default: %(default)s)")
     p.add_argument("--near", type=float, default=0.1, metavar="M", help="near plane in metres, sets the disparity range (default: %(default)s)")
     p.add_argument("--far", type=float, default=0.45, metavar="M", help="far plane in metres, for the preview and the in-box count (default: %(default)s)")
-    p.add_argument("--min-intensity", type=int, default=16, help="ignore IR pixels darker than this, 0..255 (default: %(default)s)")
+    add_stereo_arguments(p, prefix="")
     p.add_argument("--swap-cameras", action="store_true", help="exchange the cameras before matching")
     p.add_argument("--orient", choices=ls.ORIENTATIONS, default="none", help="rotate/flip the depth image (default: none)")
     p.add_argument("--hand-frame", default="auto", metavar="MODE", help="device-to-image convention for the hand skeleton: auto (default, prints the candidate table) or one of " + ", ".join(HAND_FRAME_NAMES))
@@ -1471,15 +1600,15 @@ def main(argv: list[str] | None = None) -> int:
         timer = threading.Timer(args.timeout, watchdog)
         timer.daemon = True
         timer.start()
-    view = ls.RectifiedView.from_fov(args.view[0], args.view[1], args.fov)
-    params = ls.StereoParams(min_depth_mm=args.near * 1000.0, min_intensity=args.min_intensity)
     source: LeapStereoSource | LeapSyntheticSource
     code = 0
     try:
+        view = ls.RectifiedView.from_fov(args.view[0], args.view[1], args.fov)
+        params = stereo_params_from_args(args, args.near * 1000.0, prefix="")
         if args.synthetic:
             source = LeapSyntheticSource(view, params, args.swap_cameras, args.orient, fps=args.fps, paced=False, hand_frame=args.hand_frame)
         else:
-            source = LeapStereoSource(args.leapc, view, params, args.swap_cameras, args.orient, fps=args.fps, hand_frame=args.hand_frame)
+            source = LeapStereoSource(args.leapc, view, params, args.swap_cameras, args.orient, fps=args.fps, hand_frame=args.hand_frame, alignment=args.align, calibration=args.calibration)
         dump_images(source, args.dump_images, args.out, args.near * 1000.0, args.far * 1000.0)
     except (RuntimeError, ValueError) as exc:
         log.error("%s", exc)

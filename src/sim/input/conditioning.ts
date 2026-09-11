@@ -45,8 +45,9 @@ export const trackerSettingsSchema = z.object({
   volumeNy: z.number().int().min(4).max(128).default(32),
   volumeNz: z.number().int().min(4).max(128).default(24),
   /** Surface field resolution in sim space (depth-camera scan). */
-  surfaceWidth: z.number().int().min(8).max(512).default(128),
-  surfaceHeight: z.number().int().min(8).max(512).default(96),
+  /** The scan is resampled to this grid; 192×144 keeps finger-level detail from a bridge sending 160×120 or more. */
+  surfaceWidth: z.number().int().min(8).max(512).default(192),
+  surfaceHeight: z.number().int().min(8).max(512).default(144),
 }).strict();
 export type TrackerSettings = z.infer<typeof trackerSettingsSchema>;
 export const DEFAULT_TRACKER_SETTINGS: TrackerSettings = trackerSettingsSchema.parse({});

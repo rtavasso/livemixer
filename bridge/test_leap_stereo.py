@@ -14,7 +14,9 @@ the fisheye stand-in for the raw cameras (rectifier + matcher), then through
 from __future__ import annotations
 
 import base64
+import contextlib
 import ctypes as C
+import io
 import json
 import os
 import subprocess
@@ -829,6 +831,314 @@ class HandFrameDetectorTests(unittest.TestCase):
             lsrc.HandFrameDetector(candidates=())
 
 
+# ---- the calibration grids, the camera alignment and the invalidation rules ---- #
+
+
+def model_lattice(model: ls.FisheyeModel, camera: int, normalized: bool = True) -> np.ndarray:
+    """The 64x64 grid LeapC would attach to an image of this stand-in camera, in the documented convention:
+    column i is the ray tx = -4 + 8 i / 63, row j is ty = 4 - 8 j / 63, values normalized so that pixel centre p is (p + 0.5) / size."""
+    n, r = ls.DISTORTION_GRID_N, ls.DISTORTION_SLOPE_RANGE
+    i, j = np.meshgrid(np.arange(n), np.arange(n))
+    tx, ty = -r + 2 * r * i / (n - 1), r - 2 * r * j / (n - 1)
+    px, py = model.ray_to_pixel(camera, tx, ty)
+    if normalized:
+        return np.stack([(px + 0.5) / model.width, (py + 0.5) / model.height], axis=-1).astype(np.float32)
+    return np.stack([px, py], axis=-1).astype(np.float32)
+
+
+class GridCalibrationTests(unittest.TestCase):
+    def test_lattice_convention_reproduces_the_model(self) -> None:
+        cal = ls.GridCalibration({cam: model_lattice(MODEL, cam) for cam in ls.CAMERAS}, MODEL.width, MODEL.height, normalized=True)
+        rng = np.random.default_rng(1)
+        tx, ty = rng.uniform(-1.2, 1.2, 500), rng.uniform(-0.9, 0.9, 500)
+        for cam in ls.CAMERAS:
+            px, py = cal.lookup(cam, tx, ty)
+            ex, ey = MODEL.ray_to_pixel(cam, tx, ty)
+            self.assertLess(float(np.abs(px - ex).max()), 0.6, "bilinear interpolation of the 64x64 lattice is good to half a pixel inside +-50 deg (the stand-in lens curves more than the real one)")
+            self.assertLess(float(np.abs(py - ey).max()), 0.6)
+            self.assertLess(float(np.abs(px - ex).mean()), 0.3)
+            self.assertEqual(cal(cam, 0.3, -0.2), (float(cal.lookup(cam, 0.3, -0.2)[0]), float(cal.lookup(cam, 0.3, -0.2)[1])), "the scalar call is the RayToPixel protocol")
+        self.assertTrue(np.isnan(cal.lookup(ls.CAMERA_LEFT, 4.5, 0.0)[0]), "rays beyond the lattice have no pixel")
+        pixels = ls.GridCalibration({cam: model_lattice(MODEL, cam, normalized=False) for cam in ls.CAMERAS}, MODEL.width, MODEL.height, normalized=False)
+        self.assertTrue(np.allclose(pixels.lookup(ls.CAMERA_RIGHT, tx, ty), cal.lookup(ls.CAMERA_RIGHT, tx, ty), atol=1e-3), "a grid of pixel samples and the normalized lattice agree")
+        # Rectifying through the grid is the same as rectifying through the function.
+        via_grid = ls.Rectifier(cal, MODEL.width, MODEL.height, VIEW)
+        via_model = ls.Rectifier(MODEL.ray_to_pixel, MODEL.width, MODEL.height, VIEW)
+        for cam in ls.CAMERAS:
+            for k in range(2):
+                self.assertLess(float(np.abs(via_grid.maps[cam][k] - via_model.maps[cam][k]).max()), 0.6, "the vectorised lookup builds the same maps")
+        raw_left, raw_right = sphere_scene(300.0).raw_pair(MODEL)
+        a, b = via_grid.rectify_pair(raw_left, raw_right), via_model.rectify_pair(raw_left, raw_right)
+        self.assertLess(float(np.abs(a[0].astype(int) - b[0].astype(int)).mean()), 1.0)
+        with self.assertRaises(ValueError):
+            ls.GridCalibration({1: np.zeros((64, 64))}, 640, 240)
+        with self.assertRaises(ValueError):
+            ls.GridCalibration({}, 640, 240)
+
+    def test_load_prefers_the_function_samples(self) -> None:
+        out = tempfile.mkdtemp(prefix="leap-cal-")
+        for cam, side in ((ls.CAMERA_LEFT, "left"), (ls.CAMERA_RIGHT, "right")):
+            np.save(os.path.join(out, f"leap_distortion_{side}.npy"), model_lattice(MODEL, cam))
+        with self.assertRaises(FileNotFoundError):
+            ls.GridCalibration.load(tempfile.mkdtemp(prefix="leap-empty-"))
+        lattice = ls.GridCalibration.load(out, MODEL.width, MODEL.height)
+        self.assertEqual(getattr(lattice, "source"), "leap_distortion")
+        for cam, side in ((ls.CAMERA_LEFT, "left"), (ls.CAMERA_RIGHT, "right")):
+            np.save(os.path.join(out, f"leap_r2p_{side}.npy"), model_lattice(MODEL, cam, normalized=False))
+        samples = ls.GridCalibration.load(out, MODEL.width, MODEL.height)
+        self.assertEqual(getattr(samples, "source"), "leap_r2p")
+        self.assertEqual(getattr(ls.GridCalibration.load(out, MODEL.width, MODEL.height, prefer_samples=False), "source"), "leap_distortion")
+        self.assertTrue(np.allclose(samples.lookup(1, 0.4, 0.1), lattice.lookup(1, 0.4, 0.1), atol=1e-3))
+
+
+def tilted_calibration(tilt: ls.CameraAlignment) -> ls.RayToPixel:
+    """The stand-in cameras' calibration as a service that has the RIGHT camera's frame wrong by ``tilt``."""
+    def ray_to_pixel(camera: int, tx: float, ty: float) -> tuple[float, float]:
+        if camera == ls.CAMERA_RIGHT:
+            tx, ty = (float(v) for v in tilt.rotate(tx, ty))
+        px, py = MODEL.ray_to_pixel(camera, tx, ty)
+        return float(px), float(py)
+    return ray_to_pixel
+
+
+class CameraAlignmentTests(unittest.TestCase):
+    def test_matrix_parse_and_rotate(self) -> None:
+        self.assertTrue(ls.CameraAlignment().identity)
+        self.assertTrue(np.allclose(ls.CameraAlignment().matrix, np.eye(3)))
+        a = ls.CameraAlignment.parse("0.5,-0.3")
+        self.assertEqual((a.pitch, a.roll, a.yaw), (0.5, -0.3, 0.0))
+        self.assertEqual(ls.CameraAlignment.parse("1,2,3").yaw, 3.0)
+        self.assertTrue(ls.CameraAlignment.parse("none").identity)
+        self.assertEqual(ls.CameraAlignment.parse(a.name), a, "name round-trips through parse")
+        for bad in ("1", "1,2,3,4", "20,0", "x,y"):
+            with self.assertRaises(ValueError, msg=bad):
+                ls.CameraAlignment.parse(bad)
+        tx, ty = ls.CameraAlignment(pitch=0.5).rotate(0.0, 0.0)
+        self.assertAlmostEqual(float(tx), 0.0)
+        self.assertAlmostEqual(float(ty), -np.tan(np.radians(0.5)), places=6, msg="a pitch moves the centre ray vertically by its tangent")
+        tx, ty = ls.CameraAlignment(roll=90.0).rotate(0.5, 0.0)
+        self.assertAlmostEqual(float(tx), 0.0)
+        self.assertAlmostEqual(float(ty), 0.5, msg="a roll turns the ray about the optical axis")
+        self.assertTrue(np.allclose(ls.CameraAlignment(1.0, 2.0, 0.5).matrix @ ls.CameraAlignment(1.0, 2.0, 0.5).matrix.T, np.eye(3)))
+
+    def test_estimate_recovers_a_tilted_right_camera_and_restores_the_depth(self) -> None:
+        tilt = ls.CameraAlignment(pitch=0.6, roll=-0.4)
+        view = ls.RectifiedView.from_fov(640, 480, 90.0)
+        # Spheres spread across the field: the roll is read off how the row error grows with the column, so it needs matches far from the
+        # centre (but clear of the leftmost numDisparities columns, which SGBM cannot match at all).
+        scene = ls.SyntheticStereoScene([ls.Sphere((-80.0, -20.0, 250.0), 45.0), ls.Sphere((150.0, 30.0, 270.0), 45.0), ls.Sphere((0.0, -80.0, 280.0), 40.0), ls.Sphere((10.0, 90.0, 300.0), 45.0)])
+        raw_left, raw_right = scene.raw_pair(MODEL)
+        wrong = tilted_calibration(tilt)
+        misaligned = ls.Rectifier(wrong, MODEL.width, MODEL.height, view)
+        left, right = misaligned.rectify_pair(raw_left, raw_right)
+        matches = ls.match_pair(left, right)
+        self.assertGreater(len(matches), 40, "the textured spheres give plenty of matches")
+        self.assertGreater(abs(float(np.median(matches[:, 3] - matches[:, 1]))), 2.0, "the tilt puts the right eye's features on other rows")
+        fit = ls.estimate_alignment(left, right, view)
+        self.assertAlmostEqual(fit.alignment.pitch, -tilt.pitch, delta=0.06, msg=fit.describe())
+        self.assertAlmostEqual(fit.alignment.roll, -tilt.roll, delta=0.1, msg=fit.describe() + " (feature localisation is biased by a fraction of a pixel between the eyes, which the roll feels most)")
+        self.assertLess(fit.after_px, 0.6)
+        self.assertGreater(fit.before_px, 2.0)
+        self.assertIn("pitch", fit.describe())
+        aligned = ls.Rectifier(wrong, MODEL.width, MODEL.height, view, alignment=fit.alignment)
+        self.assertEqual(set(aligned.alignment), {ls.CAMERA_RIGHT})
+        self.assertEqual(ls.Rectifier(wrong, MODEL.width, MODEL.height, view, alignment=ls.CameraAlignment()).alignment, {}, "an identity alignment is dropped")
+        again = ls.estimate_alignment(*aligned.rectify_pair(raw_left, raw_right), view, current=fit.alignment)
+        self.assertAlmostEqual(again.alignment.pitch, fit.alignment.pitch, delta=0.05, msg="matches on an aligned pair describe the same calibration frame")
+        _, truth = scene.render_pinhole(ls.CAMERA_LEFT, view)
+        mask = interior((truth > 0) & (truth < 1000), 3)
+        stereo = ls.StereoDepth(BASELINE, view.fx)
+        valid_ideal, _, _ = errors(stereo.compute(*ls.Rectifier(MODEL.ray_to_pixel, MODEL.width, MODEL.height, view).rectify_pair(raw_left, raw_right)), truth, mask)
+        valid_bad, _, _ = errors(stereo.compute(left, right), truth, mask)
+        valid_good, median_good, _ = errors(stereo.compute(*aligned.rectify_pair(raw_left, raw_right)), truth, mask)
+        self.assertGreater(valid_ideal, 0.9, f"a co-aligned pair: valid {valid_ideal:.3f}")
+        self.assertGreater(valid_good, valid_ideal - 0.03, f"aligned by the fit: valid {valid_good:.3f} vs {valid_ideal:.3f} with the true calibration")
+        self.assertLess(median_good, 0.03)
+        self.assertLess(valid_bad, valid_good - 0.2, f"misaligned by {tilt.name}: valid {valid_bad:.3f} vs {valid_good:.3f} aligned")
+
+    def test_estimator_accumulates_frames(self) -> None:
+        view = ls.RectifiedView.from_fov(640, 480, 90.0)
+        tilt = ls.CameraAlignment(pitch=0.3, roll=0.2)
+        rect = ls.Rectifier(tilted_calibration(tilt), MODEL.width, MODEL.height, view)
+        estimator = ls.AlignmentEstimator(view, min_matches=40, min_frames=3, max_frames=6)
+        self.assertIn("collecting", estimator.describe())
+        fits = []
+        for k in range(6):
+            scene = ls.SyntheticStereoScene([ls.Sphere((-150.0 + 25.0 * k, -20.0, 240.0 + 10.0 * k), 45.0), ls.Sphere((140.0, 30.0 - 15.0 * k, 300.0), 50.0)])
+            fits.append(estimator.observe(*rect.rectify_pair(*scene.raw_pair(MODEL))))
+            if estimator.done:
+                break
+        locked = [f for f in fits if f is not None]
+        self.assertEqual(len(locked), 1, "exactly one fit is returned")
+        self.assertGreaterEqual(estimator.frames, 3)
+        self.assertAlmostEqual(locked[0].alignment.pitch, -tilt.pitch, delta=0.06)
+        self.assertAlmostEqual(locked[0].alignment.roll, -tilt.roll, delta=0.1)
+        self.assertTrue(estimator.done)
+        self.assertIsNone(estimator.observe(*rect.rectify_pair(*scene.raw_pair(MODEL))), "a finished estimator ignores more frames")
+        self.assertIn("pitch", estimator.describe())
+        blank = ls.AlignmentEstimator(view, min_matches=40, min_frames=1, max_frames=2)
+        black = np.zeros((view.height, view.width), dtype=np.uint8)
+        self.assertIsNone(blank.observe(black, black))
+        self.assertIsNone(blank.observe(black, black))
+        self.assertTrue(blank.done)
+        self.assertIn("gave up", blank.describe())
+        with self.assertRaises(ValueError):
+            ls.fit_alignment(np.zeros((2, 4)), view)
+
+
+class InvalidationRuleTests(unittest.TestCase):
+    def test_parameter_validation(self) -> None:
+        for bad in ({"max_intensity": 10}, {"max_intensity": 256}, {"min_lit": -1}, {"lit_reference_mm": 0.0}, {"lit_window": 4}, {"min_texture": 300}, {"texture_window": 4}, {"uniqueness": 101}):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                ls.StereoParams(**bad)  # type: ignore[arg-type]
+        off = ls.StereoParams(min_intensity=0, max_intensity=255, min_texture=0, min_lit=0)
+        self.assertIsNone(off.invalid_pixels(np.zeros((4, 4), np.uint8)), "every rule off: nothing to mask")
+        self.assertIsNone(off.underlit_pixels(np.zeros((4, 4), np.uint8), np.zeros((4, 4), np.uint16)))
+
+    def test_local_range(self) -> None:
+        img = np.zeros((9, 9), dtype=np.uint8)
+        img[4, 4] = 40
+        spread = ls.local_range(img, 3)
+        self.assertEqual(int(spread[4, 4]), 40)
+        self.assertEqual(int(spread[3, 3]), 40, "within the 3x3 window of the bright pixel")
+        self.assertEqual(int(spread[0, 0]), 0)
+        self.assertEqual(spread.dtype, np.uint8)
+
+    def test_saturated_pixels_carry_no_depth(self) -> None:
+        left, right, truth = sphere_scene(300.0).stereo_pair(VIEW)
+        left, right = left.copy(), right.copy()
+        ys, xs = np.nonzero(sphere_mask(truth))
+        cy, cx = int(ys.mean()), int(xs.mean())
+        patch = (slice(cy - 8, cy + 8), slice(cx - 30, cx + 30))
+        left[patch] = 255
+        right[cy - 8:cy + 8, cx - 30 - 21:cx + 30 - 21] = 255  # the same blown-out patch, 21 px of disparity away
+        kept = ls.StereoDepth(BASELINE, VIEW.fx, ls.StereoParams(max_intensity=255)).compute(left, right)
+        gated = ls.StereoDepth(BASELINE, VIEW.fx).compute(left, right)
+        self.assertEqual(int((gated[patch] > 0).sum()), 0, "saturated reference pixels are never a measurement")
+        self.assertGreater(int((kept[patch] > 0).sum()), 0, "without the rule the matcher happily places pure white")
+        outside = interior(sphere_mask(truth) & (left < 250), 3)
+        self.assertGreater(float((gated[outside] > 0).mean()), 0.85, "the rest of the sphere is untouched")
+
+    def test_underlit_matches_are_dropped_but_a_dim_far_hand_is_kept(self) -> None:
+        left, right, truth = sphere_scene(200.0).stereo_pair(VIEW)
+        dim_left = (left.astype(np.float32) * 0.15).astype(np.uint8)  # a surface at 200 mm that is as dark as a far wall
+        dim_right = (right.astype(np.float32) * 0.15).astype(np.uint8)
+        mask = interior(sphere_mask(truth), 2)
+        lit = ls.StereoDepth(BASELINE, VIEW.fx, ls.StereoParams(min_lit=0, min_intensity=4)).compute(dim_left, dim_right)
+        self.assertGreater(float((lit[mask] > 0).mean()), 0.5, "the matcher itself still places the dim sphere")
+        ruled = ls.StereoDepth(BASELINE, VIEW.fx, ls.StereoParams(min_intensity=4)).compute(dim_left, dim_right)
+        self.assertLess(float((ruled[mask] > 0).mean()), 0.05, "but 20 grey levels at 200 mm cannot be lit by the LEDs: dropped")
+        far_left, far_right, far_truth = sphere_scene(400.0).stereo_pair(VIEW)
+        far_mask = interior(sphere_mask(far_truth), 2)
+        default = ls.StereoDepth(BASELINE, VIEW.fx).compute(far_left, far_right)
+        self.assertGreater(float((default[far_mask] > 0).mean()), 0.9, "the sphere at 400 mm is dim, and rightly so: kept")
+        params = ls.StereoParams()
+        depth = np.full((4, 4), 250, dtype=np.uint16)
+        depth[0, 0] = 0
+        reference = np.full((4, 4), 20, dtype=np.uint8)
+        under = params.underlit_pixels(reference, depth)
+        assert under is not None
+        self.assertFalse(under[0, 0], "a pixel without depth is not underlit")
+        self.assertTrue(under[2, 2], "20 at 250 mm is below 20 * (300/250)^2 = 28.8")
+        reference[2, 3] = 40
+        self.assertFalse(params.underlit_pixels(reference, depth)[2, 2], "a lit neighbour within the window vouches for it")
+
+    def test_texture_rule_drops_flat_regions(self) -> None:
+        left, right, truth = sphere_scene(300.0).stereo_pair(VIEW)
+        left, right = left.copy(), right.copy()
+        left[200:236, 20:120] = 90   # a flat, bright patch in both eyes
+        right[200:236, 20:120] = 90
+        params = ls.StereoParams(min_texture=8)
+        rejected = params.invalid_pixels(left)
+        assert rejected is not None
+        self.assertTrue(rejected[210:226, 30:110].all(), "a flat patch fails the texture rule")
+        self.assertLess(float(rejected[interior(sphere_mask(truth), 3)].mean()), 0.5, "the grainy sphere mostly passes it")
+        self.assertIsNone(ls.StereoParams(min_intensity=0, max_intensity=255, min_texture=0).invalid_pixels(left))
+        gated = ls.StereoDepth(BASELINE, VIEW.fx, params).compute(left, right)
+        self.assertEqual(int((gated[210:226, 30:110] > 0).sum()), 0)
+
+
+class ParserDefaultTests(unittest.TestCase):
+    def test_bridge_and_source_parsers_agree_on_the_stereo_defaults(self) -> None:
+        bridge = db.build_parser().parse_args(["--source", "leap"])
+        source = lsrc.build_parser().parse_args([])
+        for name in ("min_intensity", "max_intensity", "min_lit", "min_texture", "uniqueness", "block", "mode", "matcher", "align", "calibration"):
+            self.assertEqual(getattr(bridge, "leap_" + name), getattr(source, name), name)
+        self.assertEqual(tuple(bridge.leap_view), lsrc.DEFAULT_VIEW)
+        self.assertEqual(tuple(source.view), lsrc.DEFAULT_VIEW)
+        self.assertEqual(db.LEAP_DEFAULT_VIEW, lsrc.DEFAULT_VIEW)
+        self.assertEqual(db.LEAP_DEFAULT_SURFACE, lsrc.DEFAULT_SURFACE)
+        self.assertEqual(bridge.leap_fov, lsrc.DEFAULT_FOV_DEG)
+        params = lsrc.stereo_params_from_args(bridge, 100.0, prefix="leap_")
+        self.assertEqual(params, ls.StereoParams(min_depth_mm=100.0), "the bridge's defaults build the module's default parameters")
+        self.assertEqual(lsrc.stereo_params_from_args(source, 100.0, prefix=""), params)
+        custom = db.build_parser().parse_args(["--source", "leap", "--leap-min-lit", "0", "--leap-mode", "hh", "--leap-block", "7"])
+        self.assertEqual(lsrc.stereo_params_from_args(custom, 100.0, prefix="leap_"), ls.StereoParams(min_depth_mm=100.0, min_lit=0, mode="hh", block_size=7))
+
+    def test_surface_default_follows_the_source(self) -> None:
+        self.assertEqual(db.resolve_surface(db.build_parser().parse_args(["--source", "leap"])), db.LEAP_DEFAULT_SURFACE)
+        self.assertEqual(db.resolve_surface(db.build_parser().parse_args(["--source", "leap-synthetic"])), db.LEAP_DEFAULT_SURFACE)
+        self.assertEqual(db.resolve_surface(db.build_parser().parse_args([])), db.DEFAULT_SURFACE, "other sources keep 64x48")
+        self.assertEqual(db.resolve_surface(db.build_parser().parse_args(["--source", "leap", "--surface", "8", "6"])), (8, 6))
+        self.assertEqual(db.AnalyzerConfig().surface, db.DEFAULT_SURFACE)
+
+
+class StereoLabTests(unittest.TestCase):
+    """``stereo_lab.py`` on a synthetic dump directory laid out like ``leap_source.py --dump-images`` writes it."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import cv2  # noqa: PLC0415
+
+        cls.out = tempfile.mkdtemp(prefix="leap-lab-")
+        rect = ls.Rectifier(MODEL.ray_to_pixel, MODEL.width, MODEL.height, VIEW)
+        for i, z in enumerate((260.0, 330.0)):
+            scene = ls.SyntheticStereoScene([ls.Sphere((10.0, -20.0, z), 45.0), ls.Capsule((30.0, 40.0, z + 20.0), (80.0, 200.0, z + 90.0), 28.0)])
+            raw_left, raw_right = scene.raw_pair(MODEL)
+            left, right = rect.rectify_pair(raw_left, raw_right)
+            stem = os.path.join(cls.out, f"leap_{i:03d}")
+            for suffix, image in (("_raw_left", raw_left), ("_raw_right", raw_right), ("_left", left), ("_right", right)):
+                cv2.imwrite(stem + suffix + ".png", image)
+        for cam, side in ((ls.CAMERA_LEFT, "left"), (ls.CAMERA_RIGHT, "right")):
+            np.save(os.path.join(cls.out, f"leap_distortion_{side}.npy"), model_lattice(MODEL, cam))
+
+    def test_verify_list_and_a_run_write_the_contact_sheet(self) -> None:
+        import stereo_lab as lab  # noqa: PLC0415
+
+        frames = lab.load_frames(self.out)
+        self.assertEqual([f.name for f in frames], ["000", "001"])
+        self.assertEqual(lab.load_frames(self.out, ["001"])[0].name, "001")
+        report = lab.verify_lattice(frames, self.out, VIEW)
+        self.assertTrue(any("lattice frame 000 left" in line and "mean 0." in line for line in report), report)
+        self.assertTrue(any("samples: " in line for line in report), "no function samples in this dump: says so")
+        configs = lab.build_configs()
+        self.assertIn("old", configs)
+        self.assertIn("480x360", configs)
+        self.assertEqual(configs["480x360"].params.mode, "3way")
+        self.assertEqual(configs["old"].params.min_lit, 0)
+        png = os.path.join(self.out, "sheet.png")
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            code = lab.main(["--input", self.out, "--configs", "old", "320x240", "--repeat", "1", "--align", "none", "--out", png, "--hand-threshold", "40"])
+        self.assertEqual(code, 0)
+        text = captured.getvalue()
+        self.assertIn("calibration: leap_distortion", text)
+        self.assertRegex(text, r"old\s+000\s+[\d.]+\s+[\d.]+\s+\d+\s+\d+")
+        self.assertIn("wrote " + png, text)
+        self.assertTrue(os.path.isfile(png))
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            self.assertEqual(lab.main(["--list"]), 0)
+        self.assertIn("480x360", captured.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            self.assertEqual(lab.main(["--input", self.out, "--verify"]), 0)
+        self.assertIn("lattice frame 001 right", captured.getvalue())
+        with self.assertRaises(FileNotFoundError):
+            lab.load_calibration(self.out, "samples", MODEL.width, MODEL.height)
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            code = lab.main(["--input", self.out, "--configs", "320x240", "--frames", "001", "--repeat", "1", "--align", "auto", "--out", png, "--hand-threshold", "40"])
+        self.assertEqual(code, 0)
+        self.assertIn("alignment (auto): pitch", captured.getvalue(), "the co-aligned stand-in cameras fit a near-zero alignment")
+
+
 # ---- CLI --------------------------------------------------------------------- #
 
 
@@ -851,7 +1161,7 @@ class DumpCliTests(ProtocolAssertions):
         for seq, frame in enumerate(frames):
             self.assert_frame(frame, *grid_sizes(hello))
             self.assertEqual(frame["seq"], seq)
-            self.assertEqual(frame["stats"]["frameWidth"], 320.0)  # type: ignore[index]
+            self.assertEqual(frame["stats"]["frameWidth"], float(lsrc.DEFAULT_VIEW[0]), "the depth image is the default rectified view")  # type: ignore[index]
             self.assertEqual(frame["stats"]["trackedHands"], 1.0)  # type: ignore[index]
             self.assertEqual(len(frame["hands"]), 1, "the script starts with the hand above the device")  # type: ignore[arg-type]
             hand = frame["hands"][0]  # type: ignore[index]

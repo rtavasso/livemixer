@@ -28,6 +28,7 @@ if HERE not in sys.path:
 import numpy as np  # noqa: E402
 
 import depth_bridge as db  # noqa: E402
+import scan_fusion as sf  # noqa: E402
 
 NEAR, FAR = 0.4, 1.2
 NEAR_MM, FAR_MM = NEAR * 1000.0, FAR * 1000.0
@@ -810,6 +811,416 @@ class TrackedHandTests(ProtocolAssertions):
         self.assertTrue(db.SyntheticSource.skeleton)
 
 
+# ---- scan fusion: the skeleton's capsule model rendered into the depth ------ #
+
+
+def reference_rasterize(capsules: np.ndarray, shape: tuple[int, int], focal_px: float | None = None, mm_per_px: float = 1.0) -> np.ndarray:
+    """Brute force, float64, every pixel of every capsule: what ``rasterize_capsules`` must reproduce."""
+    h, w = shape
+    out = np.full((h, w), np.inf)
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float64)
+    for ax, ay, az, bx, by, bz, r, relief in np.asarray(capsules, dtype=np.float64).reshape(-1, 8):
+        if r <= 0:
+            continue
+        abx, aby, abz = bx - ax, by - ay, bz - az
+        len2 = abx * abx + aby * aby
+        t = np.clip(((xs - ax) * abx + (ys - ay) * aby) / len2, 0.0, 1.0) if len2 > 1e-12 else np.full_like(xs, 0.0 if az <= bz else 1.0)
+        dx, dy = xs - (ax + abx * t), ys - (ay + aby * t)
+        d2 = dx * dx + dy * dy
+        z = az + abz * t
+        s = z / focal_px if focal_px else mm_per_px
+        depth = z - relief * np.sqrt(np.maximum(1.0 - d2 / (r * r), 0.0)) * s
+        out = np.where(d2 < r * r, np.minimum(out, depth), out)
+    return out
+
+
+def capsule(a: tuple[float, float, float], b: tuple[float, float, float], radius: float, relief: float | None = None) -> list[float]:
+    return [*a, *b, radius, radius if relief is None else relief]
+
+
+def assert_same_render(test: unittest.TestCase, got: np.ndarray, want: np.ndarray, atol: float = 0.05) -> None:
+    test.assertEqual(got.dtype, np.float32)
+    test.assertTrue(np.array_equal(np.isfinite(got), np.isfinite(want)), "the same pixels are lit")
+    lit = np.isfinite(want)
+    test.assertTrue(np.allclose(got[lit], want[lit], atol=atol), f"max error {np.abs(got[lit] - want[lit]).max():.3f} mm")
+
+
+class RasterizerTests(unittest.TestCase):
+    """``scan_fusion.rasterize_capsules``: rounded tubes in the image frame, nearest surface first, clipped to the image."""
+
+    def test_horizontal_capsule_is_a_rounded_tube_of_its_width(self) -> None:
+        img = sf.rasterize_capsules([capsule((20, 30, 500), (60, 30, 500), 5)], (60, 80), mm_per_px=2.0)
+        self.assertEqual(img.shape, (60, 80))
+        column = img[:, 40]
+        self.assertEqual(np.flatnonzero(np.isfinite(column)).tolist(), list(range(26, 35)), "|d| < 5: nine rows across, 2r wide")
+        self.assertAlmostEqual(float(column[30]), 500 - 5 * 2, places=3, msg="the centre line bulges the radius (in mm per px) towards the camera")
+        self.assertAlmostEqual(float(column[33]), 500 - math.sqrt(25 - 9) * 2, places=3)
+        self.assertAlmostEqual(float(column[34]), 500 - 3 * 2, places=3)
+        self.assertTrue((np.diff(column[30:35]) > 0).all() and (np.diff(column[26:31]) < 0).all(), "rounded: deeper away from the axis")
+        self.assertTrue((column[26:35] >= 490).all() and (column[26:35] < 500).all())
+        self.assertAlmostEqual(float(img[30, 16]), 500 - 3 * 2, places=3, msg="rounded caps: 4 px past the end is still inside")
+        self.assertFalse(np.isfinite(img[30, 15]))
+        self.assertAlmostEqual(float(img[30, 64]), 500 - 3 * 2, places=3)
+        self.assertEqual(int(np.isfinite(img).sum()), int(np.isfinite(reference_rasterize([capsule((20, 30, 500), (60, 30, 500), 5)], (60, 80), mm_per_px=2.0)).sum()))
+        flat = sf.rasterize_capsules([capsule((20, 30, 500), (60, 30, 500), 5, relief=0.0)], (60, 80), mm_per_px=2.0)
+        self.assertTrue((flat[np.isfinite(flat)] == 500).all(), "no relief: a flat ribbon at the bone's depth")
+
+    def test_perspective_relief_is_radius_times_depth_over_focal(self) -> None:
+        img = sf.rasterize_capsules([capsule((20, 30, 500), (60, 30, 500), 5), capsule((20, 10, 250), (60, 10, 250), 5)], (60, 80), focal_px=160.0)
+        self.assertAlmostEqual(float(img[30, 40]), 500 - 5 * 500 / 160, places=3)
+        self.assertAlmostEqual(float(img[10, 40]), 250 - 5 * 250 / 160, places=3, msg="a pixel is smaller nearer the camera, so the same radius bulges less")
+        sloped = sf.rasterize_capsules([capsule((20, 30, 400), (60, 30, 600), 5)], (60, 80), focal_px=160.0)
+        self.assertAlmostEqual(float(sloped[30, 40]), 500 - 5 * 500 / 160, places=2, msg="depth interpolates along the bone")
+        with self.assertRaises(ValueError):
+            sf.rasterize_capsules([capsule((20, 30, 500), (60, 30, 500), 5)], (60, 80), focal_px=0.0)
+
+    def test_nearest_capsule_wins_and_out_accumulates(self) -> None:
+        far, near = capsule((20, 30, 500), (60, 30, 500), 5), capsule((40, 10, 400), (40, 50, 400), 5)
+        both = sf.rasterize_capsules([far, near], (60, 80), mm_per_px=1.0)
+        self.assertAlmostEqual(float(both[30, 40]), 395.0, places=3, msg="at the crossing the nearer tube is in front")
+        self.assertAlmostEqual(float(both[30, 25]), 495.0, places=3)
+        self.assertAlmostEqual(float(both[15, 40]), 395.0, places=3)
+        canvas = sf.rasterize_capsules([far], (60, 80), mm_per_px=1.0)
+        same = sf.rasterize_capsules([near], (60, 80), mm_per_px=1.0, out=canvas)
+        self.assertIs(same, canvas)
+        self.assertTrue(np.array_equal(canvas, both), "rendering into an existing canvas keeps the nearest of both")
+        with self.assertRaises(ValueError):
+            sf.rasterize_capsules([far], (60, 80), out=np.zeros((60, 80), dtype=np.float64))
+
+    def test_bounding_boxes_are_clipped_at_the_image_edge(self) -> None:
+        corner = sf.rasterize_capsules([capsule((0, 0, 500), (0, 0, 500), 10)], (60, 80), mm_per_px=1.0)
+        ys, xs = np.mgrid[0:60, 0:80]
+        self.assertEqual(int(np.isfinite(corner).sum()), int((xs * xs + ys * ys < 100).sum()), "a sphere on the corner: exactly its quadrant")
+        self.assertAlmostEqual(float(corner[0, 0]), 490.0, places=3)
+        for caps in (
+            [capsule((-30, 30, 500), (10, 30, 500), 6)],       # enters from the left
+            [capsule((70, -10, 500), (70, 20, 500), 6)],       # from the top
+            [capsule((75, 55, 500), (120, 90, 500), 8)],       # leaves bottom-right
+            [capsule((-20, 30, 500), (100, 30, 500), 4)],      # spans the whole width
+            [capsule((30, 30, 500), (50, 30, 500), 1e6)],      # covers everything
+        ):
+            assert_same_render(self, sf.rasterize_capsules(caps, (60, 80), mm_per_px=1.0), reference_rasterize(caps, (60, 80), mm_per_px=1.0))
+        outside = sf.rasterize_capsules([capsule((-40, 30, 500), (-20, 30, 500), 5), capsule((10, 100, 500), (30, 120, 500), 5)], (60, 80))
+        self.assertFalse(np.isfinite(outside).any(), "entirely outside: nothing, and no error")
+        self.assertFalse(np.isfinite(sf.rasterize_capsules(np.zeros((0, 8)), (60, 80))).any())
+        self.assertFalse(np.isfinite(sf.rasterize_capsules([capsule((20, 30, 500), (60, 30, 500), 0.0)], (60, 80))).any(), "a zero radius draws nothing")
+        with self.assertRaises(ValueError):
+            sf.rasterize_capsules([capsule((20, 30, float("nan")), (60, 30, 500), 5)], (60, 80))
+
+    def test_degenerate_capsule_is_a_sphere_at_its_nearer_end(self) -> None:
+        for a, b in (((30, 30, 600), (30, 30, 400)), ((30, 30, 400), (30, 30, 600))):
+            img = sf.rasterize_capsules([capsule(a, b, 5)], (60, 80), mm_per_px=1.0)
+            self.assertAlmostEqual(float(img[30, 30]), 395.0, places=3)
+            self.assertEqual(int(np.isfinite(img).sum()), int(np.isfinite(reference_rasterize([capsule(a, b, 5)], (60, 80))).sum()))
+
+    def test_matches_the_brute_force_reference_on_whole_hands(self) -> None:
+        src = synthetic(hands=2)
+        hands = src.tracked_hands(2.0)
+        caps = np.concatenate([sf.hand_capsules(h) for h in hands])
+        self.assertEqual(len(caps), 48)
+        for focal, scale in ((None, 1.25), (400.0, 1.0)):
+            assert_same_render(self, sf.rasterize_capsules(caps, (480, 640), focal, scale), reference_rasterize(caps, (480, 640), focal, scale))
+        full, bounds = sf.render_hands(hands, (480, 640), (0, 0), 400.0)
+        window, _ = sf.render_hands(hands, (240, 320), (160, 120), 400.0)
+        self.assertTrue(np.array_equal(window, full[120:360, 160:480]), "an offset window is the crop of the full render")
+        self.assertTrue(np.isfinite(full[int(round(hands[0].joints[db.JOINT_PALM][1])), int(round(hands[0].joints[db.JOINT_PALM][0]))]))
+        assert bounds is not None
+        r0, r1, c0, c1 = bounds
+        ys, xs = np.nonzero(np.isfinite(full))
+        self.assertTrue(r0 <= ys.min() and ys.max() < r1 and c0 <= xs.min() and xs.max() < c1, "the bounds enclose every lit pixel")
+        self.assertTrue(ys.min() - r0 <= 2 and r1 - 1 - ys.max() <= 2 and xs.min() - c0 <= 2 and c1 - 1 - xs.max() <= 2, "and are tight to it")
+        self.assertEqual(sf.capsule_bounds(np.zeros((0, 8)), (480, 640)), None)
+        self.assertEqual(sf.capsule_bounds([capsule((-40, 30, 500), (-20, 30, 500), 5)], (60, 80)), None, "nothing visible, no bounds")
+        self.assertEqual(sf.capsule_bounds([capsule((0, 0, 500), (0, 0, 500), 10)], (60, 80)), (0, 11, 0, 11))
+        reused = np.empty((480, 640), dtype=np.float32)
+        again, _ = sf.render_hands(hands, (480, 640), (0, 0), 400.0, out=reused)
+        self.assertIs(again, reused)
+        self.assertTrue(np.array_equal(again, full), "a reused canvas is cleared first")
+        self.assertFalse(np.isfinite(sf.render_hands([], (480, 640))[0]).any())
+
+    def test_hand_capsules_follow_the_browsers_bones_plus_a_palm(self) -> None:
+        hand = tracked_hand()  # widths: palm 80, arm 50, fingers 14, 16, 16, 15, 12
+        caps = sf.hand_capsules(hand)
+        self.assertEqual(caps.shape, (24, 8), "twenty finger bones, the forearm, three palm capsules")
+        index = caps[4:8]
+        self.assertEqual(index[:, sf.CAP_RADIUS].round(4).tolist(), [8 * 1.15, 8.0, 8 * 0.9, 8 * 0.8], "width / 2 times 1.15, 1, .9, .8 from the carpal end")
+        self.assertTrue(np.array_equal(index[:, sf.CAP_RELIEF], index[:, sf.CAP_RADIUS]), "fingers are round")
+        for j in range(4):
+            self.assertTrue(np.array_equal(index[j, :3], hand.joints[db.finger_joint(1, j)]) and np.array_equal(index[j, 3:6], hand.joints[db.finger_joint(1, j + 1)]))
+        forearm = caps[20]
+        self.assertTrue(np.array_equal(forearm[:3], hand.joints[db.JOINT_WRIST]) and np.array_equal(forearm[3:6], hand.joints[db.JOINT_ELBOW]))
+        self.assertAlmostEqual(float(forearm[sf.CAP_RADIUS]), 25 * 0.85)
+        wrist, index_mcp, pinky_mcp = hand.joints[db.JOINT_WRIST], hand.joints[db.finger_joint(1, 1)], hand.joints[db.finger_joint(4, 1)]
+        palm = caps[21:]
+        self.assertTrue(np.array_equal(palm[0, :3], index_mcp) and np.array_equal(palm[0, 3:6], wrist))
+        self.assertTrue(np.array_equal(palm[1, :3], pinky_mcp) and np.array_equal(palm[1, 3:6], wrist))
+        self.assertTrue(np.array_equal(palm[2, :3], index_mcp) and np.array_equal(palm[2, 3:6], pinky_mcp))
+        self.assertTrue((palm[:, sf.CAP_RADIUS] == 80 * sf.PALM_RADIUS_FACTOR).all() and (palm[:, sf.CAP_RELIEF] == 80 * sf.PALM_RELIEF_FACTOR).all())
+        self.assertLess(sf.PALM_RELIEF_FACTOR, sf.PALM_RADIUS_FACTOR, "the palm is a flattened slab, wider than it is thick")
+        joints = hand.joints.copy()
+        joints[db.finger_joint(0, 0)] = joints[db.finger_joint(0, 1)]  # a zero-length thumb metacarpal, as the Leap reports it
+        thumbless = sf.hand_capsules(db.TrackedHand(1, "left", joints, hand.widths_px, hand.extended))
+        self.assertEqual(len(thumbless), 23, "zero-length bones are skipped like the browser does")
+        no_elbow = sf.hand_capsules(db.TrackedHand(1, "left", hand.joints, hand.widths_px, hand.extended, has_elbow=False))
+        self.assertEqual(len(no_elbow), 23)
+        self.assertFalse(any(np.array_equal(c[3:6], hand.joints[db.JOINT_ELBOW]) for c in no_elbow), "no elbow, no forearm")
+        widths = hand.widths_px.copy()
+        widths[db.WIDTH_FINGERS + 2] = 0.0
+        self.assertEqual(len(sf.hand_capsules(db.TrackedHand(1, "left", hand.joints, widths, hand.extended))), 20, "a zero width (a line, tolerated by the protocol) draws nothing")
+
+    def test_two_hands_render_within_budget(self) -> None:
+        hands = synthetic(hands=2).tracked_hands(2.0)
+        small = []
+        for h in hands:
+            joints = h.joints.copy()
+            joints[:, 0] *= 0.5
+            joints[:, 1] *= 0.5
+            small.append(db.TrackedHand(h.id, h.type, joints, h.widths_px * 0.5, h.extended))
+        best = min(_timed(lambda: sf.render_hands(small, (240, 320), (0, 0), 160.0)) for _ in range(20))
+        self.assertLess(best, 0.010, f"two hands at 320x240 took {best * 1000:.2f} ms (a laptop does it in about 2 ms; the budget is 3)")
+
+
+def _timed(fn: "Callable[[], object]") -> float:
+    t0 = time.perf_counter()
+    fn()
+    return time.perf_counter() - t0
+
+
+class FusionRuleTests(unittest.TestCase):
+    """``scan_fusion.fuse_depth``: which of the measurement and the model a pixel takes under each mode."""
+
+    def scene(self) -> tuple[np.ndarray, np.ndarray]:
+        measured = np.zeros((4, 6), dtype=np.uint16)
+        model = np.full((4, 6), np.inf, dtype=np.float32)
+        measured[:, 0], model[:, 0] = 700, 720       # a measurement that agrees with the model (20 mm)
+        measured[:, 1], model[:, 1] = 0, 650         # no measurement under the model
+        measured[:, 2], model[:, 2] = 500, 600       # a phantom near match under the model
+        measured[:, 3], model[:, 3] = 1500, 700      # the backdrop seen through a hand the matcher missed
+        measured[:, 4], model[:, 4] = 900, np.inf    # outside the model
+        measured[:, 5], model[:, 5] = 800, 1300      # the model beyond the far plane (1200): no model there
+        return measured, model
+
+    def test_fill_keeps_agreeing_measurements_and_takes_the_model_elsewhere_under_it(self) -> None:
+        measured, model = self.scene()
+        fused, take = sf.fuse_depth(measured, model, "fill", 40.0, NEAR_MM, FAR_MM)
+        self.assertEqual(fused.dtype, np.uint16)
+        self.assertEqual(fused[0].tolist(), [700, 650, 600, 700, 900, 800])
+        self.assertEqual(take[0].tolist(), [False, True, True, True, False, False])
+        self.assertTrue((fused == fused[0]).all() and (take == take[0]).all())
+        self.assertEqual(measured[0, 1], 0, "the input is untouched")
+
+    def test_model_mode_replaces_the_measurement_wherever_the_model_has_a_surface(self) -> None:
+        measured, model = self.scene()
+        fused, take = sf.fuse_depth(measured, model, "model", 40.0, NEAR_MM, FAR_MM)
+        self.assertEqual(fused[0].tolist(), [720, 650, 600, 700, 900, 800])
+        self.assertEqual(take[0].tolist(), [True, True, True, True, False, False])
+
+    def test_off_is_the_identity(self) -> None:
+        measured, model = self.scene()
+        fused, take = sf.fuse_depth(measured, model, "off", 40.0, NEAR_MM, FAR_MM)
+        self.assertIs(fused, measured)
+        self.assertFalse(take.any())
+
+    def test_tolerance_is_inclusive_and_honoured(self) -> None:
+        measured = np.array([[700, 700, 700]], dtype=np.uint16)
+        model = np.array([[720.0, 721.0, 700.4]], dtype=np.float32)
+        fused, take = sf.fuse_depth(measured, model, "fill", 20.0, NEAR_MM, FAR_MM)
+        self.assertEqual(fused[0].tolist(), [700, 721, 700])
+        self.assertEqual(take[0].tolist(), [False, True, False])
+        fused, take = sf.fuse_depth(measured, model, "fill", 0.0, NEAR_MM, FAR_MM)
+        self.assertEqual(fused[0].tolist(), [720, 721, 700], "tolerance 0: only an exact match keeps the measurement (700.4 rounds to 700)")
+        self.assertEqual(take[0].tolist(), [True, True, True])
+        fused, _ = sf.fuse_depth(measured, model, "fill", 1000.0, NEAR_MM, FAR_MM)
+        self.assertEqual(fused[0].tolist(), [700, 700, 700])
+        with self.assertRaises(ValueError):
+            sf.fuse_depth(measured, model, "fill", -1.0, NEAR_MM, FAR_MM)
+
+    def test_near_and_far_bound_the_model_like_any_pixel(self) -> None:
+        measured = np.array([[0, 0, 0, 0, 500]], dtype=np.uint16)
+        model = np.array([[NEAR_MM - 1, NEAR_MM, FAR_MM, FAR_MM + 1, 300.0]], dtype=np.float32)
+        fused, take = sf.fuse_depth(measured, model, "fill", 40.0, NEAR_MM, FAR_MM)
+        self.assertEqual(fused[0].tolist(), [0, int(NEAR_MM), int(FAR_MM), 0, 500], "in front of near or behind far the model does not exist, so the measurement stands, even a missing one")
+        self.assertEqual(take[0].tolist(), [False, True, True, False, False])
+        fused, take = sf.fuse_depth(np.zeros((1, 2), dtype=np.uint16), np.array([[0.4, 1.0]], dtype=np.float32), "model", 40.0, 0.0, 10.0)
+        self.assertEqual(fused[0].tolist(), [0, 1], "near 0: a model depth below 1 mm would read as 'no measurement', so it is dropped")
+
+    def test_rounding_shape_and_argument_checks(self) -> None:
+        measured = np.zeros((2, 2), dtype=np.uint16)
+        fused, _ = sf.fuse_depth(measured, np.array([[650.6, 649.4], [np.inf, np.inf]], dtype=np.float32), "fill", 40.0, NEAR_MM, FAR_MM)
+        self.assertEqual(fused.tolist(), [[651, 649], [0, 0]])
+        fused, take = sf.fuse_depth(measured, np.full((2, 2), np.inf, dtype=np.float32), "fill", 40.0, NEAR_MM, FAR_MM)
+        self.assertFalse(take.any())
+        self.assertTrue(np.array_equal(fused, measured))
+        with self.assertRaises(ValueError):
+            sf.fuse_depth(measured, np.full((2, 3), np.inf, dtype=np.float32), "fill", 40.0, NEAR_MM, FAR_MM)
+        with self.assertRaises(ValueError):
+            sf.fuse_depth(measured, np.full((2, 2), np.inf, dtype=np.float32), "blend", 40.0, NEAR_MM, FAR_MM)
+        with self.assertRaises(ValueError):
+            sf.fuse_depth(measured.astype(np.float32), np.full((2, 2), np.inf, dtype=np.float32), "fill", 40.0, NEAR_MM, FAR_MM)
+        self.assertEqual(sf.FUSE_MODES, db.SCAN_FUSE_MODES)
+        self.assertEqual(sf.isotropic_mm_per_px(NEAR_MM, FAR_MM, 640), 1.25)
+
+
+class ScanFusionAnalyzerTests(ProtocolAssertions):
+    """Fusion inside ``BoxAnalyzer``: the fused depth feeds the mask, the blobs, the occupancy, the voxels and the scan."""
+
+    def frame(self, t: float = 2.0, hands: int = 1) -> tuple[db.SyntheticSource, db.DepthFrame]:
+        src = synthetic(hands=hands)
+        return src, db.DepthFrame(src.render(t), t, src.tracked_hands(t))
+
+    def test_off_is_the_plain_depth_camera_with_hands_still_reported(self) -> None:
+        src, frame = self.frame()
+        off = make_analyzer(scan_fuse="off").analyze(frame)
+        plain = make_analyzer().analyze(db.DepthFrame(frame.depth_mm, frame.timestamp, None))
+        self.assertEqual(off.stats["fusedHands"], 0.0)
+        self.assertEqual(off.stats["scanModelFraction"], 0.0)
+        self.assertEqual(off.stats["pixels"], plain.stats["pixels"])
+        for field in ("surface", "voxels", "occupancy"):
+            self.assertTrue(np.array_equal(getattr(off, field), getattr(plain, field)), field)
+        self.assertEqual([(b.u, b.v, b.w, b.pixels) for b in off.blobs], [(b.u, b.v, b.w, b.pixels) for b in plain.blobs])
+        self.assertEqual(len(off.hands), 1, "the skeleton is still reported, it just does not touch the scan")
+        self.assertEqual(off.stats["trackedHands"], 1.0)
+
+    def test_fill_adds_the_model_only_where_the_measurement_is_missing_or_disagrees(self) -> None:
+        src, frame = self.frame()
+        off, fill = make_analyzer(scan_fuse="off").analyze(frame), make_analyzer(scan_fuse="fill").analyze(frame)
+        self.assertEqual(fill.stats["fusedHands"], 1.0)
+        self.assertEqual(fill.stats["trackedHands"], 1.0)
+        self.assertGreater(fill.stats["pixels"], off.stats["pixels"], "the forearm stub and the fingertips poke past the dome's rim")
+        self.assertTrue(0.0 < fill.stats["scanModelFraction"] < 0.25, fill.stats)
+        self.assertAlmostEqual(fill.stats["scanModelFraction"], (fill.stats["pixels"] - off.stats["pixels"]) / fill.stats["pixels"], delta=0.01, msg="on a measured dome the model only adds, it replaces nothing (everything agrees within 40 mm)")
+        assert off.surface is not None and fill.surface is not None and off.occupancy is not None and fill.occupancy is not None
+        self.assertTrue(((off.surface > 0) <= (fill.surface > 0)).all(), "every measured cell is still scanned")
+        self.assertTrue((fill.occupancy >= off.occupancy).all())
+        self.assertEqual(int(fill.surface[fill.surface > 0].min()), int(off.surface[off.surface > 0].min()), "the dome's centre, a measurement that agrees with the model, is kept: the nearest point is unchanged")
+        self.assertEqual(len(fill.blobs), 1)
+        self.assertAlmostEqual(fill.blobs[0].w, off.blobs[0].w, delta=0.01)
+        m = db.frame_message(0, 0.0, fill)
+        self.assert_frame(m, (8, 6), (8, 6, 4), (8, 6))
+        self.assertEqual(m["stats"]["fusedHands"], 1.0)
+        self.assertTrue(0.0 <= m["stats"]["scanModelFraction"] <= 1.0)
+
+    def test_fill_restores_fingers_the_camera_did_not_see(self) -> None:
+        """The Leap's failure mode: a saturated hand has no depth, but the skeleton knows where the fingers are."""
+        src, frame = self.frame()
+        hand = frame.hands[0]  # type: ignore[index]
+        palm = hand.joints[db.JOINT_PALM]
+        blank = frame.depth_mm.copy()
+        blank[: int(palm[1]) - 5, :] = 0  # nothing measured above the palm: the fingers are gone
+        blanked = db.DepthFrame(blank, frame.timestamp, frame.hands)
+        off, fill = make_analyzer(scan_fuse="off", surface=(320, 240)).analyze(blanked), make_analyzer(scan_fuse="fill", surface=(320, 240)).analyze(blanked)
+        self.assertGreater(fill.stats["pixels"], off.stats["pixels"] * 1.3)
+        self.assertGreater(fill.stats["scanModelFraction"], 0.25)
+        tips = [hand.joints[db.finger_joint(f, 4)] for f in (1, 2)]
+        mid = (tips[0] + tips[1]) / 2.0
+        model, _ = sf.render_hands([hand], (480, 640), (0, 0), None, 1.25)
+        self.assertFalse(np.isfinite(model[int(round(mid[1])), int(round(mid[0]))]), "precondition: the two fingertips are separate tubes with a gap between them")
+        assert off.surface is not None and fill.surface is not None
+
+        def cell(p: np.ndarray) -> tuple[int, int]:
+            return int((p[1] + 0.5) / 480 * 240), int((p[0] + 0.5) / 640 * 320)
+
+        for tip in tips:
+            self.assertEqual(int(off.surface[cell(tip)]), 0, "the camera saw nothing at the tip")
+            self.assertGreater(int(fill.surface[cell(tip)]), 0, "the model put the fingertip back")
+            self.assertAlmostEqual((int(fill.surface[cell(tip)]) - 1) / 254.0, (tip[2] - NEAR_MM) / (FAR_MM - NEAR_MM), delta=0.02, msg="at the joint's own depth (minus the finger's radius)")
+        self.assertEqual(int(fill.surface[cell(mid)]), 0, "and the gap between the fingers stays open: fingers, not a blob")
+        self.assertEqual(len(fill.blobs), 1, "the restored fingers join the palm into one blob")
+
+    def test_model_mode_replaces_the_measurement_under_the_model(self) -> None:
+        src, frame = self.frame()
+        off, fill, model = (make_analyzer(scan_fuse=mode).analyze(frame) for mode in ("off", "fill", "model"))
+        self.assertGreater(model.stats["scanModelFraction"], 0.4)
+        self.assertEqual(model.stats["pixels"], fill.stats["pixels"], "same footprint as fill: the model only replaces depths")
+        assert off.surface is not None and model.surface is not None
+        self.assertLess(int(model.surface[model.surface > 0].min()), int(off.surface[off.surface > 0].min()), "the palm's rounded front face is nearer than the dome under it")
+        self.assertLess(model.blobs[0].w, off.blobs[0].w)
+
+    def test_near_and_far_bound_the_model_in_the_analyzer(self) -> None:
+        depth = backdrop()
+        for palm_depth, expect_pixels in ((depth_at(0.5), True), (depth_at(1.2), False), (300.0, False)):
+            frame = db.DepthFrame(depth, 0.0, (tracked_hand(palm=(319.5, 239.5, palm_depth)),))
+            result = make_analyzer().analyze(frame)
+            self.assertEqual(len(result.hands), 1, "within the margin the hand is reported...")
+            self.assertEqual(result.stats["fusedHands"], 1.0, "...and rendered")
+            if expect_pixels:
+                self.assertGreater(result.stats["pixels"], 0)
+                self.assertEqual(result.stats["scanModelFraction"], 1.0, "nothing but the model is in the box")
+                self.assertEqual(len(result.blobs), 1)
+                self.assertAlmostEqual(result.blobs[0].u, 0.5, delta=0.05)
+                assert result.surface is not None
+                self.assertGreater(int(np.count_nonzero(result.surface)), 0)
+            else:
+                self.assertEqual(result.stats["pixels"], 0.0, f"a model surface outside the depth range is dropped (palm at {palm_depth} mm)")
+                self.assertEqual(result.stats["scanModelFraction"], 0.0)
+
+    def test_roi_offset_puts_the_model_under_the_hand(self) -> None:
+        analyzer = db.BoxAnalyzer(db.BoxConfig(near_m=NEAR, far_m=FAR, roi=(0.25, 0.25, 0.75, 0.75)), db.AnalyzerConfig(occupancy=(8, 6), voxels=None, surface=(8, 6), min_pixels=50))
+        result = analyzer.analyze(db.DepthFrame(backdrop(), 0.0, (tracked_hand(palm=(319.5, 239.5, float(depth_at(0.3)))),)))
+        self.assertEqual(len(result.blobs), 1)
+        self.assertAlmostEqual(result.blobs[0].u, result.hands[0].pos[0], delta=0.08, msg="the blob of the rendered model sits on the skeleton's palm")
+        self.assertAlmostEqual(result.blobs[0].v, result.hands[0].pos[1], delta=0.1)
+        self.assertEqual(result.stats["scanModelFraction"], 1.0)
+
+    def test_focal_length_comes_from_the_source(self) -> None:
+        self.assertIsNone(db.source_focal_px(synthetic()))
+
+        class WithView:
+            class view:
+                fx = 160.0
+
+        class Declared:
+            focal_px = 300
+
+        self.assertEqual(db.source_focal_px(WithView()), 160.0)  # type: ignore[arg-type]
+        self.assertEqual(db.source_focal_px(Declared()), 300.0)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            db.BoxAnalyzer(db.BoxConfig(), db.AnalyzerConfig(), focal_px=0.0)
+        frame = db.DepthFrame(backdrop(), 0.0, (tracked_hand(),))
+        flat = db.BoxAnalyzer(db.BoxConfig(near_m=NEAR, far_m=FAR), db.AnalyzerConfig(occupancy=None, voxels=None, surface=(64, 48), min_pixels=50)).analyze(frame)
+        perspective = db.BoxAnalyzer(db.BoxConfig(near_m=NEAR, far_m=FAR), db.AnalyzerConfig(occupancy=None, voxels=None, surface=(64, 48), min_pixels=50), focal_px=400.0).analyze(frame)
+        self.assertEqual(flat.stats["pixels"], perspective.stats["pixels"], "the focal length sizes the relief, not the footprint")
+        self.assertNotEqual(flat.blobs[0].w, perspective.blobs[0].w)
+
+    def test_config_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            db.AnalyzerConfig(scan_fuse="blend")
+        with self.assertRaises(ValueError):
+            db.AnalyzerConfig(fuse_tolerance_mm=-1.0)
+        self.assertEqual(db.AnalyzerConfig().scan_fuse, "fill")
+        self.assertEqual(db.AnalyzerConfig().fuse_tolerance_mm, 40.0)
+
+    @unittest.skipUnless(db.HAVE_OPENCV, "the Leap synthetic source needs OpenCV")
+    def test_leap_synthetic_source_is_fused_too(self) -> None:
+        import leap_source  # noqa: PLC0415 - optional, needs OpenCV
+        import leap_stereo  # noqa: PLC0415
+
+        view = leap_stereo.RectifiedView.from_fov(320, 240, 90.0)
+        src = leap_source.LeapSyntheticSource(view, leap_stereo.StereoParams(min_depth_mm=100.0), paced=False, hand_frame=leap_source.DEFAULT_HAND_FRAME)
+        self.assertEqual(db.source_focal_px(src), view.fx)
+        frame = src.frame_at(2.0)
+        assert frame.hands
+        box = db.BoxConfig(near_m=0.1, far_m=0.45)
+        results = {}
+        for mode in ("off", "fill"):
+            analyzer = db.BoxAnalyzer(box, db.AnalyzerConfig(occupancy=(8, 6), voxels=(8, 6, 4), surface=(64, 48), min_pixels=50, scan_fuse=mode), focal_px=db.source_focal_px(src))
+            results[mode] = analyzer.analyze(frame)
+        off, fill = results["off"], results["fill"]
+        self.assertEqual(fill.stats["fusedHands"], 1.0)
+        self.assertGreaterEqual(fill.stats["pixels"], off.stats["pixels"])
+        self.assertTrue(0.0 < fill.stats["scanModelFraction"] < 0.5, fill.stats)
+        hand = frame.hands[0]
+        x0, y0, x1, y1 = box.roi_pixels(frame.width, frame.height)
+        fused_mm, _ = sf.fuse_depth(frame.depth_mm, *sf.render_hands([hand], frame.depth_mm.shape, (0, 0), view.fx)[:1], "fill", 40.0, box.near_mm, box.far_mm)
+        joints = hand.joints
+        inside = (joints[:, 0] >= x0) & (joints[:, 0] < x1) & (joints[:, 1] >= y0) & (joints[:, 1] < y1) & (joints[:, 2] >= box.near_mm) & (joints[:, 2] <= box.far_mm)
+        u, v = np.rint(joints[inside, 0]).astype(int), np.rint(joints[inside, 1]).astype(int)
+        covered = (fused_mm[v, u] >= box.near_mm) & (fused_mm[v, u] <= box.far_mm)
+        self.assertGreater(float(covered.mean()), 0.95, "after fusion every joint in the box lies on a foreground pixel")
+        m = db.frame_message(0, 0.0, fill)
+        self.assert_frame(m, (8, 6), (8, 6, 4), (64, 48))
+
+
 class TrackerTests(unittest.TestCase):
     def test_greedy_nearest_matching_and_new_ids(self) -> None:
         tr = db.BlobTracker(max_jump=0.25, max_missed=1)
@@ -965,6 +1376,24 @@ class DumpCliTests(ProtocolAssertions):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("near < far", proc.stderr)
 
+    def test_scan_fuse_flag_round_trip(self) -> None:
+        small = ("--resolution", "160", "120", "--min-pixels", "20", "--surface", "16", "12")
+        stats = {mode: run_dump("--dump", "2", "--scan-fuse", mode, *small)[1]["stats"] for mode in ("off", "fill", "model")}
+        self.assertEqual((stats["off"]["fusedHands"], stats["off"]["scanModelFraction"]), (0.0, 0.0))
+        self.assertEqual(stats["fill"]["fusedHands"], 1.0)
+        self.assertTrue(0.0 < stats["fill"]["scanModelFraction"] < 0.3, stats["fill"])
+        self.assertGreater(stats["model"]["scanModelFraction"], stats["fill"]["scanModelFraction"])
+        self.assertEqual(stats["model"]["pixels"], stats["fill"]["pixels"])
+        self.assertGreaterEqual(stats["fill"]["pixels"], stats["off"]["pixels"])
+        tight = run_dump("--dump", "1", "--fuse-tolerance", "0", *small)[1]["stats"]
+        self.assertGreater(tight["scanModelFraction"], stats["fill"]["scanModelFraction"], "a zero tolerance trusts only exact agreement")
+        default = run_dump("--dump", "1", *small)[1]["stats"]
+        self.assertEqual(default["scanModelFraction"], stats["fill"]["scanModelFraction"], "fill is the default")
+        for flags in (("--scan-fuse", "blend"), ("--fuse-tolerance", "-5")):
+            cmd = [sys.executable, os.path.join(HERE, "depth_bridge.py"), "--dump", "1", *flags]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False)
+            self.assertNotEqual(proc.returncode, 0, flags)
+
     @unittest.skipUnless(os.path.exists(FIXTURE), "fixture not generated")
     def test_checked_in_fixture_matches_the_protocol(self) -> None:
         with open(FIXTURE, encoding="utf-8") as fh:
@@ -981,6 +1410,10 @@ class DumpCliTests(ProtocolAssertions):
             self.assertEqual(len(hands), 1, "the script starts with the hand present")
             self.assertEqual(set(hands[0]), TRACKED_HAND_KEYS)
             self.assertEqual(hands[0]["skeleton"]["palm"], hands[0]["pos"], "pos is the palm")
+            stats = frame["stats"]
+            assert isinstance(stats, dict)
+            self.assertEqual(stats["fusedHands"], 1.0, "the fixture is generated with the default fusion (fill) and carries its stats")
+            self.assertTrue(0.0 < stats["scanModelFraction"] < 0.3, stats)
 
 
 if __name__ == "__main__":

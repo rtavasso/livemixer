@@ -38,11 +38,21 @@ if the device sits rotated. :func:`reorient` can also rotate or flip the depth
 image inside the bridge (``--leap-orient``), which is handy when the surface
 scan must keep the browser's "image right/down" convention.
 
-Quality to expect: a 40 mm baseline with ~0.36 deg per rectified pixel gives a
-depth step of ``Z^2 / (baseline * f)`` per disparity pixel, about 14 mm at
-300 mm with the default 320x240 view; sub-pixel matching brings the noise on a
-textured hand down to roughly 5-15 mm. Beyond ~450 mm the controller's IR
-illumination fades and matches become sparse.
+Quality to expect: a 40 mm baseline with ~0.24 deg per rectified pixel gives a
+depth step of ``Z^2 / (baseline * f)`` per disparity pixel, about 9 mm at
+300 mm with the default 480x360 view (f = 240 px); sub-pixel matching brings
+the noise on a textured hand down to roughly 5-10 mm. Beyond ~450 mm the
+controller's IR illumination fades and matches become sparse.
+
+What the real frames showed (``stereo_lab.py`` on ``leap_source.py --dump-images``
+output; see the README's "Tuning the stereo" for the numbers): the raw sensor
+has only 2.4 px/deg horizontally and 1.2 rows/deg vertically at the centre of
+its field, so the rectified view is already oversampling a hand over the
+device; the two cameras' calibrations leave the right eye 1-2 rows above the
+left at f = 160 px, which :class:`CameraAlignment` corrects; and the phantom
+near depth in dark, featureless parts of the room is best removed by the
+depth-aware brightness rule (``StereoParams.min_lit``) rather than by a
+texture threshold, which hollows the equally smooth hand.
 """
 from __future__ import annotations
 
@@ -164,20 +174,175 @@ def _upsample_lattice(lattice: np.ndarray, step: int, width: int, height: int) -
     return a * (1 - wu) * (1 - wv) + b * wu * (1 - wv) + c * (1 - wu) * wv + d * wu * wv
 
 
+@dataclass(frozen=True)
+class CameraAlignment:
+    """A small rotation applied to one camera's rays before its calibration is asked where they land.
+
+    LeapC's per-camera calibration (``LeapRectilinearToPixel`` and the image
+    events' distortion matrices) undistorts each camera on its own but does
+    not quite co-align the two: on the controller measured here the right
+    camera's features sit 1-2 rows above the left's at f = 160 px, and the
+    offset grows with the column, i.e. a pitch of a few tenths of a degree and
+    a roll of about half a degree. Block matching on a pair misaligned by two
+    rows is what turns a hand into a blob, so the rectifier rotates the right
+    camera's rays by this before looking them up. Angles are in degrees:
+    ``pitch`` about the baseline (x; positive moves the right view's content
+    down, i.e. corrects features that sat too high), ``roll`` about the
+    optical axis (z; positive corrects a right view whose rows tilt up
+    towards the right), ``yaw`` about y (it offsets disparity by ``f * yaw``
+    and cannot be told from depth without a known distance, so it is 0
+    unless you know better). :func:`estimate_alignment` measures pitch and
+    roll from image matches.
+    """
+
+    pitch: float = 0.0
+    roll: float = 0.0
+    yaw: float = 0.0
+
+    @property
+    def matrix(self) -> np.ndarray:
+        """``R`` such that a ray ``d`` of the aligned view is the calibration's ray ``R @ d``."""
+        rx, ry, rz = (math.radians(a) for a in (self.pitch, self.yaw, self.roll))
+        cx, sx, cy, sy, cz, sz = math.cos(rx), math.sin(rx), math.cos(ry), math.sin(ry), math.cos(rz), math.sin(rz)
+        mx = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]])
+        my = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]])
+        mz = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]])
+        return mz @ my @ mx
+
+    @property
+    def identity(self) -> bool:
+        return self.pitch == 0.0 and self.roll == 0.0 and self.yaw == 0.0
+
+    def rotate(self, tx: np.ndarray | float, ty: np.ndarray | float) -> tuple[np.ndarray, np.ndarray]:
+        """Ray slopes of the aligned view -> slopes in the calibration's own frame (arrays broadcast)."""
+        tx, ty = np.asarray(tx, dtype=np.float64), np.asarray(ty, dtype=np.float64)
+        r = self.matrix
+        x = r[0, 0] * tx + r[0, 1] * ty + r[0, 2]
+        y = r[1, 0] * tx + r[1, 1] * ty + r[1, 2]
+        z = r[2, 0] * tx + r[2, 1] * ty + r[2, 2]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return x / z, y / z
+
+    @property
+    def name(self) -> str:
+        return f"{self.pitch:.3f},{self.roll:.3f}" + (f",{self.yaw:.3f}" if self.yaw else "")
+
+    @classmethod
+    def parse(cls, text: str) -> "CameraAlignment":
+        """``"PITCH,ROLL"`` or ``"PITCH,ROLL,YAW"`` in degrees; ``"none"`` is the identity."""
+        if text.strip().lower() in ("none", "0", ""):
+            return cls()
+        parts = [float(p) for p in text.split(",")]
+        if len(parts) not in (2, 3) or any(abs(p) > 10.0 for p in parts):
+            raise ValueError(f"alignment must be PITCH,ROLL[,YAW] in degrees (each within +-10), got {text!r}")
+        return cls(parts[0], parts[1], parts[2] if len(parts) == 3 else 0.0)
+
+
+#: ``LEAP_DISTORTION_MATRIX`` is 64x64 points; the lattice spans ray slopes ``-4..4`` (+-76 deg) in both directions.
+DISTORTION_GRID_N = 64
+DISTORTION_SLOPE_RANGE = 4.0
+
+
+class GridCalibration:
+    """The controller's calibration as a sampled grid, usable offline: a :data:`RayToPixel` built from arrays.
+
+    The distortion matrix LeapC attaches to every image (``LEAP_IMAGE.distortion_matrix``,
+    ``float[64][64][2]``) is a lookup table from ray direction to raw pixel,
+    verified against the live ``LeapRectilinearToPixel`` and the images it
+    rectified: entry ``[j, i]`` holds the raw-image coordinates, normalized to
+    ``0..1`` of the width and height, hit by the ray with slopes
+    ``tx = -4 + 8 i / 63`` (columns run with ``+tx``, image right) and
+    ``ty = 4 - 8 j / 63`` (row 0 is ``+ty``, image DOWN: the rows are stored
+    bottom-up, the OpenGL texture convention of the original SDK's distortion
+    shaders). Values outside ``0..1`` are rays that miss the sensor. In pixels
+    that is ``x * width - 0.5`` (OpenCV's integer-is-centre convention), which
+    matches the live function to a quarter pixel in the centre; towards the
+    edges of the sensor the two disagree by several pixels (the function
+    extrapolates differently), so a grid of the function's own answers on the
+    same lattice (``normalized=False``, pixels) reproduces the bridge's live
+    rectification exactly and is what ``leap_source.py --dump-images`` saves
+    next to the lattice. ``grids`` maps camera -> ``(64, 64, 2)`` array;
+    lookups are bilinear, vectorised in :meth:`lookup`, scalar via
+    :meth:`__call__` (the :data:`RayToPixel` protocol).
+    """
+
+    def __init__(self, grids: dict[int, np.ndarray], raw_width: int, raw_height: int, normalized: bool = True, slope_range: float = DISTORTION_SLOPE_RANGE) -> None:
+        if raw_width < 1 or raw_height < 1:
+            raise ValueError("raw image size must be positive")
+        self.raw_width, self.raw_height = int(raw_width), int(raw_height)
+        self.slope_range = float(slope_range)
+        self.grids: dict[int, np.ndarray] = {}
+        for camera, grid in grids.items():
+            g = np.asarray(grid, dtype=np.float64)
+            if g.ndim != 3 or g.shape[0] != g.shape[1] or g.shape[2] != 2 or g.shape[0] < 2:
+                raise ValueError(f"camera {camera}: expected an (N, N, 2) grid, got {g.shape}")
+            if normalized:
+                g = np.stack([g[..., 0] * self.raw_width - 0.5, g[..., 1] * self.raw_height - 0.5], axis=-1)
+            self.grids[int(camera)] = np.ascontiguousarray(g)
+        if not self.grids:
+            raise ValueError("no calibration grids")
+
+    @classmethod
+    def load(cls, directory: str, raw_width: int = 640, raw_height: int = 240, prefer_samples: bool = True) -> "GridCalibration":
+        """The grids ``leap_source.py --dump-images`` writes: ``leap_r2p_{left,right}.npy`` (function samples, pixels) if present and
+        ``prefer_samples``, else ``leap_distortion_{left,right}.npy`` (the image events' lattices, normalized)."""
+        import os
+
+        for prefix, normalized in (("leap_r2p", False), ("leap_distortion", True)):
+            if prefix == "leap_r2p" and not prefer_samples:
+                continue
+            paths = {CAMERA_LEFT: os.path.join(directory, f"{prefix}_left.npy"), CAMERA_RIGHT: os.path.join(directory, f"{prefix}_right.npy")}
+            if all(os.path.isfile(p) for p in paths.values()):
+                cal = cls({cam: np.load(p) for cam, p in paths.items()}, raw_width, raw_height, normalized=normalized)
+                cal.source = prefix  # type: ignore[attr-defined]
+                return cal
+        raise FileNotFoundError(f"no leap_r2p_*.npy or leap_distortion_*.npy in {directory}")
+
+    def lookup(self, camera: int, tx: np.ndarray | float, ty: np.ndarray | float) -> tuple[np.ndarray, np.ndarray]:
+        """Raw pixel coordinates of rays ``(tx, ty, 1)``; NaN for rays outside the lattice."""
+        grid = self.grids[int(camera)]
+        n = grid.shape[0]
+        a = (np.asarray(tx, dtype=np.float64) + self.slope_range) / (2.0 * self.slope_range) * (n - 1)
+        b = (self.slope_range - np.asarray(ty, dtype=np.float64)) / (2.0 * self.slope_range) * (n - 1)
+        ok = (a >= 0) & (a <= n - 1) & (b >= 0) & (b <= n - 1)
+        a = np.clip(np.nan_to_num(a), 0.0, n - 1 - 1e-9)
+        b = np.clip(np.nan_to_num(b), 0.0, n - 1 - 1e-9)
+        i0, j0 = np.floor(a).astype(np.int64), np.floor(b).astype(np.int64)
+        fa, fb = (a - i0)[..., None], (b - j0)[..., None]
+        p = (grid[j0, i0] * (1 - fa) * (1 - fb) + grid[j0, i0 + 1] * fa * (1 - fb) + grid[j0 + 1, i0] * (1 - fa) * fb + grid[j0 + 1, i0 + 1] * fa * fb)
+        px, py = p[..., 0], p[..., 1]
+        px = np.where(ok, px, np.nan)
+        py = np.where(ok, py, np.nan)
+        return px, py
+
+    def __call__(self, camera: int, tx: float, ty: float) -> tuple[float, float]:
+        px, py = self.lookup(camera, tx, ty)
+        return float(px), float(py)
+
+    @property
+    def cameras(self) -> tuple[int, ...]:
+        return tuple(self.grids)
+
+
 class Rectifier:
     """Builds and applies ``cv2.remap`` maps that turn raw images into the :class:`RectifiedView`.
 
     ``ray_to_pixel`` is queried on a lattice every ``sample_step`` rectified
     pixels (the Leap's own calibration is a 64x64 grid, so nothing is lost)
     and interpolated bilinearly in between; ``sample_step=1`` queries every
-    pixel. Rays the calibration cannot place (non-finite results) map outside
-    the raw image and come out black. ``coverage[camera]`` is the fraction of
-    the view that lands inside the raw image.
+    pixel. A calibration with a vectorised ``lookup`` (:class:`GridCalibration`)
+    is asked for the whole lattice at once. Rays the calibration cannot place
+    (non-finite results) map outside the raw image and come out black.
+    ``coverage[camera]`` is the fraction of the view that lands inside the
+    raw image. ``alignment`` rotates a camera's rays (:class:`CameraAlignment`)
+    before the lookup; by convention only the right camera is aligned, to the
+    left, so the reference view keeps the calibration's frame.
     """
 
     def __init__(
         self, ray_to_pixel: RayToPixel, raw_width: int, raw_height: int,
         view: RectifiedView | None = None, cameras: Sequence[int] = CAMERAS, sample_step: int = 4,
+        alignment: "dict[int, CameraAlignment] | CameraAlignment | None" = None,
     ) -> None:
         if raw_width < 1 or raw_height < 1:
             raise ValueError("raw image size must be positive")
@@ -186,6 +351,9 @@ class Rectifier:
         self.view = view or RectifiedView()
         self.raw_width, self.raw_height = int(raw_width), int(raw_height)
         self.sample_step = int(sample_step)
+        if isinstance(alignment, CameraAlignment):
+            alignment = {CAMERA_RIGHT: alignment}
+        self.alignment: dict[int, CameraAlignment] = {int(k): v for k, v in (alignment or {}).items() if not v.identity}
         self.maps: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         self.coverage: dict[int, float] = {}
         for camera in cameras:
@@ -197,13 +365,22 @@ class Rectifier:
     def _build(self, ray_to_pixel: RayToPixel, camera: int) -> tuple[np.ndarray, np.ndarray]:
         view, step = self.view, self.sample_step
         nu, nv = (view.width - 1) // step + 2, (view.height - 1) // step + 2
-        lat_x = np.empty((nv, nu), dtype=np.float64)
-        lat_y = np.empty((nv, nu), dtype=np.float64)
-        for j in range(nv):
-            for i in range(nu):
-                tx, ty = view.pixel_to_ray(i * step, j * step)
-                px, py = ray_to_pixel(camera, float(tx), float(ty))
-                lat_x[j, i], lat_y[j, i] = px, py
+        i, j = np.meshgrid(np.arange(nu), np.arange(nv))
+        tx, ty = view.pixel_to_ray(i * step, j * step)
+        align = self.alignment.get(camera)
+        if align is not None:
+            tx, ty = align.rotate(tx, ty)
+        lookup = getattr(ray_to_pixel, "lookup", None)
+        if callable(lookup):
+            lat_x, lat_y = lookup(camera, tx, ty)
+            lat_x, lat_y = np.asarray(lat_x, dtype=np.float64), np.asarray(lat_y, dtype=np.float64)
+        else:
+            lat_x = np.empty((nv, nu), dtype=np.float64)
+            lat_y = np.empty((nv, nu), dtype=np.float64)
+            for jj in range(nv):
+                for ii in range(nu):
+                    px, py = ray_to_pixel(camera, float(tx[jj, ii]), float(ty[jj, ii]))
+                    lat_x[jj, ii], lat_y[jj, ii] = px, py
         map_x = _upsample_lattice(lat_x, step, view.width, view.height)
         map_y = _upsample_lattice(lat_y, step, view.width, view.height)
         bad = ~(np.isfinite(map_x) & np.isfinite(map_y))
@@ -223,8 +400,165 @@ class Rectifier:
 
 
 # --------------------------------------------------------------------------- #
+# Estimating the camera alignment from the images themselves
+# --------------------------------------------------------------------------- #
+
+
+def match_pair(left: np.ndarray, right: np.ndarray, max_dy: float = 12.0, max_disparity: float = 160.0, ratio: float = 0.7, features: int = 4000) -> np.ndarray:
+    """Feature matches between a rectified pair as ``(N, 4)`` rows ``(u_left, v_left, u_right, v_right)`` (pixel-centre coordinates).
+
+    SIFT (ORB when OpenCV lacks it) with Lowe's ratio test, keeping matches
+    whose rows differ by at most ``max_dy`` and whose disparity is between -1
+    and ``max_disparity``; the scale of the two keypoints must agree, which
+    drops most mismatches on repetitive ceiling texture.
+    """
+    if hasattr(cv2, "SIFT_create"):
+        detector = cv2.SIFT_create(nfeatures=features, contrastThreshold=0.015, edgeThreshold=20)
+        norm = cv2.NORM_L2
+    else:  # pragma: no cover - older OpenCV builds
+        detector = cv2.ORB_create(nfeatures=features)
+        norm = cv2.NORM_HAMMING
+    kl, dl = detector.detectAndCompute(left, None)
+    kr, dr = detector.detectAndCompute(right, None)
+    if dl is None or dr is None or len(kl) < 2 or len(kr) < 2:
+        return np.zeros((0, 4))
+    out = []
+    for pair in cv2.BFMatcher(norm).knnMatch(dl, dr, k=2):
+        if len(pair) < 2:
+            continue
+        m, n = pair
+        if m.distance >= ratio * n.distance:
+            continue
+        a, b = kl[m.queryIdx], kr[m.trainIdx]
+        disparity = a.pt[0] - b.pt[0]
+        if abs(a.pt[1] - b.pt[1]) > max_dy or not (-1.0 <= disparity <= max_disparity) or abs(a.size - b.size) > 0.5 * a.size:
+            continue
+        out.append((a.pt[0], a.pt[1], b.pt[0], b.pt[1]))
+    return np.asarray(out, dtype=np.float64).reshape(-1, 4)
+
+
+def matches_to_rays(matches: np.ndarray, view: RectifiedView, current: CameraAlignment | None = None) -> np.ndarray:
+    """``(N, 4)`` pixel matches -> ``(N, 4)`` ray slopes ``(txL, tyL, txR, tyR)``, the right ones in its calibration frame.
+
+    ``current`` is the alignment the right view was rectified with, so that
+    matches measured on an already partly aligned pair still describe the
+    calibration frame and fits can be refined and accumulated.
+    """
+    m = np.asarray(matches, dtype=np.float64).reshape(-1, 4)
+    txl, tyl = view.pixel_to_ray(m[:, 0], m[:, 1])
+    txr, tyr = view.pixel_to_ray(m[:, 2], m[:, 3])
+    if current is not None and not current.identity:
+        txr, tyr = current.rotate(txr, tyr)
+    return np.stack([txl, tyl, txr, tyr], axis=-1)
+
+
+def _alignment_residual(pitch_rad: float, roll_rad: float, rays: np.ndarray) -> np.ndarray:
+    align = CameraAlignment(math.degrees(pitch_rad), math.degrees(roll_rad))
+    r = align.matrix  # calibration ray = R @ aligned ray  =>  aligned ray = R^T @ calibration ray
+    x, y, z = rays[:, 2], rays[:, 3], 1.0
+    ay = r[0, 1] * x + r[1, 1] * y + r[2, 1] * z
+    az = r[0, 2] * x + r[1, 2] * y + r[2, 2] * z
+    return ay / az - rays[:, 1]
+
+
+@dataclass(frozen=True)
+class AlignmentFit:
+    """Result of :func:`fit_alignment`: the alignment, how many matches it was fitted on and the row error before/after (view pixels)."""
+
+    alignment: CameraAlignment
+    matches: int
+    before_px: float
+    after_px: float
+
+    def describe(self) -> str:
+        return f"pitch {self.alignment.pitch:+.3f} deg, roll {self.alignment.roll:+.3f} deg from {self.matches} matches (row error {self.before_px:.2f} -> {self.after_px:.2f} px)"
+
+
+def fit_alignment(rays: np.ndarray, view: RectifiedView, iterations: int = 30, huber_px: float = 1.0) -> AlignmentFit:
+    """Pitch and roll of the right camera that put matched features on the same row (yaw stays 0).
+
+    Gauss-Newton on the vertical ray error with Huber-like reweighting
+    (``huber_px`` in view pixels), so a few wrong matches do not steer it.
+    """
+    rays = np.asarray(rays, dtype=np.float64).reshape(-1, 4)
+    if len(rays) < 4:
+        raise ValueError(f"need at least 4 matches to fit the alignment, got {len(rays)}")
+    p = np.zeros(2)
+    scale = huber_px / view.fy
+    r0 = _alignment_residual(0.0, 0.0, rays)
+    for _ in range(iterations):
+        r = _alignment_residual(p[0], p[1], rays)
+        jac = np.empty((len(rays), 2))
+        for k in range(2):
+            dp = np.zeros(2)
+            dp[k] = 1e-7
+            jac[:, k] = (_alignment_residual(p[0] + dp[0], p[1] + dp[1], rays) - r) / 1e-7
+        w = 1.0 / np.maximum(1.0, np.abs(r) / scale)
+        step, *_ = np.linalg.lstsq(jac * w[:, None], -r * w, rcond=None)
+        p = p + step
+        if float(np.abs(step).max()) < 1e-10:
+            break
+    r1 = _alignment_residual(p[0], p[1], rays)
+    align = CameraAlignment(round(math.degrees(p[0]), 4), round(math.degrees(p[1]), 4))
+    return AlignmentFit(align, len(rays), float(np.median(np.abs(r0)) * view.fy), float(np.median(np.abs(r1)) * view.fy))
+
+
+def estimate_alignment(left: np.ndarray, right: np.ndarray, view: RectifiedView, current: CameraAlignment | None = None) -> AlignmentFit:
+    """One-shot :func:`match_pair` + :func:`fit_alignment` on a rectified pair (``current`` = the alignment it was made with)."""
+    return fit_alignment(matches_to_rays(match_pair(left, right), view, current), view)
+
+
+class AlignmentEstimator:
+    """Accumulates matches over frames and fits once there are enough (``--leap-align auto``).
+
+    Feed every rectified pair to :meth:`observe`; it returns the fit the
+    first time at least ``min_matches`` matches from at least ``min_frames``
+    frames are in, and ``None`` before that and after (``fit`` keeps the
+    result). ``max_frames`` caps how long a scene without features is tried.
+    """
+
+    def __init__(self, view: RectifiedView, current: CameraAlignment | None = None, min_matches: int = 150, min_frames: int = 5, max_frames: int = 300) -> None:
+        self.view, self.current = view, current or CameraAlignment()
+        self.min_matches, self.min_frames, self.max_frames = int(min_matches), int(min_frames), int(max_frames)
+        self.rays: list[np.ndarray] = []
+        self.matches = 0
+        self.frames = 0
+        self.fit: AlignmentFit | None = None
+
+    @property
+    def done(self) -> bool:
+        return self.fit is not None or self.frames >= self.max_frames
+
+    def observe(self, left: np.ndarray, right: np.ndarray) -> AlignmentFit | None:
+        if self.done:
+            return None
+        self.frames += 1
+        m = match_pair(left, right)
+        if len(m):
+            self.rays.append(matches_to_rays(m, self.view, self.current))
+            self.matches += len(m)
+        if self.frames >= self.min_frames and self.matches >= self.min_matches:
+            self.fit = fit_alignment(np.concatenate(self.rays), self.view)
+            return self.fit
+        return None
+
+    def describe(self) -> str:
+        if self.fit is not None:
+            return self.fit.describe()
+        if self.frames >= self.max_frames:
+            return f"gave up after {self.frames} frames with {self.matches} matches (keeping {self.current.name})"
+        return f"collecting: {self.matches} matches from {self.frames} frames"
+
+
+# --------------------------------------------------------------------------- #
 # Stereo matching
 # --------------------------------------------------------------------------- #
+
+
+def local_range(image: np.ndarray, window: int) -> np.ndarray:
+    """Spread of intensities (max - min) in a ``window x window`` neighbourhood of every pixel, as ``uint8``."""
+    kernel = np.ones((window, window), dtype=np.uint8)
+    return cv2.subtract(cv2.dilate(image, kernel), cv2.erode(image, kernel))
 
 
 @dataclass(frozen=True)
@@ -235,44 +569,111 @@ class StereoParams:
     search); pass the box's near plane. Anything nearer than the range
     matches at the largest disparity, so disparities within a pixel of it
     are discarded rather than reported as a wrong depth.
-    ``min_intensity`` invalidates pixels darker than that
-    (0..255) in the reference image: the controller's IR LEDs light what is
-    near and leave the room dark, and a matcher fed near-black texture
-    invents disparities, so this is the main defence against phantom
-    matter. ``median`` (0, 3 or 5) median-filters the disparity; the speckle
-    filter drops connected patches smaller than ``speckle_window`` pixels
-    whose disparity varies by more than ``speckle_range``. ``matcher`` is
-    ``"sgbm"`` (default) or ``"bm"`` (block matching: faster, noisier);
-    ``mode`` picks the SGBM path aggregation (``"sgbm"`` 5 directions,
-    ``"hh"`` 8 directions, ``"3way"`` fastest).
+    Four rules invalidate pixels of the reference image after matching, each
+    off at its neutral value. ``min_intensity`` drops pixels darker than that
+    (0..255): the controller's IR LEDs light what is near and leave the room
+    dark, and a matcher fed near-black texture invents disparities.
+    ``max_intensity`` drops pixels at or above it (255 = off): a hand held
+    close to the LEDs saturates to pure white and matches anywhere.
+    ``min_lit`` is the same idea made depth-aware (0 = off): the LEDs fall off
+    with the square of the distance, so a surface that claims depth ``Z``
+    must be at least ``min_lit * (lit_reference_mm / Z)^2`` bright somewhere
+    in its ``lit_window`` neighbourhood; a real hand is 65-90 at 300 mm on
+    the controller measured here, a dark wall that the matcher placed at
+    250 mm is 20-40 and fails, while a dim hand at 450 mm (the same wall's
+    brightness, but consistent with its depth) passes.
+    ``min_texture`` drops pixels whose ``texture_window`` x ``texture_window``
+    neighbourhood spans fewer than that many grey levels (0 = off, the
+    default: skin at 2-3 px per degree is as smooth as the walls, so on the
+    real frames this rule hollows the hand before it removes the phantoms;
+    it is kept for rooms where the walls are the only flat thing). The
+    matcher's own confidence rules stay on: ``uniqueness`` (percent margin
+    the best disparity must win by) and ``disp12_max_diff`` (left-right
+    consistency in pixels; -1 = off). ``median`` (0, 3 or 5) median-filters
+    the disparity; the speckle filter drops connected patches smaller than
+    ``speckle_window`` pixels whose disparity varies by more than
+    ``speckle_range`` (scale the window with the view's pixel count).
+    ``matcher`` is ``"sgbm"`` (default) or ``"bm"`` (block matching: faster,
+    noisier); ``mode`` picks the SGBM path aggregation (``"3way"``, the
+    default, is the parallel three-direction pass and 3-4x faster than
+    ``"sgbm"``, 5 directions, for the same hand; ``"hh"`` is 8 directions and
+    slower still).
     """
 
     min_depth_mm: float = 100.0
     max_depth_mm: float = 65535.0
     min_intensity: int = 16
+    max_intensity: int = 250
+    min_lit: int = 20
+    lit_reference_mm: float = 300.0
+    lit_window: int = 5
+    min_texture: int = 0
+    texture_window: int = 7
     block_size: int = 5
-    uniqueness: int = 10
-    speckle_window: int = 100
+    uniqueness: int = 15
+    speckle_window: int = 200
     speckle_range: int = 2
     disp12_max_diff: int = 1
     prefilter_cap: int = 31
     median: int = 3
     matcher: str = "sgbm"
-    mode: str = "sgbm"
+    mode: str = "3way"
 
     def __post_init__(self) -> None:
         if not (0 < self.min_depth_mm < self.max_depth_mm):
             raise ValueError("need 0 < min_depth_mm < max_depth_mm")
         if not (0 <= self.min_intensity <= 255):
             raise ValueError("min_intensity must be 0..255")
+        if not (self.min_intensity < self.max_intensity <= 255):
+            raise ValueError("max_intensity must be above min_intensity and at most 255")
+        if not (0 <= self.min_lit <= 255) or not (self.lit_reference_mm > 0):
+            raise ValueError("min_lit must be 0..255 at a positive reference depth")
+        if self.lit_window < 1 or self.lit_window % 2 == 0:
+            raise ValueError("lit_window must be odd and positive")
+        if not (0 <= self.min_texture <= 255):
+            raise ValueError("min_texture must be 0..255")
+        if self.texture_window < 3 or self.texture_window % 2 == 0:
+            raise ValueError("texture_window must be odd and at least 3")
         if self.block_size < 1 or self.block_size % 2 == 0:
             raise ValueError("block_size must be odd and positive")
+        if not (0 <= self.uniqueness <= 100):
+            raise ValueError("uniqueness must be 0..100 (percent)")
         if self.median not in (0, 3, 5):
             raise ValueError("median must be 0, 3 or 5")
         if self.matcher not in ("sgbm", "bm"):
             raise ValueError("matcher must be 'sgbm' or 'bm'")
         if self.mode not in ("sgbm", "hh", "3way"):
             raise ValueError("mode must be 'sgbm', 'hh' or '3way'")
+
+    def invalid_pixels(self, reference: np.ndarray) -> np.ndarray | None:
+        """Boolean mask of the reference-image pixels the intensity and texture rules reject, or ``None`` when every rule is off."""
+        masks = []
+        if self.min_intensity > 0:
+            masks.append(reference < self.min_intensity)
+        if self.max_intensity < 255:
+            masks.append(reference >= self.max_intensity)
+        if self.min_texture > 0:
+            masks.append(local_range(reference, self.texture_window) < self.min_texture)
+        if not masks:
+            return None
+        out = masks[0]
+        for m in masks[1:]:
+            out |= m
+        return out
+
+    def underlit_pixels(self, reference: np.ndarray, depth_mm: np.ndarray) -> np.ndarray | None:
+        """Boolean mask of measured pixels too dark for the depth they claim (the ``min_lit`` rule), or ``None`` when it is off.
+
+        Brightness is the maximum over a ``lit_window`` neighbourhood, so a
+        dark pore or grain inside a lit hand does not count as unlit; a
+        phantom region is dark throughout and still fails.
+        """
+        if self.min_lit <= 0:
+            return None
+        z = depth_mm.astype(np.float32)
+        needed = self.min_lit * (self.lit_reference_mm / np.maximum(z, 1.0)) ** 2
+        brightest = cv2.dilate(reference, np.ones((self.lit_window, self.lit_window), dtype=np.uint8))
+        return (z > 0) & (brightest.astype(np.float32) < needed)
 
 
 class StereoDepth:
@@ -337,8 +738,9 @@ class StereoDepth:
         if self.params.median in (3, 5):
             disp = cv2.medianBlur(disp, self.params.median)
         disp[disp > self.num_disparities - 1.5] = -1.0  # saturated: nearer than the search range, depth unknown
-        if self.params.min_intensity > 0:
-            disp[left < self.params.min_intensity] = -1.0  # too dark to trust: the IR LEDs did not reach it
+        rejected = self.params.invalid_pixels(left)  # too dark, saturated or featureless in the reference image
+        if rejected is not None:
+            disp[rejected] = -1.0
         return disp
 
     def depth_from_disparity(self, disp: np.ndarray) -> np.ndarray:
@@ -350,7 +752,15 @@ class StereoDepth:
         return np.ascontiguousarray(np.rint(depth), dtype=np.uint16)
 
     def compute(self, left: np.ndarray, right: np.ndarray) -> np.ndarray:
-        return self.depth_from_disparity(self.disparity(left, right))
+        """Depth in millimetres (``uint16``, 0 = none) with every invalidation rule applied, including the depth-aware ``min_lit``."""
+        depth = self.depth_from_disparity(self.disparity(left, right))
+        reference = right if self.swap else left
+        if reference.dtype != np.uint8:
+            reference = np.clip(reference, 0, 255).astype(np.uint8)
+        underlit = self.params.underlit_pixels(reference, depth)
+        if underlit is not None:
+            depth[underlit] = 0
+        return depth
 
     def valid_fraction(self, left: np.ndarray, right: np.ndarray) -> float:
         """Fraction of pixels the matcher could place; used to detect a swapped pair."""

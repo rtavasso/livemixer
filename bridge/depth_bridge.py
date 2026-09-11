@@ -47,6 +47,12 @@ Geometry conventions
   not clamped (a forearm may leave the box) but the hand's ``pos`` is. When a
   frame carries tracked hands they are what ``hands`` reports, with a
   ``skeleton``; otherwise the blobs are, exactly as for a plain depth camera.
+* Before anything is measured from the depth, the tracked hands' capsule
+  model (``scan_fusion.py``) is fused into it (``scan_fuse``: ``fill`` fills
+  where the measurement is missing or disagrees with the model, ``model``
+  replaces it under the model, ``off`` leaves it alone), so the scan, the
+  voxels, the occupancy and the blobs agree with the skeleton;
+  ``stats.scanModelFraction`` says how much of the foreground came from it.
 
 Dependencies: ``numpy`` and ``websockets`` (``pip install numpy websockets``).
 Optional: ``opencv-python`` for multi-blob connected components and for the
@@ -88,6 +94,10 @@ MAX_POINTS = 256          # bridgeHandSchema: points.max(256)
 MAX_OCCUPANCY_SIDE = 256  # bridgeHelloSchema: occupancy width/height.max(256)
 MAX_VOXEL_SIDE = 128      # bridgeHelloSchema: voxels nx/ny/nz.max(128)
 MAX_SURFACE_SIDE = 512    # bridgeHelloSchema: surface width/height.max(512)
+#: How a tracked hand's capsule model is fused into the depth before the scan (``scan_fusion.fuse_depth``).
+SCAN_FUSE_MODES = ("off", "fill", "model")
+DEFAULT_SCAN_FUSE = "fill"
+DEFAULT_FUSE_TOLERANCE_MM = 40.0
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 
@@ -213,6 +223,9 @@ class FrameSource(ABC):
     fps: float | None = None
     #: True when frames can carry :class:`TrackedHand` skeletons (announced as ``skeleton`` in ``hello``).
     skeleton: bool = False
+    #: Focal length of the depth image in pixels when it is a perspective view (square pixels), else ``None``.
+    #: It sizes the relief of the fused hand model; :func:`source_focal_px` also reads it off a Leap source's ``view``.
+    focal_px: float | None = None
 
     def start(self) -> None:
         """Open the device. Called once before the first ``read()``."""
@@ -545,6 +558,13 @@ class AnalyzerConfig:
     A tracked hand (skeleton) is reported while its palm is inside the box
     widened by ``hand_margin`` on every axis (normalized units); farther out it
     is dropped like any pixel outside the box, instead of sticking to a wall.
+    ``scan_fuse`` (one of :data:`SCAN_FUSE_MODES`) fuses the reported hands'
+    capsule model into the depth before the mask, the blobs, the occupancy,
+    the voxels and the scan are computed from it: ``fill`` keeps a measurement
+    that exists and agrees with the model within ``fuse_tolerance_mm``, takes
+    the model where the measurement is missing or disagrees, and leaves pixels
+    outside the model alone; ``model`` takes the model wherever it has a
+    surface; ``off`` is a plain depth camera.
     """
 
     occupancy: tuple[int, int] | None = (32, 24)
@@ -559,8 +579,14 @@ class AnalyzerConfig:
     depth_percentile: float = 10.0
     conf_saturation: float = 4.0
     hand_margin: float = 0.25
+    scan_fuse: str = DEFAULT_SCAN_FUSE
+    fuse_tolerance_mm: float = DEFAULT_FUSE_TOLERANCE_MM
 
     def __post_init__(self) -> None:
+        if self.scan_fuse not in SCAN_FUSE_MODES:
+            raise ValueError(f"scan_fuse must be one of {SCAN_FUSE_MODES}, got {self.scan_fuse!r}")
+        if not (self.fuse_tolerance_mm >= 0.0):
+            raise ValueError("fuse_tolerance_mm must be non-negative")
         if self.occupancy is not None:
             w, h = self.occupancy
             if not (1 <= w <= MAX_OCCUPANCY_SIDE and 1 <= h <= MAX_OCCUPANCY_SIDE):
@@ -679,6 +705,33 @@ def normalize_tracked_hand(hand: TrackedHand, roi: tuple[int, int, int, int], ne
 def hand_in_box(hand: SkeletonHand, margin: float) -> bool:
     """Whether the palm lies inside the unit box widened by ``margin`` on every axis."""
     return all(-margin <= c <= 1.0 + margin for c in hand.pos)
+
+
+@functools.lru_cache(maxsize=1)
+def _import_scan_fusion() -> Any:
+    """``scan_fusion`` (the hand-model rasteriser and fusion rules), imported on first use so the module can import this one."""
+    if __package__:
+        from . import scan_fusion  # type: ignore[import-not-found]
+    else:
+        import scan_fusion  # type: ignore[import-not-found]
+    return scan_fusion
+
+
+def source_focal_px(source: FrameSource) -> float | None:
+    """The focal length (pixels) of the source's depth image when it is a perspective view, else ``None``.
+
+    Sources declare it as ``focal_px``; the Leap sources expose their rectified
+    ``view`` (``leap_stereo.RectifiedView``, square pixels) instead, whose
+    ``fx`` is taken. The fused hand model uses it to size its relief: a tube of
+    radius ``r`` px bulges ``r * depth / focal`` mm.
+    """
+    focal = getattr(source, "focal_px", None)
+    if focal is None:
+        focal = getattr(getattr(source, "view", None), "fx", None)
+    try:
+        return float(focal) if focal else None
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass(frozen=True)
@@ -937,23 +990,33 @@ class RateMeter:
 class BoxAnalyzer:
     """Turns a depth frame into blobs, an occupancy grid, and stats.
 
-    Pipeline: crop the ROI -> mask pixels with ``near <= depth <= far`` ->
-    morphological opening -> connected components -> keep the largest
-    ``max_hands`` blobs with at least ``min_pixels`` -> per blob: centroid,
-    nearest-percentile depth, extent, confidence, sample points -> stable ids
-    from :class:`BlobTracker` -> occupancy grid of the mask -> voxel grid of
-    the mask binned by depth (the foreground in 3D) -> surface scan (nearest
-    depth per cell) -> the frame's tracked hands, if any, normalized with the
-    same box (:func:`normalize_tracked_hand`) and kept while their palm is
-    within ``hand_margin`` of it. All outputs are ROI-normalized (see the
-    module docstring).
+    Pipeline: crop the ROI -> the frame's tracked hands, if any, normalized
+    with the same box (:func:`normalize_tracked_hand`) and kept while their
+    palm is within ``hand_margin`` of it -> fuse the kept hands' capsule model
+    into the depth (``scan_fusion``, per ``config.scan_fuse``) -> mask pixels
+    with ``near <= depth <= far`` -> morphological opening -> connected
+    components -> keep the largest ``max_hands`` blobs with at least
+    ``min_pixels`` -> per blob: centroid, nearest-percentile depth, extent,
+    confidence, sample points -> stable ids from :class:`BlobTracker` ->
+    occupancy grid of the mask -> voxel grid of the mask binned by depth (the
+    foreground in 3D) -> surface scan (nearest depth per cell). Everything
+    after the fusion sees the fused depth, so the scan, the voxels and the
+    blobs agree with the skeleton. All outputs are ROI-normalized (see the
+    module docstring). ``focal_px`` is the depth image's focal length when it
+    is a perspective view (:func:`source_focal_px`); without one the model's
+    relief is scaled as if the box were isotropic.
     """
 
-    def __init__(self, box: BoxConfig, config: AnalyzerConfig | None = None) -> None:
+    def __init__(self, box: BoxConfig, config: AnalyzerConfig | None = None, focal_px: float | None = None) -> None:
         self.box = box
         self.config = config or AnalyzerConfig()
+        self.focal_px = None if focal_px is None else float(focal_px)
+        if self.focal_px is not None and not (self.focal_px > 0.0):
+            raise ValueError("focal_px must be positive")
         self.tracker = BlobTracker(self.config.max_jump, self.config.max_missed)
         self._rate = RateMeter()
+        self._fusion = _import_scan_fusion() if self.config.scan_fuse != "off" else None
+        self._model_canvas: np.ndarray | None = None  # reused across frames: a fresh 1 MB float32 image costs more than rendering into it
 
     def analyze(self, frame: DepthFrame) -> AnalysisResult:
         started = time.perf_counter()
@@ -964,9 +1027,25 @@ class BoxAnalyzer:
         near_mm, far_mm = box.near_mm, box.far_mm
         span_mm = far_mm - near_mm
 
+        hands: list[SkeletonHand] = []
+        fused: list[TrackedHand] = []
+        for hand in frame.hands or ():
+            skeleton = normalize_tracked_hand(hand, (x0, y0, x1, y1), near_mm, far_mm, cfg.sample_points)
+            if hand_in_box(skeleton, cfg.hand_margin) and len(hands) < MAX_HANDS:
+                hands.append(skeleton)
+                fused.append(hand)
+        from_model: np.ndarray | None = None
+        if self._fusion is not None and fused:
+            if self._model_canvas is None or self._model_canvas.shape != (rh, rw):
+                self._model_canvas = np.empty((rh, rw), dtype=np.float32)
+            mm_per_px = self._fusion.isotropic_mm_per_px(near_mm, far_mm, rw)
+            model, bounds = self._fusion.render_hands(fused, (rh, rw), (x0, y0), self.focal_px, mm_per_px, out=self._model_canvas)
+            roi, from_model = self._fusion.fuse_depth(roi, model, cfg.scan_fuse, cfg.fuse_tolerance_mm, near_mm, far_mm, bounds)
+
         mask = (roi >= max(near_mm, 1.0)) & (roi <= far_mm)  # depth 0 is "unknown", never inside the box
         mask = open_mask(mask, cfg.morph_iterations)
         in_range = int(np.count_nonzero(mask))
+        model_pixels = int(np.count_nonzero(mask & from_model)) if from_model is not None else 0
 
         blobs: list[Blob] = []
         candidates: list[tuple[int, int]] = []
@@ -1000,22 +1079,19 @@ class BoxAnalyzer:
         occupancy = downsample_occupancy(mask, *cfg.occupancy) if cfg.occupancy else None
         voxels = voxelize(roi, mask, near_mm, far_mm, *cfg.voxels) if cfg.voxels else None
         surface = scan_surface(roi, mask, near_mm, far_mm, *cfg.surface) if cfg.surface else None
-        hands: list[SkeletonHand] = []
-        for hand in frame.hands or ():
-            skeleton = normalize_tracked_hand(hand, (x0, y0, x1, y1), near_mm, far_mm, cfg.sample_points)
-            if hand_in_box(skeleton, cfg.hand_margin):
-                hands.append(skeleton)
         fps = self._rate.tick(frame.timestamp)
         stats = {
             "pixels": float(in_range),
             "blobs": float(len(candidates)),
             "trackedHands": float(len(hands)),
+            "fusedHands": float(len(fused)) if from_model is not None else 0.0,
+            "scanModelFraction": round(model_pixels / in_range, 4) if in_range else 0.0,
             "fps": round(fps, 2),
             "processingMs": round((time.perf_counter() - started) * 1000.0, 3),
             "frameWidth": float(frame.width),
             "frameHeight": float(frame.height),
         }
-        return AnalysisResult(tracked, occupancy, stats, voxels, surface, tuple(hands[:MAX_HANDS]))
+        return AnalysisResult(tracked, occupancy, stats, voxels, surface, tuple(hands))
 
 
 # --------------------------------------------------------------------------- #
@@ -1276,6 +1352,7 @@ SOURCES: dict[str, type[FrameSource]] = {"synthetic": SyntheticSource, "realsens
 #: the Leap Motion Controller looks up from the desk and sees about 10-45 cm of height.
 LEAP_SOURCES: dict[str, tuple[float, float]] = {"leap": (0.1, 0.45), "leap-synthetic": (0.1, 0.45)}
 DEFAULT_RANGE_M = (0.4, 1.2)
+DEFAULT_SURFACE = (64, 48)  # the AnalyzerConfig default; the Leap sources use LEAP_DEFAULT_SURFACE (see resolve_surface)
 LEAP_ORIENTATIONS = ("none", "rot90", "rot180", "rot270", "flip-h", "flip-v", "transpose")  # mirrors leap_stereo.ORIENTATIONS
 
 
@@ -1296,6 +1373,19 @@ def resolve_range(args: argparse.Namespace) -> tuple[float, float]:
     return (near if args.near is None else args.near, far if args.far is None else args.far)
 
 
+#: The Leap sources' rectified view (mirrors ``leap_source.DEFAULT_VIEW``) and their surface scan: a hand 25 cm above the
+#: controller is 120 px wide and a finger 13 px in that view, so 3 pixels per cell keep the fingers apart in the scan.
+LEAP_DEFAULT_VIEW = (480, 360)
+LEAP_DEFAULT_SURFACE = (160, 120)
+
+
+def resolve_surface(args: argparse.Namespace) -> tuple[int, int]:
+    """``--surface`` if given, else the source's default: 160x120 for the Leap sources, 64x48 otherwise."""
+    if args.surface is not None:
+        return tuple(args.surface)
+    return LEAP_DEFAULT_SURFACE if args.source in LEAP_SOURCES else DEFAULT_SURFACE
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Depth-camera bridge: streams blobs inside a physical box to the browser over WebSocket.")
     p.add_argument("--source", choices=sorted(SOURCES) + sorted(LEAP_SOURCES), default="synthetic", help="frame source (default: synthetic)")
@@ -1310,8 +1400,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-occupancy", action="store_true", help="do not send an occupancy grid")
     p.add_argument("--voxels", type=int, nargs=3, default=(32, 24, 16), metavar=("NX", "NY", "NZ"), help=f"foreground voxel grid: cells across, down and deep into the box, each 1..{MAX_VOXEL_SIDE} (default: 32 24 16)")
     p.add_argument("--no-voxels", action="store_true", help="do not send a voxel grid")
-    p.add_argument("--surface", type=int, nargs=2, default=(64, 48), metavar=("W", "H"), help=f"nearest-depth surface scan size, each side 1..{MAX_SURFACE_SIDE} (default: 64 48)")
+    p.add_argument("--surface", type=int, nargs=2, default=None, metavar=("W", "H"), help=f"nearest-depth surface scan size, each side 1..{MAX_SURFACE_SIDE} (default: {DEFAULT_SURFACE[0]} {DEFAULT_SURFACE[1]}, {LEAP_DEFAULT_SURFACE[0]} {LEAP_DEFAULT_SURFACE[1]} for the Leap sources)")
     p.add_argument("--no-surface", action="store_true", help="do not send a surface scan")
+    p.add_argument("--scan-fuse", choices=SCAN_FUSE_MODES, default=DEFAULT_SCAN_FUSE, help="fuse the tracked hands' capsule model into the depth before the scan, voxels, occupancy and blobs: 'fill' keeps measurements that agree with the model within --fuse-tolerance and takes the model where the measurement is missing or disagrees, 'model' takes the model wherever it has a surface, 'off' uses the measurement alone (default: %(default)s)")
+    p.add_argument("--fuse-tolerance", type=float, default=DEFAULT_FUSE_TOLERANCE_MM, metavar="MM", help="under --scan-fuse fill, how far a measurement may differ from the model and still be kept (default: %(default)s mm)")
     p.add_argument("--min-pixels", type=int, default=150, help="smallest blob in pixels (default: %(default)s)")
     p.add_argument("--max-hands", type=int, default=2, help=f"largest number of blobs to report, 0..{MAX_HANDS} (default: %(default)s)")
     p.add_argument("--fps", type=float, default=30.0, help="capture rate (default: %(default)s)")
@@ -1325,9 +1417,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--synthetic-hands", type=int, choices=(1, 2), default=1, help="hands in the synthetic script (default: %(default)s)")
     leap = p.add_argument_group("Leap Motion Controller (--source leap / leap-synthetic; see bridge/README.md)")
     leap.add_argument("--leapc", metavar="PATH", help="LeapC library (default: search the Ultraleap Gemini/Hyperion SDK, then Leap Motion Core Services, then $LEAPC_DLL)")
-    leap.add_argument("--leap-view", type=int, nargs=2, default=(320, 240), metavar=("W", "H"), help="rectified stereo view = depth image size (default: 320 240)")
+    leap.add_argument("--leap-view", type=int, nargs=2, default=LEAP_DEFAULT_VIEW, metavar=("W", "H"), help="rectified stereo view = depth image size (default: %d %d)" % LEAP_DEFAULT_VIEW)
     leap.add_argument("--leap-fov", type=float, default=90.0, metavar="DEG", help="horizontal field of view of the rectified view in degrees (default: %(default)s)")
+    # The matcher and invalidation flags below repeat leap_source.add_stereo_arguments (which cannot be imported here: OpenCV is optional);
+    # test_leap_stereo pins the two parsers' defaults to each other.
     leap.add_argument("--leap-min-intensity", type=int, default=16, help="ignore IR pixels darker than this, 0..255; the LEDs do not reach the background (default: %(default)s)")
+    leap.add_argument("--leap-max-intensity", type=int, default=250, help="ignore IR pixels at or above this, 0..255: a hand close to the LEDs saturates and matches anywhere; 255 = off (default: %(default)s)")
+    leap.add_argument("--leap-min-lit", type=int, default=20, help="ignore a match darker than N * (300 mm / depth)^2 in a 5x5 neighbourhood: a dark wall cannot be 25 cm from the LEDs; 0 = off (default: %(default)s)")
+    leap.add_argument("--leap-min-texture", type=int, default=0, help="ignore pixels whose 7x7 neighbourhood spans fewer grey levels than this; 0 = off (default: %(default)s; skin is smooth, so this hollows a hand before it removes phantoms)")
+    leap.add_argument("--leap-uniqueness", type=int, default=15, help="percent margin the best disparity must win by, 0..100 (default: %(default)s)")
+    leap.add_argument("--leap-block", type=int, default=5, help="matching block size, odd (default: %(default)s)")
+    leap.add_argument("--leap-mode", choices=("sgbm", "hh", "3way"), default="3way", help="SGBM path aggregation: 3way (parallel, fastest), sgbm (5 directions), hh (8 directions, slowest) (default: %(default)s)")
+    leap.add_argument("--leap-matcher", choices=("sgbm", "bm"), default="sgbm", help="sgbm or plain block matching (bm: faster, far sparser on skin) (default: %(default)s)")
+    leap.add_argument("--leap-align", default="auto", metavar="MODE", help="right-camera alignment: 'auto' (fitted from feature matches in the first frames, default), 'none', or PITCH,ROLL[,YAW] in degrees")
+    leap.add_argument("--leap-calibration", choices=("function", "lattice"), default="function", help="rectify with LeapRectilinearToPixel (function, default) or the images' 64x64 distortion lattice")
     leap.add_argument("--swap-cameras", action="store_true", help="exchange the two cameras before matching (use when the depth image stays empty with a hand over the device)")
     leap.add_argument("--leap-orient", choices=LEAP_ORIENTATIONS, default="none", help="rotate/flip the depth image before analysis so image right/down mean what the browser expects (default: none)")
     leap.add_argument("--leap-hand-frame", default="auto", metavar="MODE", help="how the LeapC hand skeleton is projected onto the depth image: 'auto' (default: every convention is scored against the scan until one clearly leads) or a convention name u{+|-}{x|z}_v{+|-}{z|x}_ref{+|-}, see bridge/README.md")
@@ -1345,10 +1448,11 @@ def make_source(args: argparse.Namespace) -> FrameSource:
         leap = _import_leap_source()
         try:
             view = leap.ls.RectifiedView.from_fov(args.leap_view[0], args.leap_view[1], args.leap_fov)
-            params = leap.ls.StereoParams(min_depth_mm=args.near * 1000.0, min_intensity=args.leap_min_intensity)
+            params = leap.stereo_params_from_args(args, args.near * 1000.0, prefix="leap_")
             if args.source == "leap-synthetic":
                 return leap.LeapSyntheticSource(view, params, args.swap_cameras, args.leap_orient, fps=args.fps, paced=args.dump is None, hand_frame=args.leap_hand_frame)
-            return leap.LeapStereoSource(args.leapc, view, params, args.swap_cameras, args.leap_orient, fps=args.fps, hand_frame=args.leap_hand_frame)
+            return leap.LeapStereoSource(args.leapc, view, params, args.swap_cameras, args.leap_orient, fps=args.fps, hand_frame=args.leap_hand_frame,
+                                         alignment=args.leap_align, calibration=args.leap_calibration)
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
     raise SystemExit(f"unknown source {args.source!r}")
@@ -1368,6 +1472,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     args.near, args.far = resolve_range(args)
+    args.surface = resolve_surface(args)
     logging.basicConfig(level=getattr(logging, args.log_level.upper()), stream=sys.stderr, format="%(asctime)s %(levelname)s %(message)s")
     try:
         box = BoxConfig(near_m=args.near, far_m=args.far, roi=tuple(args.roi), box_x=tuple(args.box_x), box_y=tuple(args.box_y))
@@ -1377,11 +1482,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             surface=None if args.no_surface else tuple(args.surface),
             min_pixels=args.min_pixels, max_hands=args.max_hands, morph_iterations=args.morph,
             sample_points=args.points, max_jump=args.max_jump,
+            scan_fuse=args.scan_fuse, fuse_tolerance_mm=args.fuse_tolerance,
         )
     except ValueError as exc:
         parser.error(str(exc))
     source = make_source(args)
-    analyzer = BoxAnalyzer(box, config)
+    analyzer = BoxAnalyzer(box, config, focal_px=source_focal_px(source))
     hello = hello_message(source.name, box, source.fps, config.occupancy, config.voxels, config.surface, skeleton=source.skeleton)
 
     if args.dump is not None:
