@@ -305,6 +305,25 @@ class ReorientTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ls.reorient_points(0.0, 0.0, 5, 4, "upside")
 
+    def test_reorient_intrinsics_follows_the_pixels(self) -> None:
+        """A pixel's metric point is the same physical point after a reorientation, expressed in the turned image's axes."""
+        view = ls.RectifiedView.from_fov(48, 36, 90.0)
+        expect = {
+            "none": lambda x, v: (x, v), "rot90": lambda x, v: (-v, x), "rot180": lambda x, v: (-x, -v), "rot270": lambda x, v: (v, -x),
+            "flip-h": lambda x, v: (-x, v), "flip-v": lambda x, v: (x, -v), "transpose": lambda x, v: (v, x),
+        }
+        depth = 250.0
+        for name in ls.ORIENTATIONS:
+            fx, fy, cx, cy = ls.reorient_intrinsics(view.fx, view.fy, view.cx, view.cy, view.width, view.height, name)
+            for col, row in ((0.0, 0.0), (10.0, 3.0), (47.0, 35.0), (-2.5, 40.0)):
+                x, v = (col + 0.5 - view.cx) * depth / view.fx, (row + 0.5 - view.cy) * depth / view.fy
+                u2, v2 = ls.reorient_points(col, row, view.width, view.height, name)
+                turned = ((float(u2) + 0.5 - cx) * depth / fx, (float(v2) + 0.5 - cy) * depth / fy)
+                self.assertTrue(np.allclose(turned, expect[name](x, v)), f"{name} ({col}, {row}): {turned} vs {expect[name](x, v)}")
+        self.assertEqual(ls.reorient_intrinsics(24.0, 24.0, 24.0, 18.0, 48, 36, "rot90"), (24.0, 24.0, 18.0, 24.0), "a turned 48x36 view is 36 wide")
+        with self.assertRaises(ValueError):
+            ls.reorient_intrinsics(1.0, 1.0, 1.0, 1.0, 4, 4, "upside")
+
 
 # ---- synthetic scene ------------------------------------------------------- #
 
@@ -1058,12 +1077,284 @@ class InvalidationRuleTests(unittest.TestCase):
         self.assertEqual(int((gated[210:226, 30:110] > 0).sum()), 0)
 
 
+def noisy_depth(truth: np.ndarray, rng: np.random.Generator, sigma_mm: float, hole_fraction: float, spike_fraction: float = 0.0, spike_mm: float = 80.0) -> np.ndarray:
+    """A measurement of ``truth`` (``float32`` mm, 0 = nothing): Gaussian noise, random holes and, optionally, wrong matches."""
+    out = truth + rng.normal(0.0, sigma_mm, truth.shape).astype(np.float32)
+    if spike_fraction > 0:
+        spikes = rng.random(truth.shape) < spike_fraction
+        out[spikes] += rng.choice([-spike_mm, spike_mm], size=int(spikes.sum())).astype(np.float32)
+    out[rng.random(truth.shape) < hole_fraction] = 0.0
+    out[truth <= 0] = 0.0
+    return np.clip(np.rint(out), 0, 65535).astype(np.uint16)
+
+
+class DistanceConditioningTests(unittest.TestCase):
+    """The far-hand additions: input gain, hole filling, the temporal median and the measurement statistics."""
+
+    STEREO = ls.StereoDepth(BASELINE, VIEW.fx, ls.StereoParams(min_depth_mm=NEAR_MM, fill_radius=0, temporal=0))
+
+    def test_gain_levels_a_dim_scene_to_a_bright_one(self) -> None:
+        scene = sphere_scene(300.0)
+        left, right, truth = scene.stereo_pair(VIEW)
+        dim_l, dim_r = (np.clip(np.rint(img.astype(np.float32) * 0.3), 0, 255).astype(np.uint8) for img in (left, right))
+        bright = ls.normalize_intensity(left, "gain", 31, floor=4.0)
+        dim = ls.normalize_intensity(dim_l, "gain", 31, floor=4.0)
+        capped = ls.normalize_intensity(dim_l, "gain", 31)
+        mask = interior(sphere_mask(truth), 4)
+        self.assertAlmostEqual(float(bright[mask].mean()), float(dim[mask].mean()), delta=8.0, msg="the local gain levels the sphere to the same brightness whatever the LEDs gave it")
+        self.assertLess(float(capped[mask].mean()), float(dim[mask].mean()), "the default floor (24) caps the gain at 4x, so a 0.3x scene is not fully levelled")
+        self.assertLess(abs(float(np.corrcoef(bright[mask].astype(float), dim[mask].astype(float))[0, 1]) - 1.0), 0.1, "and keeps the same shading")
+        plain = ls.StereoDepth(BASELINE, VIEW.fx, ls.StereoParams(min_depth_mm=NEAR_MM, min_lit=0, min_intensity=4, fill_radius=0, temporal=0))
+        gained = ls.StereoDepth(BASELINE, VIEW.fx, ls.StereoParams(min_depth_mm=NEAR_MM, min_lit=0, min_intensity=4, contrast="gain", contrast_floor=4.0, fill_radius=0, temporal=0))
+        valid_bright = errors(plain.compute(left, right), truth, mask)[0]
+        valid_dim = errors(plain.compute(dim_l, dim_r), truth, mask)[0]
+        valid_dim_gained = errors(gained.compute(dim_l, dim_r), truth, mask)[0]
+        self.assertGreater(valid_bright, 0.9)
+        self.assertGreaterEqual(valid_dim_gained, min(valid_bright, valid_dim + 0.05) - 0.05, (valid_bright, valid_dim, valid_dim_gained))
+        self.assertEqual(ls.normalize_intensity(left, "none").tobytes(), left.tobytes())
+        lcn = ls.normalize_intensity(dim_l, "lcn", 15)
+        self.assertAlmostEqual(float(lcn[mask].mean()), 128.0, delta=8.0, msg="local contrast normalisation centres on mid grey")
+        with self.assertRaises(ValueError):
+            ls.normalize_intensity(left, "gain", 10)
+        with self.assertRaises(ValueError):
+            ls.normalize_intensity(left, "nope")
+
+    def test_the_rules_keep_looking_at_the_original_image(self) -> None:
+        scene = sphere_scene(300.0)
+        left, right, truth = scene.stereo_pair(VIEW)
+        dark_l, dark_r = (np.clip(np.rint(img.astype(np.float32) * 0.04), 0, 255).astype(np.uint8) for img in (left, right))
+        gained = ls.StereoDepth(BASELINE, VIEW.fx, ls.StereoParams(min_depth_mm=NEAR_MM, contrast="gain", contrast_floor=1.0, fill_radius=0, temporal=0))
+        self.assertLess(float((gained.compute(dark_l, dark_r) > 0).mean()), 0.02, "a scene below min_intensity yields nothing however much it is amplified for the matcher")
+
+    def test_hole_filler_fills_small_holes_and_leaves_a_finger_gap_open(self) -> None:
+        tol = self.STEREO.tolerance_mm(1.5)
+        depth = np.full((40, 60), 300, dtype=np.uint16)
+        depth[10:13, 20:23] = 0          # a 3x3 hole in a flat surface
+        depth[20, 40] = 0                # a single missing pixel
+        depth[:, 30:38] = 0              # an 8 px gap between two "fingers"
+        depth[30:40, :] = 0              # the background: nothing there
+        filled = ls.fill_holes(depth, 2, tol)
+        self.assertTrue((filled[10:13, 20:23] == 300).all(), "the small hole is filled with its surroundings")
+        self.assertEqual(int(filled[20, 40]), 300)
+        self.assertTrue((filled[:30, 32:36] == 0).all(), "the middle of the finger gap stays open")
+        self.assertTrue((filled[33:, :] == 0).all(), "the background is not invented")
+        self.assertTrue((filled[:30, :30] > 0).all())
+        # Surroundings that disagree with each other (a finger and the backdrop) do not fill.
+        mixed = np.full((20, 20), 300, dtype=np.uint16)
+        mixed[:, 10:] = 1200
+        mixed[8:11, 9:12] = 0
+        self.assertTrue((ls.fill_holes(mixed, 2, tol)[8:11, 9:12] == 0).all(), "a hole between a finger and the backdrop stays a hole")
+        mixed[8:11, 9:12] = 0
+        self.assertTrue((ls.fill_holes(mixed, 2, 2000.0)[8:11, 9:12] > 0).all(), "unless the tolerance allows it")
+        self.assertIs(ls.fill_holes(depth, 0, tol), depth)
+        self.assertEqual(filled.dtype, np.uint16)
+        keep_out = np.zeros(depth.shape, dtype=bool)
+        keep_out[10:13, 20:23] = True
+        self.assertTrue((ls.fill_holes(depth, 2, tol, exclude=keep_out)[10:13, 20:23] == 0).all(), "excluded pixels (the rules' rejections) stay empty")
+
+    def test_hole_filler_keeps_the_synthetic_sphere_accurate(self) -> None:
+        scene = sphere_scene(300.0)
+        left, right, truth = scene.stereo_pair(VIEW)
+        plain = self.STEREO.compute(left, right)
+        filled = ls.StereoDepth(BASELINE, VIEW.fx, ls.StereoParams(min_depth_mm=NEAR_MM, fill_radius=2, temporal=0)).compute(left, right)
+        mask = interior(sphere_mask(truth), 3)
+        self.assertGreaterEqual(float((filled[mask] > 0).mean()), float((plain[mask] > 0).mean()))
+        self.assertLess(errors(filled, truth, mask)[1], 0.02)
+        self.assertTrue(((filled == plain) | (plain == 0)).all(), "the filler only writes into holes")
+
+    def test_temporal_median_lowers_noise_and_fills_holes_on_a_static_scene(self) -> None:
+        rng = np.random.default_rng(1)
+        truth = np.zeros((60, 80), dtype=np.float32)
+        truth[10:50, 10:70] = 320.0
+        sigma = 12.0
+        filt = self.STEREO.temporal_filter() if self.STEREO.params.temporal > 1 else ls.TemporalDepthFilter(3, self.STEREO.tolerance_mm(1.5))
+        frames = [noisy_depth(truth, rng, sigma, 0.2) for _ in range(3)]
+        out = frames[0]
+        for f in frames:
+            out = filt.push(f)
+        inside = truth > 0
+        single = frames[-1]
+        self.assertGreater(float((out[inside] > 0).mean()), float((single[inside] > 0).mean()) + 0.05, "holes that flicker are filled from older frames (where two older frames agree)")
+        valid_out, valid_one = (out[inside] > 0), (single[inside] > 0)
+        err_out = float(np.abs(out[inside][valid_out].astype(np.float32) - 320.0).std())
+        err_one = float(np.abs(single[inside][valid_one].astype(np.float32) - 320.0).std())
+        self.assertLess(err_out, 0.92 * err_one, (err_out, err_one))
+        self.assertTrue((out[~inside] == 0).all(), "nothing appears where nothing was measured")
+        self.assertEqual(out.dtype, np.uint16)
+        # Noise well inside the tolerance (4 mm against 24): every sample agrees and the median of three divides it by about 1.4.
+        quiet = ls.TemporalDepthFilter(3, self.STEREO.tolerance_mm(1.5))
+        for _ in range(3):
+            q = quiet.push(noisy_depth(truth, rng, 4.0, 0.0))
+        self.assertLess(float(np.abs(q[inside].astype(np.float32) - 320.0).std()), 0.8 * 4.0)
+        # A lone speckle in one frame is not carried forward: two older frames must agree to fill a hole.
+        speckle = np.zeros((60, 80), dtype=np.uint16)
+        speckle[5, 5] = 300
+        f2 = ls.TemporalDepthFilter(3, self.STEREO.tolerance_mm(1.5))
+        f2.push(speckle)
+        f2.push(np.zeros_like(speckle))
+        self.assertEqual(int(f2.push(np.zeros_like(speckle))[5, 5]), 0)
+        # Warm-up passes the input through; a shape change resets.
+        f3 = ls.TemporalDepthFilter(3, 10.0)
+        first = np.full((4, 4), 200, dtype=np.uint16)
+        self.assertIs(f3.push(first), first)
+        f3.push(np.full((4, 4), 210, dtype=np.uint16))
+        self.assertEqual(int(f3.push(np.full((4, 4), 205, dtype=np.uint16))[0, 0]), 205, "the median of three agreeing samples")
+        self.assertEqual(len(f3.history), 3)
+        f3.push(np.full((2, 2), 1, dtype=np.uint16))
+        self.assertEqual(len(f3.history), 1)
+        self.assertIsNone(ls.StereoDepth(BASELINE, VIEW.fx, ls.StereoParams(temporal=0)).temporal_filter())
+
+    def test_temporal_median_does_not_smear_a_moving_hand(self) -> None:
+        tol = self.STEREO.tolerance_mm(1.5)  # 1.5 px of disparity: 21 mm at 300 mm
+        filt = ls.TemporalDepthFilter(3, tol)
+        a = np.zeros((30, 40), dtype=np.uint16)
+        a[5:25, 5:20] = 300                       # the hand on the left
+        b = np.zeros_like(a)
+        b[5:25, 20:35] = 300                      # jumped to the right
+        c = np.zeros_like(a)
+        c[5:25, 20:35] = 400                      # and receded by 100 mm, far beyond the tolerance
+        filt.push(a)
+        out_b = filt.push(b)
+        self.assertTrue((out_b[5:25, 20:35] == 300).all(), "the newest measurement is authoritative")
+        self.assertTrue((out_b[5:25, 5:20] == 0).all(), "one older sample alone does not fill the vacated pixels")
+        out_c = filt.push(c)
+        self.assertTrue((out_c[5:25, 20:35] == 400).all(), "a sample that disagrees with the newest by more than the tolerance is dropped: no lag")
+        self.assertTrue((out_c[5:25, 5:20] == 0).all())
+        # Within the tolerance the samples are averaged: a slow move lags by at most the tolerance.
+        slow = ls.TemporalDepthFilter(3, tol)
+        for z in (300, 306, 312):
+            out = slow.push(np.full((4, 4), z, dtype=np.uint16))
+        self.assertEqual(int(out[0, 0]), 306)
+        # The majority rule: a lone wrong newest sample is outvoted by two agreeing older ones, a jump by both is not.
+        vote = ls.TemporalDepthFilter(3, tol, majority=True)
+        vote.push(np.full((4, 4), 300, dtype=np.uint16))
+        vote.push(np.full((4, 4), 302, dtype=np.uint16))
+        self.assertEqual(int(vote.push(np.full((4, 4), 500, dtype=np.uint16))[0, 0]), 301)
+        self.assertEqual(int(vote.push(np.full((4, 4), 500, dtype=np.uint16))[0, 0]), 500)
+        # The general (any length) path agrees with the three-frame OpenCV path to the rounding of a half.
+        rng = np.random.default_rng(3)
+        truth = np.zeros((40, 50), dtype=np.float32)
+        truth[5:35, 5:45] = 350.0
+        frames = [noisy_depth(truth, rng, 10.0, 0.25, 0.05) for _ in range(4)]
+        fast, general = ls.TemporalDepthFilter(3, tol), ls.TemporalDepthFilter(3, tol)
+        general.fast = False
+        for f in frames:
+            out_fast, out_general = fast.push(f), general.push(f)
+        self.assertLessEqual(int(np.abs(out_fast.astype(int) - out_general.astype(int)).max()), 1)
+        self.assertGreater(float((out_fast > 0).mean()), 0.3)
+
+    def test_depth_statistics(self) -> None:
+        rng = np.random.default_rng(2)
+        truth = np.zeros((120, 160), dtype=np.float32)
+        truth[20:100, 30:130] = 300.0
+        clean = noisy_depth(truth, rng, 2.0, 0.0)
+        noisy = noisy_depth(truth, rng, 15.0, 0.3)
+        s_clean, s_noisy = ls.depth_statistics(clean, 100, 450), ls.depth_statistics(noisy, 100, 450)
+        self.assertEqual(set(s_clean), {"depthNoiseMm", "depthValidFraction"})
+        self.assertGreater(s_clean["depthValidFraction"], 0.99)
+        self.assertLess(s_clean["depthNoiseMm"], 3.0)
+        self.assertLess(s_noisy["depthValidFraction"], 0.8)
+        self.assertGreater(s_noisy["depthValidFraction"], 0.6)
+        self.assertGreater(s_noisy["depthNoiseMm"], 10.0)
+        self.assertEqual(ls.depth_statistics(np.zeros((10, 10), dtype=np.uint16), 100, 450), {"depthNoiseMm": 0.0, "depthValidFraction": 0.0})
+        beyond = np.full((20, 20), 900, dtype=np.uint16)
+        self.assertEqual(ls.depth_statistics(beyond, 100, 450)["depthValidFraction"], 0.0, "what lies beyond the box is not foreground")
+
+    def test_synthetic_source_reports_stats_and_runs_the_temporal_filter(self) -> None:
+        src = lsrc.LeapSyntheticSource(VIEW, ls.StereoParams(min_depth_mm=NEAR_MM), paced=False, absences=False)
+        src.start()
+        assert src.temporal is not None
+        self.assertEqual(src.temporal.length, 3)
+        frames = [src.frame_at(0.05 * i) for i in range(4)]
+        self.assertIsInstance(frames[0], lsrc.LeapDepthFrame)
+        self.assertIsInstance(frames[0], db.DepthFrame)
+        self.assertEqual(set(frames[-1].stats), {"depthNoiseMm", "depthValidFraction"})
+        self.assertGreater(frames[-1].stats["depthValidFraction"], 0.5)
+        self.assertLess(frames[-1].stats["depthNoiseMm"], 15.0)
+        self.assertEqual(len(src.temporal.history), 3)
+        src.start()
+        self.assertEqual(len(src.temporal.history), 0, "start() resets the history")
+        plain = lsrc.LeapSyntheticSource(VIEW, ls.StereoParams(min_depth_mm=NEAR_MM, temporal=0), paced=False, absences=False)
+        self.assertIsNone(plain.temporal)
+
+    def test_parameter_validation_and_flags(self) -> None:
+        for bad in (dict(p1=8, p2=4), dict(contrast="clahe"), dict(contrast_window=8), dict(fill_radius=-1), dict(temporal=-1), dict(fill_tolerance_px=0.0), dict(mode="hh5")):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                ls.StereoParams(**bad)  # type: ignore[arg-type]
+        for mode in ("hh4", "hh", "sgbm", "3way"):
+            ls.StereoDepth(BASELINE, VIEW.fx, ls.StereoParams(mode=mode))
+        source = lsrc.build_parser().parse_args(["--contrast", "gain", "--contrast-window", "63", "--p1", "16", "--p2", "64", "--speckle", "100", "--fill-radius", "3", "--temporal", "5"])
+        params = lsrc.stereo_params_from_args(source, 100.0, prefix="")
+        self.assertEqual((params.contrast, params.contrast_window, params.p1, params.p2, params.speckle_window, params.fill_radius, params.temporal), ("gain", 63, 16, 64, 100, 3, 5))
+        defaults = lsrc.stereo_params_from_args(lsrc.build_parser().parse_args([]), 100.0, prefix="")
+        self.assertEqual(defaults, ls.StereoParams(min_depth_mm=100.0))
+        self.assertEqual((defaults.median, defaults.fill_radius, defaults.temporal, defaults.contrast), (5, 2, 3, "none"))
+
+    def test_tolerance_scales_with_the_square_of_the_depth(self) -> None:
+        tol = self.STEREO.tolerance_mm(1.5)
+        z = np.array([200.0, 300.0, 450.0], dtype=np.float32)
+        expected = 1.5 * z * z / (BASELINE * VIEW.fx)
+        self.assertTrue(np.allclose(tol(z), expected))
+        self.assertAlmostEqual(float(tol(np.float32(300.0))), 1.5 * self.STEREO.depth_step_mm(300.0), places=4)
+
+
+class DistanceSimulationTests(unittest.TestCase):
+    """``stereo_lab.DistanceSimulator``: the calibration inversion and the re-imaging of a pair to a farther scene."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import stereo_lab as lab  # noqa: PLC0415
+
+        cls.lab = lab
+        cls.cal = ls.GridCalibration({cam: model_lattice(MODEL, cam, normalized=False) for cam in ls.CAMERAS}, MODEL.width, MODEL.height, normalized=False)
+
+    def test_calibration_inversion_round_trips(self) -> None:
+        tx, ty = self.lab.invert_calibration(self.cal, ls.CAMERA_LEFT)
+        self.assertEqual(tx.shape, (MODEL.height, MODEL.width))
+        ok = np.isfinite(tx) & np.isfinite(ty)
+        self.assertGreater(float(ok.mean()), 0.9)
+        px, py = self.cal.lookup(ls.CAMERA_LEFT, tx[ok], ty[ok])
+        gx, gy = np.meshgrid(np.arange(MODEL.width, dtype=np.float64), np.arange(MODEL.height, dtype=np.float64))
+        self.assertLess(float(np.hypot(px - gx[ok], py - gy[ok]).max()), 0.05)
+        mx, my = MODEL.pixel_to_ray(ls.CAMERA_LEFT, gx[ok], gy[ok])
+        self.assertLess(float(np.abs(tx[ok] - mx).max()), 0.02, "the inverted grid agrees with the stand-in camera's own inverse")
+
+    def test_reimaged_scene_has_scaled_disparity_and_a_dimmer_hand(self) -> None:
+        lab = self.lab
+        scene = sphere_scene(260.0, radius=45.0, background_mm=None)
+        raw_left, raw_right = scene.raw_pair(MODEL)
+        frame = lab.Frame("000", raw_left, raw_right)
+        sim = lab.DistanceSimulator(self.cal, None, hand_threshold=40)
+        far = sim.simulate(frame, 260.0 / 390.0, 390.0, seed=1)
+        self.assertEqual(far.name, "000@390#1")
+        self.assertTrue(far.simulated)
+        self.assertAlmostEqual(far.scale, 2.0 / 3.0, places=6)
+        rect = ls.Rectifier(self.cal, MODEL.width, MODEL.height, VIEW)
+        stereo = ls.StereoDepth(BASELINE, VIEW.fx, ls.StereoParams(min_depth_mm=NEAR_MM, min_lit=0, min_intensity=4, fill_radius=0, temporal=0))
+        near = stereo.compute(*rect.rectify_pair(raw_left, raw_right))
+        far_depth = stereo.compute(*rect.rectify_pair(far.raw_left, far.raw_right))
+        z_near = float(np.median(near[near > 0]))
+        z_far = float(np.median(far_depth[far_depth > 0]))
+        self.assertAlmostEqual(z_near, 260.0 - 45.0 + 10.0, delta=15.0)
+        self.assertAlmostEqual(z_far / z_near, 1.5, delta=0.08, msg="the scene is 1.5x farther")
+        self.assertLess(float((far_depth > 0).sum()), 0.75 * float((near > 0).sum()), "and covers fewer pixels (the matcher widens both silhouettes by a few pixels)")
+        self.assertLess(float(far.raw_left[far.raw_left > 0].mean()), 0.75 * float(raw_left[raw_left > 0].mean()), "and is dimmer")
+        truths = lab.TruthCache(self.cal, None, 40, NEAR_MM, FAR_MM)
+        truth = truths.truth(far, VIEW)
+        self.assertTrue(truth.hand.any())
+        self.assertGreater(truth.box[1], 450.0, "the box stretches to hold the farther hand")
+        core = truth.hand & (truth.depth > 0)
+        self.assertAlmostEqual(float(np.median(truth.depth[core])), z_far, delta=25.0)
+
+
 class ParserDefaultTests(unittest.TestCase):
     def test_bridge_and_source_parsers_agree_on_the_stereo_defaults(self) -> None:
         bridge = db.build_parser().parse_args(["--source", "leap"])
         source = lsrc.build_parser().parse_args([])
-        for name in ("min_intensity", "max_intensity", "min_lit", "min_texture", "uniqueness", "block", "mode", "matcher", "align", "calibration"):
+        for name in ("min_intensity", "max_intensity", "min_lit", "min_texture", "uniqueness", "block", "mode", "matcher", "align", "calibration",
+                     "contrast", "contrast_window", "p1", "p2", "speckle", "fill_radius", "temporal"):
             self.assertEqual(getattr(bridge, "leap_" + name), getattr(source, name), name)
+        self.assertEqual(db.build_parser().parse_args(["--source", "leap", "--leap-mode", "hh4"]).leap_mode, "hh4")
         self.assertEqual(tuple(bridge.leap_view), lsrc.DEFAULT_VIEW)
         self.assertEqual(tuple(source.view), lsrc.DEFAULT_VIEW)
         self.assertEqual(db.LEAP_DEFAULT_VIEW, lsrc.DEFAULT_VIEW)

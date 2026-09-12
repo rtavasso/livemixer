@@ -561,6 +561,254 @@ def local_range(image: np.ndarray, window: int) -> np.ndarray:
     return cv2.subtract(cv2.dilate(image, kernel), cv2.erode(image, kernel))
 
 
+CONTRAST_MODES = ("none", "gain", "lcn")
+
+
+def _local_moments(image: np.ndarray, window: int) -> tuple[np.ndarray, np.ndarray]:
+    """Mean and standard deviation of ``image`` over a ``window x window`` box around every pixel (``float32``)."""
+    x = image.astype(np.float32)
+    mean = cv2.blur(x, (window, window))
+    var = cv2.blur(x * x, (window, window)) - mean * mean
+    return mean, np.sqrt(np.maximum(var, 0.0))
+
+
+def normalize_intensity(image: np.ndarray, mode: str = "gain", window: int = 31, floor: float = 24.0, target: float = 96.0) -> np.ndarray:
+    """Rescale a rectified IR image so that a dim (far) surface has the amplitude of a bright (near) one.
+
+    The controller's LEDs light a hand at 45 cm with a third of the grey
+    levels it has at 27 cm, and SGBM's data term (Birchfield-Tomasi on the
+    intensities and their x-gradient) shrinks with it while the smoothness
+    penalties ``P1``/``P2`` and the uniqueness margin stay fixed, so the dim
+    hand loses to smoothness and comes out as holes and flat patches.
+    ``"gain"`` multiplies every pixel by ``target / max(local_mean, floor)``
+    over a ``window x window`` box: the local mean (the LED falloff and the
+    hand's overall brightness) is levelled to ``target``, and the shading
+    inside the window, which on smooth skin is most of what the matcher can
+    lock onto, is scaled with it. ``floor`` caps the gain at ``target /
+    floor`` so the dark room (grey 10-30) is not amplified into texture.
+    ``"lcn"`` is local contrast normalisation, ``128 + (I - mean) * target /
+    max(std, floor)``: it also removes the shading and, on the real 27 cm
+    frame, loses a fifth of the hand; it is kept for comparison. Both return
+    ``uint8``; the invalidation rules keep looking at the ORIGINAL image.
+    """
+    if mode == "none":
+        return image
+    if mode not in CONTRAST_MODES:
+        raise ValueError(f"contrast mode must be one of {CONTRAST_MODES}, got {mode!r}")
+    if window < 3 or window % 2 == 0:
+        raise ValueError("contrast window must be odd and at least 3")
+    mean, std = _local_moments(image, window)
+    if mode == "gain":
+        out = image.astype(np.float32) * (target / np.maximum(mean, max(float(floor), 1.0)))
+    else:
+        out = 128.0 + (image.astype(np.float32) - mean) * (target / 4.0) / np.maximum(std, max(float(floor), 0.5))
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def fill_holes(depth: np.ndarray, radius: int, tolerance_mm: Callable[[np.ndarray], np.ndarray] | float, min_support: float = 0.6, exclude: np.ndarray | None = None) -> np.ndarray:
+    """Fill small holes of a depth map by normalised convolution, only where the surrounding depth agrees.
+
+    A hole pixel (0) takes the mean of the valid depth in its ``(2 radius + 1)``
+    square when at least ``min_support`` of that square is valid and the
+    valid depths spread (standard deviation) by no more than ``tolerance_mm``
+    (a number, or a function of the local mean depth: pass the matcher's
+    depth step so the tolerance grows with ``Z^2``). Both conditions keep the
+    filler from bridging the gap between two spread fingers: the middle of a
+    gap wider than the radius has too little support, and a window that
+    straddles a finger and the backdrop behind it spreads far beyond the
+    tolerance. ``exclude`` marks pixels that must stay empty (what the
+    invalidation rules threw out: too dark, saturated, underlit for their
+    depth), so the filler only fills what the matcher left. ``radius <= 0``
+    returns the input; the result is a new ``uint16`` array.
+    """
+    if radius <= 0:
+        return depth
+    k = 2 * int(radius) + 1
+    box = (k, k)
+    d = depth.astype(np.float32)  # holes are already 0
+    valid = cv2.compare(d, 0.0, cv2.CMP_GT)  # uint8 0/255
+    num = cv2.boxFilter(d, -1, box, normalize=False, borderType=cv2.BORDER_CONSTANT)
+    den = cv2.boxFilter(valid, cv2.CV_32F, box, normalize=False, borderType=cv2.BORDER_CONSTANT)  # 255 per valid pixel
+    sq = cv2.boxFilter(cv2.multiply(d, d), -1, box, normalize=False, borderType=cv2.BORDER_CONSTANT)
+    safe = cv2.max(den, 1.0)
+    mean = cv2.divide(num, safe, scale=255.0)               # 0 where nothing is valid
+    var = cv2.subtract(cv2.divide(sq, safe, scale=255.0), cv2.multiply(mean, mean))
+    spread = cv2.sqrt(cv2.max(var, 0.0))
+    tol = tolerance_mm(mean) if callable(tolerance_mm) else np.full(mean.shape, float(tolerance_mm), dtype=np.float32)
+    fill = cv2.bitwise_and(cv2.bitwise_not(valid), cv2.compare(den, min_support * k * k * 255.0, cv2.CMP_GE))
+    fill = cv2.bitwise_and(fill, cv2.compare(spread, np.asarray(tol, dtype=np.float32), cv2.CMP_LE))
+    if exclude is not None:
+        fill = cv2.bitwise_and(fill, cv2.bitwise_not(np.ascontiguousarray(exclude, dtype=np.uint8) * 255))
+    out = depth.copy()
+    cv2.copyTo(cv2.add(mean, 0.5).astype(np.uint16), fill, out)  # rounded; mean > 0 wherever den > 0
+    return out
+
+
+class TemporalDepthFilter:
+    """Median of the last ``length`` depth maps where they agree, without smearing a moving hand.
+
+    The controller's disparity noise is independent frame to frame, so a
+    per-pixel median over a few frames divides it by about the square root
+    of their number and fills the holes that flicker from frame to frame.
+    Unlike a plain running median, only samples that agree with the newest
+    frame are used: where the newest frame has a measurement, an older one
+    counts if it is within ``tolerance(depth)`` of it (pass the matcher's
+    depth step scaled by a pixel count, so the tolerance grows with ``Z^2``
+    like the noise does); where the newest frame has a hole, the most recent
+    older measurement is the reference instead and the hole is filled from
+    the samples that agree with it. A hand that moved by more than the
+    tolerance since the previous frame therefore keeps only its newest
+    sample (no lag), and its old position can only linger in pixels where
+    the newest frame saw nothing at all, for at most ``length - 1`` frames.
+    With ``majority`` on, a newest sample that no older sample agrees with
+    is outvoted when at least two older samples agree with each other: the
+    lone sample is then a wrong match (the scattered near or far spikes a
+    dim hand produces) far more often than a hand that jumped by more than
+    the tolerance in one frame, and the cost of being wrong about that is
+    one frame of lag on that pixel. A hole in the newest frame is filled
+    only when at least ``min_fill_samples`` older samples agree (2 by
+    default: a speckle that matched once in the dark room does not get
+    carried forward, a hand pixel that matched in the last two frames
+    does). The raw measurements are what is kept, not the filtered output,
+    so nothing feeds back. ``length <= 1`` passes frames through. Three
+    frames (the default) cost about 3 ms at 480x360 on a laptop; longer
+    histories take a sort per pixel and several times that.
+    """
+
+    def __init__(self, length: int, tolerance_mm: Callable[[np.ndarray], np.ndarray] | float, majority: bool = False, min_fill_samples: int = 2) -> None:
+        self.length = max(1, int(length))
+        self.tolerance_mm = tolerance_mm
+        self.majority = bool(majority)
+        self.min_fill_samples = max(1, int(min_fill_samples))
+        self.fast = True  # three frames without the majority rule take the OpenCV path (:meth:`_push3`); off for checking it against the general one
+        self.history: list[np.ndarray] = []
+
+    def reset(self) -> None:
+        self.history.clear()
+
+    def _tolerance(self, depth: np.ndarray) -> np.ndarray:
+        t = self.tolerance_mm(depth) if callable(self.tolerance_mm) else float(self.tolerance_mm)
+        return np.asarray(t, dtype=np.float32)
+
+    def push(self, depth: np.ndarray) -> np.ndarray:
+        """Add the newest measurement and return the filtered depth (``uint16``; the input itself while warming up)."""
+        if self.history and self.history[0].shape != depth.shape:
+            self.reset()
+        self.history.append(depth.astype(np.float32))
+        if len(self.history) > self.length:
+            del self.history[0]
+        if len(self.history) < 2:
+            return depth
+        if len(self.history) == 3 and not self.majority and self.fast:
+            return self._push3(*self.history[::-1])
+        samples = np.stack(self.history[::-1])  # newest first
+        valid = samples > 0
+        newest = samples[0]
+        # Reference per pixel: the newest measurement, else the most recent older one.
+        reference = newest.copy()
+        have = valid[0].copy()
+        for i in range(1, len(samples)):
+            take = ~have & valid[i]
+            reference[take] = samples[i][take]
+            have |= take
+        tol = self._tolerance(reference)
+        agree = valid & (np.abs(samples - reference[None]) <= tol[None])
+        count = agree.sum(axis=0)
+        if self.min_fill_samples > 1:
+            unconfirmed = ~valid[0] & (count < self.min_fill_samples)
+            agree[:, unconfirmed] = False
+            count[unconfirmed] = 0
+        if self.majority and len(samples) >= 3:
+            lone = valid[0] & (count == 1)
+            if lone.any():
+                # The older sample that most of the other older samples agree with, if at least one does.
+                best_count = np.zeros(newest.shape, dtype=np.int32)
+                best_ref = np.zeros(newest.shape, dtype=np.float32)
+                for i in range(1, len(samples)):
+                    tol_i = self._tolerance(samples[i])
+                    with_i = (valid[1:] & (np.abs(samples[1:] - samples[i][None]) <= tol_i[None])).sum(axis=0)
+                    with_i = np.where(valid[i], with_i, 0)
+                    better = with_i > best_count
+                    best_count = np.where(better, with_i, best_count)
+                    best_ref = np.where(better, samples[i], best_ref)
+                outvoted = lone & (best_count >= 2)
+                if outvoted.any():
+                    reference = np.where(outvoted, best_ref, reference)
+                    tol = self._tolerance(reference)
+                    agree = valid & (np.abs(samples - reference[None]) <= tol[None])
+                    agree[0] &= ~outvoted
+                    count = agree.sum(axis=0)
+        if len(samples) == 2:
+            a, b = np.where(agree[0], samples[0], 0.0), np.where(agree[1], samples[1], 0.0)
+            median = np.where(count > 0, (a + b) / np.maximum(count, 1), 0.0)
+        else:
+            ordered = np.sort(np.where(agree, samples, np.inf), axis=0)  # agreeing samples first, ascending
+            lo = np.take_along_axis(ordered, np.maximum(count - 1, 0)[None] // 2, axis=0)[0]
+            hi = np.take_along_axis(ordered, np.maximum(count - 1, 0)[None] - np.maximum(count - 1, 0)[None] // 2, axis=0)[0]
+            median = np.where(count > 0, 0.5 * (lo + hi), 0.0)
+        return np.clip(np.rint(median), 0, 65535).astype(np.uint16)
+
+    def _push3(self, n: np.ndarray, o1: np.ndarray, o2: np.ndarray) -> np.ndarray:
+        """The three-frame case with OpenCV primitives (a few milliseconds instead of a sort per pixel); same rules as :meth:`push`."""
+        gt = cv2.CMP_GT
+        vn, v1, v2 = cv2.compare(n, 0.0, gt), cv2.compare(o1, 0.0, gt), cv2.compare(o2, 0.0, gt)
+        reference = o2.copy()
+        cv2.copyTo(o1, v1, reference)
+        cv2.copyTo(n, vn, reference)  # newest where valid, else the most recent valid older sample
+        tol = self._tolerance(reference)
+        a1 = cv2.bitwise_and(v1, cv2.compare(cv2.absdiff(o1, reference), tol, cv2.CMP_LE))
+        a2 = cv2.bitwise_and(v2, cv2.compare(cv2.absdiff(o2, reference), tol, cv2.CMP_LE))
+        count = cv2.add(cv2.add(cv2.bitwise_and(vn, 1), cv2.bitwise_and(a1, 1)), cv2.bitwise_and(a2, 1))  # uint8 0..3
+        if self.min_fill_samples > 1:
+            confirmed = cv2.bitwise_or(vn, cv2.compare(count, self.min_fill_samples, cv2.CMP_GE))
+            a1, a2 = cv2.bitwise_and(a1, confirmed), cv2.bitwise_and(a2, confirmed)
+            count = cv2.bitwise_and(count, confirmed)
+        total = cv2.add(cv2.add(cv2.copyTo(n, vn), cv2.copyTo(o1, a1)), cv2.copyTo(o2, a2))
+        median = cv2.divide(total, cv2.max(count.astype(np.float32), 1.0))  # the mean of one or two agreeing samples (0 where none)
+        mid3 = cv2.max(cv2.min(n, o1), cv2.min(cv2.max(n, o1), o2))
+        cv2.copyTo(mid3, cv2.compare(count, 3, cv2.CMP_EQ), median)  # the middle of three
+        return cv2.add(median, 0.5).astype(np.uint16)
+
+
+def depth_statistics(depth: np.ndarray, near_mm: float, far_mm: float, window: int = 5, close: int = 7) -> dict[str, float]:
+    """How good the measurement is: ``depthNoiseMm`` and ``depthValidFraction`` of a depth map's foreground.
+
+    The foreground is what lies within ``[near_mm, far_mm]``; its hull is
+    that mask closed with a ``close x close`` ellipse (small holes and
+    speckle gaps closed, the gaps between spread fingers not), and
+    ``depthValidFraction`` is the share of the hull that carries an in-range
+    measurement: 1 for a solid scan, well below for a hand full of holes.
+    ``depthNoiseMm`` is the median, over the foreground, of the standard
+    deviation of the in-range depth in a ``window x window`` box (only boxes
+    at least 60 % filled count, so silhouettes and hole edges do not
+    inflate it): 5-10 mm for a hand at 30 cm on the controller, 20 and more
+    when the scan has turned to noise. Both are 0 when nothing is in range.
+    """
+    inbox = cv2.inRange(depth, np.array([near_mm], dtype=np.float64), np.array([far_mm], dtype=np.float64))  # uint8 0/255
+    n = cv2.countNonZero(inbox)
+    if n < window * window:
+        return {"depthNoiseMm": 0.0, "depthValidFraction": 0.0}
+    x, y, w, h = cv2.boundingRect(inbox)  # the foreground's box, with a margin for the filters
+    pad = max(window, close)
+    x0, y0, x1, y1 = max(x - pad, 0), max(y - pad, 0), min(x + w + pad, depth.shape[1]), min(y + h + pad, depth.shape[0])
+    inbox = inbox[y0:y1, x0:x1]
+    hull = cv2.morphologyEx(inbox, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close, close)))
+    valid_fraction = n / max(cv2.countNonZero(hull), 1)
+    d = cv2.copyTo(depth[y0:y1, x0:x1].astype(np.float32), inbox)
+    k = (window, window)
+    den = cv2.boxFilter(inbox, cv2.CV_32F, k, normalize=False, borderType=cv2.BORDER_CONSTANT)  # 255 per in-range pixel
+    num = cv2.boxFilter(d, -1, k, normalize=False, borderType=cv2.BORDER_CONSTANT)
+    sq = cv2.boxFilter(cv2.multiply(d, d), -1, k, normalize=False, borderType=cv2.BORDER_CONSTANT)
+    safe = cv2.max(den, 1.0)
+    mean = cv2.divide(num, safe, scale=255.0)
+    var = cv2.subtract(cv2.divide(sq, safe, scale=255.0), cv2.multiply(mean, mean))
+    std = cv2.sqrt(cv2.max(var, 0.0))
+    full = cv2.bitwise_and(inbox, cv2.compare(den, 0.6 * window * window * 255.0, cv2.CMP_GE))
+    values = std[::2, ::2][full[::2, ::2] > 0]  # every other pixel is plenty for a median
+    noise = float(np.median(values)) if values.size else 0.0
+    return {"depthNoiseMm": round(noise, 2), "depthValidFraction": round(float(valid_fraction), 4)}
+
+
 @dataclass(frozen=True)
 class StereoParams:
     """Matcher tuning. ``min_depth_mm`` sets the disparity search range
@@ -596,8 +844,23 @@ class StereoParams:
     ``matcher`` is ``"sgbm"`` (default) or ``"bm"`` (block matching: faster,
     noisier); ``mode`` picks the SGBM path aggregation (``"3way"``, the
     default, is the parallel three-direction pass and 3-4x faster than
-    ``"sgbm"``, 5 directions, for the same hand; ``"hh"`` is 8 directions and
-    slower still).
+    ``"sgbm"``, 5 directions, for the same hand; ``"hh4"`` is a single
+    four-direction pass, ``"hh"`` 8 directions and slower still). ``p1``
+    and ``p2`` are SGBM's smoothness penalties per block pixel (``P1 = p1 *
+    block^2`` for a one-pixel disparity change, ``P2 = p2 * block^2`` for
+    more; OpenCV's usual 8 and 32).
+
+    Distance (a hand 35-55 cm up is dim, small and matched on a few raw
+    rows; see the README's tuning table): ``contrast`` conditions the pair
+    before matching (:func:`normalize_intensity`, ``"gain"`` over a
+    ``contrast_window`` box, floor ``contrast_floor``; the invalidation
+    rules keep reading the original image); ``fill_radius`` fills holes up
+    to about twice that wide from agreeing neighbours after matching
+    (:func:`fill_holes`, spread tolerance ``fill_tolerance_px`` disparity
+    pixels at the local depth; 0 = off); ``temporal`` is the length of the
+    per-pixel agreeing median over frames (:class:`TemporalDepthFilter`,
+    tolerance ``temporal_tolerance_px``; 0 or 1 = off), which the source
+    applies since it is stateful.
     """
 
     min_depth_mm: float = 100.0
@@ -615,13 +878,32 @@ class StereoParams:
     speckle_range: int = 2
     disp12_max_diff: int = 1
     prefilter_cap: int = 31
-    median: int = 3
+    median: int = 5
     matcher: str = "sgbm"
     mode: str = "3way"
+    p1: int = 8
+    p2: int = 32
+    contrast: str = "none"
+    contrast_window: int = 31
+    contrast_floor: float = 24.0
+    fill_radius: int = 2
+    fill_tolerance_px: float = 1.5
+    temporal: int = 3
+    temporal_tolerance_px: float = 1.5
 
     def __post_init__(self) -> None:
         if not (0 < self.min_depth_mm < self.max_depth_mm):
             raise ValueError("need 0 < min_depth_mm < max_depth_mm")
+        if self.p1 < 0 or self.p2 < self.p1:
+            raise ValueError("need 0 <= p1 <= p2")
+        if self.contrast not in CONTRAST_MODES:
+            raise ValueError(f"contrast must be one of {CONTRAST_MODES}")
+        if self.contrast_window < 3 or self.contrast_window % 2 == 0:
+            raise ValueError("contrast_window must be odd and at least 3")
+        if self.fill_radius < 0 or self.temporal < 0:
+            raise ValueError("fill_radius and temporal must not be negative")
+        if not (self.fill_tolerance_px > 0 and self.temporal_tolerance_px > 0):
+            raise ValueError("tolerances must be positive")
         if not (0 <= self.min_intensity <= 255):
             raise ValueError("min_intensity must be 0..255")
         if not (self.min_intensity < self.max_intensity <= 255):
@@ -642,8 +924,8 @@ class StereoParams:
             raise ValueError("median must be 0, 3 or 5")
         if self.matcher not in ("sgbm", "bm"):
             raise ValueError("matcher must be 'sgbm' or 'bm'")
-        if self.mode not in ("sgbm", "hh", "3way"):
-            raise ValueError("mode must be 'sgbm', 'hh' or '3way'")
+        if self.mode not in ("sgbm", "hh", "hh4", "3way"):
+            raise ValueError("mode must be 'sgbm', 'hh', 'hh4' or '3way'")
 
     def invalid_pixels(self, reference: np.ndarray) -> np.ndarray | None:
         """Boolean mask of the reference-image pixels the intensity and texture rules reject, or ``None`` when every rule is off."""
@@ -704,11 +986,12 @@ class StereoDepth:
             matcher.setPreFilterCap(p.prefilter_cap)
             self.matcher_name = "bm"
         else:
-            modes = {"sgbm": cv2.STEREO_SGBM_MODE_SGBM, "hh": cv2.STEREO_SGBM_MODE_HH, "3way": cv2.STEREO_SGBM_MODE_SGBM_3WAY}
+            modes = {"sgbm": cv2.STEREO_SGBM_MODE_SGBM, "hh": cv2.STEREO_SGBM_MODE_HH, "3way": cv2.STEREO_SGBM_MODE_SGBM_3WAY,
+                     "hh4": getattr(cv2, "STEREO_SGBM_MODE_HH4", cv2.STEREO_SGBM_MODE_SGBM)}
             block = p.block_size
             matcher = cv2.StereoSGBM_create(
                 minDisparity=0, numDisparities=self.num_disparities, blockSize=block,
-                P1=8 * block * block, P2=32 * block * block, disp12MaxDiff=p.disp12_max_diff,
+                P1=p.p1 * block * block, P2=p.p2 * block * block, disp12MaxDiff=p.disp12_max_diff,
                 preFilterCap=p.prefilter_cap, uniquenessRatio=p.uniqueness,
                 speckleWindowSize=p.speckle_window, speckleRange=p.speckle_range, mode=modes[p.mode],
             )
@@ -723,6 +1006,27 @@ class StereoDepth:
         """Depth change per whole pixel of disparity at ``depth_mm`` (the matcher resolves 1/16 of that)."""
         return depth_mm * depth_mm / (self.baseline_mm * self.focal_px)
 
+    def tolerance_mm(self, pixels: float) -> Callable[[np.ndarray], np.ndarray]:
+        """``depth -> pixels * depth_step(depth)``, the millimetre tolerance worth ``pixels`` of disparity at every depth (arrays)."""
+        scale = float(pixels) / (self.baseline_mm * self.focal_px)
+
+        def tolerance(depth_mm: np.ndarray) -> np.ndarray:
+            z = np.asarray(depth_mm, dtype=np.float32)
+            return scale * z * z
+
+        return tolerance
+
+    def temporal_filter(self) -> "TemporalDepthFilter | None":
+        """A :class:`TemporalDepthFilter` sized by ``params.temporal`` and its tolerance, or ``None`` when it is off."""
+        if self.params.temporal <= 1:
+            return None
+        return TemporalDepthFilter(self.params.temporal, self.tolerance_mm(self.params.temporal_tolerance_px))
+
+    def condition(self, image: np.ndarray) -> np.ndarray:
+        """The image as the matcher sees it (:func:`normalize_intensity` under ``params.contrast``)."""
+        p = self.params
+        return normalize_intensity(image, p.contrast, p.contrast_window, p.contrast_floor)
+
     def disparity(self, left: np.ndarray, right: np.ndarray) -> np.ndarray:
         """Disparity in rectified pixels as ``float32``; ``<= 0`` means no match."""
         if left.shape != right.shape:
@@ -733,12 +1037,12 @@ class StereoDepth:
             right = np.clip(right, 0, 255).astype(np.uint8)
         if self.swap:
             left, right = right, left
-        raw = self.matcher.compute(left, right)  # int16, 16x fixed point, invalid = -16
+        raw = self.matcher.compute(self.condition(left), self.condition(right))  # int16, 16x fixed point, invalid = -16
         disp = raw.astype(np.float32) / 16.0
         if self.params.median in (3, 5):
             disp = cv2.medianBlur(disp, self.params.median)
         disp[disp > self.num_disparities - 1.5] = -1.0  # saturated: nearer than the search range, depth unknown
-        rejected = self.params.invalid_pixels(left)  # too dark, saturated or featureless in the reference image
+        rejected = self.params.invalid_pixels(left)  # too dark, saturated or featureless in the ORIGINAL reference image
         if rejected is not None:
             disp[rejected] = -1.0
         return disp
@@ -752,7 +1056,7 @@ class StereoDepth:
         return np.ascontiguousarray(np.rint(depth), dtype=np.uint16)
 
     def compute(self, left: np.ndarray, right: np.ndarray) -> np.ndarray:
-        """Depth in millimetres (``uint16``, 0 = none) with every invalidation rule applied, including the depth-aware ``min_lit``."""
+        """Depth in millimetres (``uint16``, 0 = none) with every invalidation rule applied, including the depth-aware ``min_lit``, then the hole filler."""
         depth = self.depth_from_disparity(self.disparity(left, right))
         reference = right if self.swap else left
         if reference.dtype != np.uint8:
@@ -760,6 +1064,11 @@ class StereoDepth:
         underlit = self.params.underlit_pixels(reference, depth)
         if underlit is not None:
             depth[underlit] = 0
+        if self.params.fill_radius > 0:
+            rejected = self.params.invalid_pixels(reference)  # the rules' rejections stay empty: the filler only fills what the matcher left
+            if underlit is not None:
+                rejected = underlit if rejected is None else (rejected | underlit)
+            depth = fill_holes(depth, self.params.fill_radius, self.tolerance_mm(self.params.fill_tolerance_px), exclude=rejected)
         return depth
 
     def valid_fraction(self, left: np.ndarray, right: np.ndarray) -> float:
@@ -828,6 +1137,38 @@ def reorient_points(u: np.ndarray | float, v: np.ndarray | float, width: int, he
         return u, last_row - v
     if orientation == "transpose":
         return v, u
+    raise ValueError(f"unknown orientation {orientation!r}; choose one of {ORIENTATIONS}")
+
+
+def reorient_intrinsics(fx: float, fy: float, cx: float, cy: float, width: int, height: int, orientation: str = "none") -> tuple[float, float, float, float]:
+    """The pinhole intrinsics ``(fx, fy, cx, cy)`` of an image after :func:`reorient` turned it.
+
+    ``cx``/``cy`` are the principal point in edge coordinates (pixel ``i``
+    spans ``[i, i + 1)``, so pixel index ``i`` has its centre at ``i + 0.5``:
+    the convention of :class:`RectifiedView`, whose ``cx`` is ``width / 2``).
+    A rotation or flip is a rigid move of the image plane, so the camera stays
+    a pinhole: the focal lengths follow the axes they land on and the
+    principal point is mirrored where an axis is reversed. Metric coordinates
+    ``X = (u + 0.5 - cx) * depth / fx`` (across) and ``V = (v + 0.5 - cy) *
+    depth / fy`` (down) computed with the result therefore describe the same
+    physical point as before, expressed in the turned image's axes: ``rot90``
+    gives ``(-V, X)``, ``flip-h`` gives ``(-X, V)``, ``transpose`` ``(V, X)``.
+    """
+    w, h = float(width), float(height)
+    if orientation == "none":
+        return fx, fy, cx, cy
+    if orientation == "rot90":
+        return fy, fx, h - cy, cx
+    if orientation == "rot180":
+        return fx, fy, w - cx, h - cy
+    if orientation == "rot270":
+        return fy, fx, cy, w - cx
+    if orientation == "flip-h":
+        return fx, fy, w - cx, cy
+    if orientation == "flip-v":
+        return fx, fy, cx, h - cy
+    if orientation == "transpose":
+        return fy, fx, cy, cx
     raise ValueError(f"unknown orientation {orientation!r}; choose one of {ORIENTATIONS}")
 
 

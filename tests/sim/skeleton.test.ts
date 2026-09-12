@@ -182,3 +182,13 @@ describe('bridge skeleton protocol', () => {
     expect(tracked.capsules[3].b.y).toBeGreaterThan(tracked.position.y);
   });
 });
+
+describe('bridge frame announcement', () => {
+  const hello = { type: 'hello', version: PROTOCOL_VERSION, source: 'leap', box: { x: [-.31, .31], y: [.1, .45], z: [-.175, .175] }, surface: { width: 8, height: 6 }, skeleton: true };
+  it('accepts image and upright frames and rejects anything else', () => {
+    expect((parseBridgeMessage(JSON.stringify({ ...hello, frame: 'upright' })) as BridgeHello).frame).toBe('upright');
+    expect((parseBridgeMessage(JSON.stringify({ ...hello, frame: 'image' })) as BridgeHello).frame).toBe('image');
+    expect((parseBridgeMessage(JSON.stringify(hello)) as BridgeHello).frame).toBeUndefined();
+    expect(() => parseBridgeMessage(JSON.stringify({ ...hello, frame: 'sideways' }))).toThrow(/frame/);
+  });
+});

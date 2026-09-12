@@ -59,6 +59,14 @@ export const bridgeHelloSchema = z.object({
   surface: z.object({ width: z.number().int().min(1).max(512), height: z.number().int().min(1).max(512) }).optional(),
   /** True when the bridge tracks hands and can attach a `skeleton` to them. */
   skeleton: z.boolean().optional(),
+  /**
+   * How the bridge oriented its box. `image` (the default when absent): u/v follow the camera image and
+   * w is depth from the camera. `upright`: the camera lies on the desk looking up, and the bridge has
+   * already re-oriented and de-perspectived its output (metric box) so that u runs along the device's
+   * long axis, v runs DOWN from the top of the box (1 − height above the device) and w grows toward the
+   * display; the browser's default depth mapping then puts height on sim y and reach on sim z.
+   */
+  frame: z.enum(['image', 'upright']).optional(),
 }).strict();
 
 /**

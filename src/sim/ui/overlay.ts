@@ -170,7 +170,7 @@ export class Overlay {
     if (s.sourceId === 'depth') {
       const url = el('input', { type: 'text', value: settings.depth.url, placeholder: 'ws://127.0.0.1:8765' });
       nodes.push(el('div', { class: 'row' }, el('label', {}, 'Bridge WebSocket URL', url), el('button', { onclick: () => this.host.setDepthUrl(url.value) }, 'Connect')));
-      nodes.push(el('p', { class: 'hint' }, 'Run bridge/depth_bridge.py next to the camera (--source leap for a Leap Motion Controller: hand skeletons and the depth scan together). See bridge/README.md.'));
+      nodes.push(el('p', { class: 'hint' }, 'Run bridge/depth_bridge.py next to the camera (--source leap for a Leap Motion Controller: hand skeletons and the depth scan together; add --frame upright when the camera lies on the desk looking up, so height becomes y and reaching toward the display becomes z). See bridge/README.md.'));
       nodes.push(this.depthStatus);
     }
     if (s.sourceId === 'leap') {
@@ -297,7 +297,7 @@ export class Overlay {
     if (s.source instanceof DepthBridgeSource) {
       const hello = s.source.hello, solidHands = s.tracked.hands.filter(h => h.capsules.length).length;
       this.depthStatus.textContent = hello
-        ? `${hello.skeleton ? 'The bridge sends hand skeletons' : 'The bridge sends no skeletons (blobs and the scan only)'}${hello.surface ? ` · scan ${hello.surface.width}×${hello.surface.height}` : ' · no scan'} · ${solidHands} of ${s.tracked.hands.length} tracked hands solid · simulation sees: ${s.solid}`
+        ? `${hello.skeleton ? 'The bridge sends hand skeletons' : 'The bridge sends no skeletons (blobs and the scan only)'}${hello.surface ? ` · scan ${hello.surface.width}×${hello.surface.height}` : ' · no scan'}${hello.frame === 'upright' ? ' · upright frame (height → y, reach → z)' : ''} · ${solidHands} of ${s.tracked.hands.length} tracked hands solid · simulation sees: ${s.solid}`
         : 'Waiting for the bridge hello…';
     }
     this.hands.replaceChildren(s.tracked.hands.length ? el('table', {}, el('tr', {}, ...['hand', 'x', 'y', 'z', 'speed', 'open', 'push', 'age'].map(h => el('th', {}, h))), ...s.tracked.hands.map(h => el('tr', {}, el('td', {}, `#${h.id}`), el('td', {}, fmt(h.position.x)), el('td', {}, fmt(h.position.y)), el('td', {}, fmt(h.position.z)), el('td', {}, fmt(h.speed)), el('td', {}, fmt(h.openness, 1)), el('td', {}, fmt(h.push)), el('td', {}, `${(h.ageMs / 1000).toFixed(1)}s`)))) : el('p', { class: 'hint' }, 'No hand present.'));

@@ -48,14 +48,34 @@ at 320x240 on a laptop.
 Fusion
 ------
 :func:`fuse_depth` merges the measurement (``uint16`` mm, 0 = no measurement)
-with the model under one of three modes: ``fill`` keeps a measurement that
+with the model under one of four modes: ``fill`` keeps a measurement that
 exists and agrees with the model within a tolerance, takes the model where
 the measurement is missing or disagrees by more, and leaves everything outside
 the model alone (the arm, objects); ``model`` takes the model wherever it has
-a surface; ``off`` changes nothing. Model pixels outside the box's depth range
-count as no model, so a hand outside the box adds nothing, exactly like a
-pixel outside the range. The second result says which pixels came from the
-model, which the analyzer reports as ``stats.scanModelFraction``.
+a surface; ``off`` changes nothing; ``blend`` is ``fill`` made noise-aware
+for the far hand (below). Model pixels outside the box's depth range count
+as no model, so a hand outside the box adds nothing, exactly like a pixel
+outside the range. The second result says which pixels came from the model,
+which the analyzer reports as ``stats.scanModelFraction``.
+
+``blend``: a hand 35-55 cm above the controller is measured with 5-10 mm of
+local noise, a tenth of its pixels wrong by more than 15 % and holes all
+over (the README's *Distance* table), and ``fill`` passes every measurement
+that is within the tolerance of the model straight through, spikes
+included. Under the model's silhouette ``blend`` first median-filters the
+measurement (:data:`BLEND_MEDIAN` window, holes taken as the model so the
+median does not drift into them), then applies ``fill``'s rule to the
+smoothed value, and where it agrees mixes it with the model: ``(1 - w) *
+smoothed + w * model`` with a weight that grows with the local noise of
+the measurement (:func:`local_noise` over :data:`NOISE_WINDOW`, 0 at
+:data:`BLEND_NOISE_MM[0]`, 1 at ``[1]``) and with the depth (0 and 1 at
+:data:`BLEND_DEPTH_FRACTION` of the box's depth range, i.e. the far third
+of the box; the larger of the two weights wins). A clean measurement at 27
+cm is kept as measured, a noisy one at 45
+cm reads as the smooth model with the measured relief where the
+measurement is consistent, and outside the model nothing changes. A pixel
+counts as "from the model" when the model replaced it or its weight is at
+least a half.
 """
 from __future__ import annotations
 
@@ -64,6 +84,11 @@ import sys
 from typing import Any, Sequence
 
 import numpy as np
+
+try:
+    import cv2  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - the median then falls back to numpy
+    cv2 = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -88,7 +113,23 @@ N_FINGERS, JOINTS_PER_FINGER = _db.N_FINGERS, _db.JOINTS_PER_FINGER
 JOINT_WRIST, JOINT_ELBOW = _db.JOINT_WRIST, _db.JOINT_ELBOW
 WIDTH_PALM, WIDTH_ARM, WIDTH_FINGERS = _db.WIDTH_PALM, _db.WIDTH_ARM, _db.WIDTH_FINGERS
 finger_joint = _db.finger_joint
-FUSE_MODES: tuple[str, ...] = _db.SCAN_FUSE_MODES  # ("off", "fill", "model")
+FUSE_MODES: tuple[str, ...] = _db.SCAN_FUSE_MODES  # ("off", "fill", "model", "blend")
+
+#: ``blend``: the measurement's local noise (mm, standard deviation over :data:`NOISE_WINDOW`) at which the model's weight is 0 and 1.
+BLEND_NOISE_MM = (5.0, 20.0)
+#: ``blend``: where in the box's depth range (0 = near, 1 = far) the model's weight is 0 and 1 whatever the noise: the far third of the
+#: box leans on the model (345-450 mm above a controller with the default 100-450 mm box, where its stereo is worst).
+BLEND_DEPTH_FRACTION = (0.7, 1.0)
+
+
+def blend_depth_range(near_mm: float, far_mm: float) -> tuple[float, float]:
+    """The depths (mm) at which ``blend``'s depth ramp is 0 and 1 for a box ``[near_mm, far_mm]`` (:data:`BLEND_DEPTH_FRACTION`)."""
+    span = float(far_mm) - float(near_mm)
+    return float(near_mm) + BLEND_DEPTH_FRACTION[0] * span, float(near_mm) + BLEND_DEPTH_FRACTION[1] * span
+#: ``blend``: the median window that smooths the measurement under the model (odd; 5 spans a finger's width at 45 cm on the Leap view).
+BLEND_MEDIAN = 5
+#: ``blend``: the window of the local noise estimate.
+NOISE_WINDOW = 5
 
 # Columns of a capsule row.
 CAP_AX, CAP_AY, CAP_AZ, CAP_BX, CAP_BY, CAP_BZ, CAP_RADIUS, CAP_RELIEF = range(8)
@@ -143,12 +184,13 @@ def hand_capsules(hand: TrackedHand) -> np.ndarray:
     return rows[keep]
 
 
-def _boxes(caps: np.ndarray, shape: tuple[int, int]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Per capsule its clipped bounding box: ``(row0, row1, col0, col1, visible)`` with inclusive maxima."""
+def _boxes(caps: np.ndarray, shape: tuple[int, int], row_scale: float = 1.0) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Per capsule its clipped bounding box: ``(row0, row1, col0, col1, visible)`` with inclusive maxima (a radius spans ``radius / row_scale`` rows)."""
     height, width = shape
     ax, ay, bx, by, radius = caps[:, CAP_AX], caps[:, CAP_AY], caps[:, CAP_BX], caps[:, CAP_BY], caps[:, CAP_RADIUS]
+    row_radius = radius / row_scale
     lo_c, hi_c = np.floor(np.minimum(ax, bx) - radius), np.ceil(np.maximum(ax, bx) + radius)
-    lo_r, hi_r = np.floor(np.minimum(ay, by) - radius), np.ceil(np.maximum(ay, by) + radius)
+    lo_r, hi_r = np.floor(np.minimum(ay, by) - row_radius), np.ceil(np.maximum(ay, by) + row_radius)
     visible = (radius > 0.0) & (hi_c >= 0) & (lo_c <= width - 1) & (hi_r >= 0) & (lo_r <= height - 1)
     c0, r0 = np.clip(lo_c, 0, width - 1).astype(np.int64), np.clip(lo_r, 0, height - 1).astype(np.int64)
     c1, r1 = np.clip(hi_c, 0, width - 1).astype(np.int64), np.clip(hi_r, 0, height - 1).astype(np.int64)
@@ -180,12 +222,12 @@ def _check_capsules(capsules: np.ndarray | Sequence[Sequence[float]]) -> np.ndar
     return caps
 
 
-def capsule_bounds(capsules: np.ndarray | Sequence[Sequence[float]], shape: tuple[int, int]) -> Bounds | None:
+def capsule_bounds(capsules: np.ndarray | Sequence[Sequence[float]], shape: tuple[int, int], row_scale: float = 1.0) -> Bounds | None:
     """The union of the capsules' clipped bounding boxes as ``(row0, row1, col0, col1)`` (exclusive maxima), or ``None`` if none is visible."""
     caps = _check_capsules(capsules)
     if not caps.size:
         return None
-    r0, r1, c0, c1, visible = _boxes(caps, (int(shape[0]), int(shape[1])))
+    r0, r1, c0, c1, visible = _boxes(caps, (int(shape[0]), int(shape[1])), row_scale)
     if not visible.any():
         return None
     return int(r0[visible].min()), int(r1[visible].max()) + 1, int(c0[visible].min()), int(c1[visible].max()) + 1
@@ -193,7 +235,7 @@ def capsule_bounds(capsules: np.ndarray | Sequence[Sequence[float]], shape: tupl
 
 def rasterize_capsules(
     capsules: np.ndarray | Sequence[Sequence[float]], shape: tuple[int, int],
-    focal_px: float | None = None, mm_per_px: float = 1.0, out: np.ndarray | None = None,
+    focal_px: float | None = None, mm_per_px: float = 1.0, out: np.ndarray | None = None, row_scale: float = 1.0,
 ) -> np.ndarray:
     """Depth image (``float32`` mm, ``inf`` where no capsule) of the nearest capsule surface at every pixel of ``shape = (height, width)``.
 
@@ -208,7 +250,10 @@ def rasterize_capsules(
     ``(K, S, S)`` batch (:func:`_batches`) and scattered into the canvas with
     a per-capsule ``minimum``, so the cost is a few vector operations per
     group rather than per capsule. ``out`` accumulates into an existing canvas
-    (the nearest surface wins) instead of a fresh one.
+    (the nearest surface wins) instead of a fresh one. ``row_scale`` is the
+    height of a pixel in units of its width (1 = square pixels): distances and
+    radii are measured in column units, so a grid whose rows are taller than
+    its columns (the front view of a metric box) still renders round tubes.
     """
     height, width = int(shape[0]), int(shape[1])
     canvas = np.full((height, width), np.inf, dtype=np.float32) if out is None else out
@@ -217,6 +262,8 @@ def rasterize_capsules(
     caps = _check_capsules(capsules)
     if focal_px is not None and not (float(focal_px) > 0.0):
         raise ValueError("focal_px must be positive")
+    if not (float(row_scale) > 0.0):
+        raise ValueError("row_scale must be positive")
     inv_focal = None if focal_px is None else 1.0 / float(focal_px)
     if not caps.size:
         return canvas
@@ -226,12 +273,13 @@ def rasterize_capsules(
     if swap.any():
         caps = caps.copy()
         caps[swap, CAP_AX:CAP_AZ + 1], caps[swap, CAP_BX:CAP_BZ + 1] = caps[swap, CAP_BX:CAP_BZ + 1], caps[swap, CAP_AX:CAP_AZ + 1]
-    r0, r1, c0, c1, visible = _boxes(caps, (height, width))
+    r0, r1, c0, c1, visible = _boxes(caps, (height, width), row_scale)
     if not visible.any():
         return canvas
     side = np.where(visible, np.maximum(c1 - c0, r1 - r0) + 1, 0)  # each capsule's square window; a batch shares its largest
     caps32 = caps.astype(np.float32)
     f32, eps = np.float32, np.float32(MIN_BONE * MIN_BONE)
+    row_scale32 = f32(row_scale)
     for group in _batches(side):
         group = group[side[group] > 0]
         if not group.size:
@@ -240,10 +288,11 @@ def rasterize_capsules(
         g = caps32[group]                                              # (K, 8)
         steps = np.arange(size, dtype=np.float32)[None, :]
         rows0, cols0 = r0[group], c0[group]
-        py = (rows0.astype(np.float32)[:, None] + steps - g[:, CAP_AY:CAP_AY + 1])[:, :, None]  # (K, S, 1)
+        py = (rows0.astype(np.float32)[:, None] + steps - g[:, CAP_AY:CAP_AY + 1])[:, :, None]  # (K, S, 1), rows -> column units
+        py *= row_scale32
         px = (cols0.astype(np.float32)[:, None] + steps - g[:, CAP_AX:CAP_AX + 1])[:, None, :]  # (K, 1, S)
         ab = (g[:, CAP_BX:CAP_BZ + 1] - g[:, CAP_AX:CAP_AZ + 1])[:, :, None, None]           # (K, 3, 1, 1)
-        abx, aby, abz = ab[:, 0], ab[:, 1], ab[:, 2]
+        abx, aby, abz = ab[:, 0], ab[:, 1] * row_scale32, ab[:, 2]
         len2 = abx * abx + aby * aby
         inv_len2 = np.where(len2 > eps, f32(1.0) / np.maximum(len2, eps), f32(0.0))
         t = px * (abx * inv_len2) + py * (aby * inv_len2)  # (K, S, S): position along each segment, 0 for a sphere
@@ -267,7 +316,7 @@ def rasterize_capsules(
 
 def render_hands(
     hands: Sequence[TrackedHand], shape: tuple[int, int], offset: tuple[int, int] = (0, 0),
-    focal_px: float | None = None, mm_per_px: float = 1.0, out: np.ndarray | None = None,
+    focal_px: float | None = None, mm_per_px: float = 1.0, out: np.ndarray | None = None, row_scale: float = 1.0,
 ) -> tuple[np.ndarray, Bounds | None]:
     """The model depth of every hand over a ``shape = (height, width)`` window starting at pixel ``offset = (x0, y0)`` of the hands' image.
 
@@ -276,7 +325,8 @@ def render_hands(
     it could have touched, ``(row0, row1, col0, col1)`` with exclusive maxima
     (:func:`capsule_bounds`), or ``None`` when no capsule reaches the window.
     The analyzer renders over its ROI, which is why the window and offset
-    exist, and fuses only inside the box.
+    exist, and fuses only inside the box. ``row_scale`` is passed to
+    :func:`rasterize_capsules` for grids whose cells are not square.
     """
     shape = (int(shape[0]), int(shape[1]))
     if out is None:
@@ -289,8 +339,131 @@ def render_hands(
     if x0 or y0:
         caps[:, [CAP_AX, CAP_BX]] -= x0
         caps[:, [CAP_AY, CAP_BY]] -= y0
-    rasterize_capsules(caps, shape, focal_px, mm_per_px, out=canvas)
-    return canvas, capsule_bounds(caps, shape)
+    rasterize_capsules(caps, shape, focal_px, mm_per_px, out=canvas, row_scale=row_scale)
+    return canvas, capsule_bounds(caps, shape, row_scale)
+
+
+def local_noise(values: np.ndarray, valid: np.ndarray, window: int = NOISE_WINDOW) -> np.ndarray:
+    """Standard deviation of the ``valid`` entries of ``values`` (``float32``) over a ``window x window`` box around every pixel (0 where fewer than two are valid)."""
+    v = np.where(valid, values, 0.0).astype(np.float32)
+    n = valid.astype(np.float32)
+    k = (int(window), int(window))
+    if cv2 is not None:
+        den = cv2.boxFilter(n, -1, k, normalize=False, borderType=cv2.BORDER_CONSTANT)
+        num = cv2.boxFilter(v, -1, k, normalize=False, borderType=cv2.BORDER_CONSTANT)
+        sq = cv2.boxFilter(v * v, -1, k, normalize=False, borderType=cv2.BORDER_CONSTANT)
+    else:  # pragma: no cover - pure numpy box sums (slower; OpenCV is required by the Leap sources anyway)
+        def box(a: np.ndarray) -> np.ndarray:
+            r = int(window) // 2
+            p = np.pad(a, r)
+            c = np.cumsum(np.cumsum(p, axis=0), axis=1)
+            c = np.pad(c, ((1, 0), (1, 0)))
+            h, w = a.shape
+            return c[window:window + h, window:window + w] - c[:h, window:window + w] - c[window:window + h, :w] + c[:h, :w]
+        den, num, sq = box(n), box(v), box(v * v)
+    safe = np.maximum(den, 1.0)
+    mean = num / safe
+    var = np.maximum(sq / safe - mean * mean, 0.0)
+    return np.where(den >= 2.0, np.sqrt(var), 0.0).astype(np.float32)
+
+
+def blend_weight(noise_mm: np.ndarray, depth_mm: np.ndarray | float, noise_range: tuple[float, float] = BLEND_NOISE_MM, depth_range: tuple[float, float] = (350.0, 450.0)) -> np.ndarray:
+    """The model's share, 0..1, from the measurement's local noise and its depth: the larger of two linear ramps (``float32``; ``depth_range`` from :func:`blend_depth_range`)."""
+    n0, n1 = noise_range
+    d0, d1 = depth_range
+    w_noise = np.clip((np.asarray(noise_mm, dtype=np.float32) - n0) / max(n1 - n0, 1e-6), 0.0, 1.0)
+    w_depth = np.clip((np.asarray(depth_mm, dtype=np.float32) - d0) / max(d1 - d0, 1e-6), 0.0, 1.0)
+    return np.maximum(w_noise, w_depth).astype(np.float32)
+
+
+def _median(image: np.ndarray, window: int) -> np.ndarray:
+    """``window x window`` median of a ``float32`` image (OpenCV; a numpy fallback for environments without it)."""
+    if window <= 1:
+        return image
+    if cv2 is not None:
+        return cv2.medianBlur(np.ascontiguousarray(image, dtype=np.float32), int(window))
+    r = int(window) // 2  # pragma: no cover
+    padded = np.pad(image, r, mode="edge")
+    stack = np.stack([padded[dy:dy + image.shape[0], dx:dx + image.shape[1]] for dy in range(window) for dx in range(window)])
+    return np.median(stack, axis=0).astype(np.float32)
+
+
+def _blend(seen: np.ndarray, valid: np.ndarray, model: np.ndarray, has_model: np.ndarray, tolerance_mm: float, depth_for_weight: np.ndarray | float,
+           depth_range: tuple[float, float], median: int = BLEND_MEDIAN) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The ``blend`` rule on ``float32`` arrays: ``(value under the model, taken from the model, model weight)``.
+
+    ``seen`` is the measurement (any value where ``valid`` is false is
+    ignored), ``model`` the model depth where ``has_model``. The smoothed
+    measurement is a median over the measurement with holes taken as the
+    model; where it agrees with the model within the tolerance the result is
+    ``(1 - w) * smoothed + w * model``, elsewhere under the model it is the
+    model. Outside the model the returned value is ``seen`` (callers keep
+    their own there). ``depth_for_weight`` and ``depth_range`` feed the
+    depth ramp of :func:`blend_weight`.
+    """
+    model_here = np.where(has_model, model, 0.0).astype(np.float32)  # finite everywhere: inf outside the model would poison the mix
+    filled = np.where(valid, seen, np.where(has_model, model_here, seen)).astype(np.float32)
+    smoothed = _median(filled, median)
+    noise = local_noise(seen, valid)
+    weight = blend_weight(noise, depth_for_weight, depth_range=depth_range)
+    agree = has_model & valid & np.isfinite(smoothed) & (np.abs(smoothed - model_here) <= np.float32(tolerance_mm))
+    mixed = (1.0 - weight) * np.where(np.isfinite(smoothed), smoothed, 0.0) + weight * model_here
+    value = np.where(agree, mixed, np.where(has_model, model_here, seen)).astype(np.float32)
+    take = has_model & (~agree | (weight >= 0.5))
+    return value, take, weight
+
+
+def fuse_front(measured: np.ndarray, model: np.ndarray, mode: str, tolerance_mm: float, depth_mm: float, height_range_mm: tuple[float, float] | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Merge two front views (``float32`` reach in mm, ``inf`` = nothing there) under the same rules as :func:`fuse_depth`: ``(fused, from_model)``.
+
+    The upright frame's scan is a height field over the FRONT of the box (u
+    across, v down, and the value the nearest reach ``w`` in millimetres from
+    the box's front plane), so the measurement is the extruded underside the
+    camera saw and the model is the capsules rendered orthographically from
+    the front. The model counts only where its reach lies inside ``[0,
+    depth_mm]`` (a model face past the box's front or back plane is dropped
+    like any point outside the box). Then ``fill`` takes the model where the
+    measurement is empty or differs by more than ``tolerance_mm`` and keeps
+    the measurement where it agrees; ``model`` takes the model wherever it
+    counts; ``off`` returns the measurement and an all-false mask; ``blend``
+    (module docstring) smooths the measurement under the model and mixes it
+    toward the model by its local noise and, when ``height_range_mm =
+    (near, far)`` is given, by the height above the device of each row (row
+    0 is the top of the box, ``far``; the last row ``near``; the ramp is
+    :func:`blend_depth_range` of that range).
+    """
+    if mode not in FUSE_MODES:
+        raise ValueError(f"scan fusion mode must be one of {FUSE_MODES}, got {mode!r}")
+    if measured.ndim != 2 or model.shape != measured.shape:
+        raise ValueError(f"model {model.shape} and measurement {measured.shape} must be the same 2-D shape")
+    if tolerance_mm < 0.0:
+        raise ValueError("tolerance must be non-negative")
+    if mode == "off":
+        return measured, np.zeros(measured.shape, dtype=bool)
+    has_model = (model >= 0.0) & (model <= float(depth_mm))  # inf fails the upper bound: no model there
+    if mode == "model":
+        take = has_model
+    elif mode == "blend":
+        valid = np.isfinite(measured)
+        if height_range_mm is None:
+            height: np.ndarray | float = 0.0
+            ramp = (1.0, 2.0)  # never reached: the noise alone decides
+        else:
+            near, far = float(height_range_mm[0]), float(height_range_mm[1])
+            rows = measured.shape[0]
+            height = (far - (np.arange(rows, dtype=np.float32) + 0.5) / rows * (far - near))[:, None] * np.ones((1, measured.shape[1]), dtype=np.float32)
+            ramp = blend_depth_range(near, far)
+        value, take, _ = _blend(measured, valid, model, has_model, tolerance_mm, height, ramp)
+        fused = np.where(has_model, value, measured).astype(np.float32, copy=False)
+        return fused, take
+    else:
+        both = has_model & np.isfinite(measured)
+        gap = np.full(measured.shape, np.inf, dtype=np.float32)
+        np.subtract(measured, model, out=gap, where=both)  # only where both exist: inf - inf is not a disagreement, it is nothing
+        keep = both & (np.abs(gap) <= np.float32(tolerance_mm))
+        take = has_model & ~keep
+    fused = np.where(take, model, measured).astype(np.float32, copy=False)
+    return fused, take
 
 
 def isotropic_mm_per_px(near_mm: float, far_mm: float, roi_width_px: int) -> float:
@@ -316,6 +489,10 @@ def fuse_depth(
       the measurement exists and agrees, the measurement; outside the model,
       the measurement.
     * ``model``: the model wherever it counts, the measurement elsewhere.
+    * ``blend``: under the model, the median-smoothed measurement mixed
+      toward the model by its local noise and its depth where it agrees with
+      the model within the tolerance, the model where it is missing or
+      disagrees (module docstring); outside the model, the measurement.
     """
     if mode not in FUSE_MODES:
         raise ValueError(f"scan fusion mode must be one of {FUSE_MODES}, got {mode!r}")
@@ -335,14 +512,24 @@ def fuse_depth(
             return measured, take
         bounds = (int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1)
     r0, r1, c0, c1 = bounds
+    if mode == "blend":
+        # A margin around the model's box so the median and the noise estimate see the measurement's surroundings.
+        m = max(BLEND_MEDIAN, NOISE_WINDOW) // 2
+        r0, r1, c0, c1 = max(r0 - m, 0), min(r1 + m, measured.shape[0]), max(c0 - m, 0), min(c1 + m, measured.shape[1])
     window, seen = model[r0:r1, c0:c1], measured[r0:r1, c0:c1]
     has_model = (window >= max(float(near_mm), 1.0)) & (window <= float(far_mm))  # inf fails the upper bound: no model there
+    fused = measured.copy()
     if mode == "model":
         take_here = has_model
+    elif mode == "blend":
+        valid = seen != 0
+        value, take_here, _ = _blend(seen.astype(np.float32), valid, window, has_model, tolerance_mm, np.where(has_model, window, 0.0), blend_depth_range(near_mm, far_mm))
+        fused[r0:r1, c0:c1][has_model] = np.clip(np.rint(value[has_model]), 1.0, 65535.0).astype(np.uint16)
+        take[r0:r1, c0:c1] = take_here
+        return fused, take
     else:
         keep = (seen != 0) & (np.abs(seen.astype(np.float32) - window) <= np.float32(tolerance_mm))
         take_here = has_model & ~keep
-    fused = measured.copy()
     fused[r0:r1, c0:c1][take_here] = np.clip(np.rint(window[take_here]), 1.0, 65535.0).astype(np.uint16)
     take[r0:r1, c0:c1] = take_here
     return fused, take

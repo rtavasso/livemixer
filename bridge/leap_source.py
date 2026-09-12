@@ -53,7 +53,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Sequence
 
 import numpy as np
@@ -876,6 +876,19 @@ class LeapC:
 
 
 @dataclass(frozen=True)
+class LeapDepthFrame(DepthFrame):
+    """A :class:`DepthFrame` that also carries the source's per-frame measurement statistics.
+
+    ``stats`` holds :func:`leap_stereo.depth_statistics`' ``depthNoiseMm`` and
+    ``depthValidFraction`` for the frame; the analyzer merges whatever a
+    frame's ``stats`` holds into the wire message's ``stats``, so the browser
+    overlay can show when the scan has turned to noise.
+    """
+
+    stats: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class StereoPair:
     """One raw stereo frame copied out of a LeapC image event."""
 
@@ -915,7 +928,7 @@ class LeapStereoSource(FrameSource):
         swap: bool = False, orient: str = "none", fps: float = 30.0, stall_after: float = 3.0, restart_after: float = 20.0,
         poll_timeout_ms: int = 100, sample_step: int = 4, baseline_mm: float | None = None,
         hand_frame: str = "auto", tracking_window_s: float = 0.05, alignment: str = "auto", calibration: str = "function",
-        align_every: int = 3,
+        align_every: int = 3, far_mm: float = 450.0,
     ) -> None:
         if orient not in ls.ORIENTATIONS:
             raise ValueError(f"orient must be one of {ls.ORIENTATIONS}")
@@ -944,6 +957,9 @@ class LeapStereoSource(FrameSource):
         self.tracking_frames = 0
         self.last_tracking: TrackingFrame | None = None
         self.last_hands: tuple[TrackedHand, ...] = ()
+        self.last_stats: dict[str, float] = {}
+        self.far_mm = float(far_mm)
+        self.temporal: ls.TemporalDepthFilter | None = None  # built with the matcher, whose depth step sizes its tolerance
 
         self.lib: LeapC | None = None
         self.pool = BufferPool()
@@ -974,6 +990,12 @@ class LeapStereoSource(FrameSource):
         self.policy_at: float | None = None
         self.started_at: float | None = None
         self.image_size: tuple[int, int] | None = None
+
+    @property
+    def intrinsics(self) -> tuple[float, float, float, float]:
+        """The rectified view's pinhole ``(fx, fy, cx, cy)``, turned with ``orient`` like the depth image (``leap_stereo.reorient_intrinsics``)."""
+        v = self.view
+        return ls.reorient_intrinsics(v.fx, v.fy, v.cx, v.cy, v.width, v.height, self.orient)
 
     # ---- lifecycle -------------------------------------------------------- #
 
@@ -1286,10 +1308,13 @@ class LeapStereoSource(FrameSource):
         baseline = self.forced_baseline_mm or (self.device_info.baseline_mm if self.device_info and self.device_info.baseline_um > 0 else ls.CONTROLLER_BASELINE_MM)
         if self.stereo is None or abs(self.stereo.baseline_mm - baseline) > 1e-6:
             self.stereo = ls.StereoDepth(baseline, self.view.fx, self.params, self.swap)
+            self.temporal = self.stereo.temporal_filter()
             p = self.params
-            log.info("stereo matcher %s/%s block %d: baseline %.1f mm, f %.1f px, %d disparities (near plane %.0f mm), swap=%s; rules: intensity [%d, %d), lit %d @ %.0f mm, texture %d, uniqueness %d, lr %d",
+            log.info("stereo matcher %s/%s block %d: baseline %.1f mm, f %.1f px, %d disparities (near plane %.0f mm), swap=%s; rules: intensity [%d, %d), lit %d @ %.0f mm, texture %d, uniqueness %d, lr %d; "
+                     "contrast %s, fill radius %d, temporal %d",
                      self.stereo.matcher_name, p.mode, p.block_size, baseline, self.view.fx, self.stereo.num_disparities, p.min_depth_mm, self.swap,
-                     p.min_intensity, p.max_intensity, p.min_lit, p.lit_reference_mm, p.min_texture, p.uniqueness, p.disp12_max_diff)
+                     p.min_intensity, p.max_intensity, p.min_lit, p.lit_reference_mm, p.min_texture, p.uniqueness, p.disp12_max_diff,
+                     p.contrast, p.fill_radius, p.temporal)
         if self.projector is None:
             self.projector = HandProjector(self.view, baseline, self.swap, self.orient, self.hand_frame)
             log.info("hand skeletons projected with hand frame %s", self.projector.describe())
@@ -1327,11 +1352,15 @@ class LeapStereoSource(FrameSource):
         left, right = self.rectifier.rectify_pair(pair.left, pair.right)
         self._reads += 1
         self._observe_alignment(left, right)
-        depth = ls.reorient(self.stereo.compute(left, right), self.orient)
+        depth = self.stereo.compute(left, right)
+        if self.temporal is not None:
+            depth = self.temporal.push(depth)
+        depth = ls.reorient(depth, self.orient)
+        stats = ls.depth_statistics(depth, self.params.min_depth_mm, self.far_mm)
         hands = self.projector.resolve(self._hands_at(pair.timestamp_us), depth)
-        self.last_pair, self.last_rectified, self.last_depth, self.last_hands = pair, (left, right), depth, hands
+        self.last_pair, self.last_rectified, self.last_depth, self.last_hands, self.last_stats = pair, (left, right), depth, hands, stats
         self._last_return = time.monotonic()
-        return DepthFrame(depth, pair.timestamp, hands)
+        return LeapDepthFrame(depth, pair.timestamp, hands, stats)
 
     def frames(self) -> Iterator[DepthFrame]:
         """Depth frames forever (``start()`` first)."""
@@ -1366,6 +1395,7 @@ class LeapSyntheticSource(FrameSource):
         orient: str = "none", fps: float = 30.0, paced: bool = True, raw_model: ls.FisheyeModel | None = None,
         baseline_mm: float = ls.CONTROLLER_BASELINE_MM, speed: float = 1.0, absences: bool = True, sample_step: int = 4,
         hand_frame: str = "auto", true_frame: str = DEFAULT_HAND_FRAME, skeletons: bool = True, alignment: str = "none",
+        far_mm: float = 450.0,
     ) -> None:
         if orient not in ls.ORIENTATIONS:
             raise ValueError(f"orient must be one of {ls.ORIENTATIONS}")
@@ -1378,9 +1408,12 @@ class LeapSyntheticSource(FrameSource):
         self.swap, self.orient, self.fps, self.paced = bool(swap), orient, float(fps), paced
         self.raw_model = raw_model or ls.FisheyeModel()
         self.baseline_mm, self.speed, self.absences = float(baseline_mm), float(speed), absences
+        self.far_mm = float(far_mm)
         self.alignment = ls.CameraAlignment() if alignment == "auto" else ls.CameraAlignment.parse(alignment)  # the stand-in cameras are co-aligned: auto means none
         self.rectifier = ls.Rectifier(self.raw_model.ray_to_pixel, self.raw_model.width, self.raw_model.height, self.view, sample_step=sample_step, alignment=self.alignment)
         self.stereo = ls.StereoDepth(self.baseline_mm, self.view.fx, self.params, self.swap)
+        self.temporal = self.stereo.temporal_filter()
+        self.last_stats: dict[str, float] = {}
         self.projector = HandProjector(self.view, self.baseline_mm, self.swap, self.orient, hand_frame)
         self.true_frame = HAND_FRAME_BY_NAME[true_frame]
         self.skeletons = bool(skeletons)
@@ -1391,8 +1424,16 @@ class LeapSyntheticSource(FrameSource):
         self.last_depth: np.ndarray | None = None
         self.last_hands: tuple[TrackedHand, ...] = ()
 
+    @property
+    def intrinsics(self) -> tuple[float, float, float, float]:
+        """The rectified view's pinhole ``(fx, fy, cx, cy)``, turned with ``orient`` like the depth image (``leap_stereo.reorient_intrinsics``)."""
+        v = self.view
+        return ls.reorient_intrinsics(v.fx, v.fy, v.cx, v.cy, v.width, v.height, self.orient)
+
     def start(self) -> None:
         self._origin = None
+        if self.temporal is not None:
+            self.temporal.reset()
 
     def scene(self, t: float) -> ls.SyntheticStereoScene:
         return ls.SyntheticStereoScene(ls.hand_shapes(t, self.absences), self.baseline_mm)
@@ -1416,8 +1457,12 @@ class LeapSyntheticSource(FrameSource):
         """Depth image (uint16 mm, reoriented) at script time ``t``; the raw and rectified pairs are kept in ``last_*``."""
         raw_left, raw_right = self.scene(t).raw_pair(self.raw_model)
         left, right = self.rectifier.rectify_pair(raw_left, raw_right)
-        depth = ls.reorient(self.stereo.compute(left, right), self.orient)
+        depth = self.stereo.compute(left, right)
+        if self.temporal is not None:
+            depth = self.temporal.push(depth)
+        depth = ls.reorient(depth, self.orient)
         self.last_pair, self.last_rectified, self.last_depth = (raw_left, raw_right), (left, right), depth
+        self.last_stats = ls.depth_statistics(depth, self.params.min_depth_mm, self.far_mm)
         return depth
 
     def tracked_hands(self, t: float, depth: np.ndarray) -> tuple[TrackedHand, ...]:
@@ -1429,7 +1474,7 @@ class LeapSyntheticSource(FrameSource):
     def frame_at(self, t: float, timestamp: float | None = None) -> DepthFrame:
         depth = self.render(t)
         hands = self.tracked_hands(t, depth) if self.skeletons else None
-        return DepthFrame(depth, t if timestamp is None else timestamp, hands)
+        return LeapDepthFrame(depth, t if timestamp is None else timestamp, hands, dict(self.last_stats))
 
     def read(self) -> DepthFrame:
         now = time.perf_counter()
@@ -1457,7 +1502,7 @@ DEFAULT_VIEW = (480, 360)
 DEFAULT_FOV_DEG = 90.0
 #: The bridge's surface scan for the Leap sources: 3 view pixels per cell at the default view, so a finger (13 px) spans 4 cells.
 DEFAULT_SURFACE = (160, 120)
-STEREO_MODES = ("sgbm", "hh", "3way")
+STEREO_MODES = ("sgbm", "hh", "hh4", "3way")
 STEREO_MATCHERS = ("sgbm", "bm")
 
 
@@ -1479,15 +1524,36 @@ def add_stereo_arguments(p: argparse.ArgumentParser | Any, prefix: str = "leap-"
     p.add_argument(f"--{prefix}matcher", choices=STEREO_MATCHERS, default=d.matcher, help="sgbm or plain block matching (bm: faster, far sparser on skin) (default: %(default)s)")
     p.add_argument(f"--{prefix}align", default="auto", metavar="MODE", help="right-camera alignment: 'auto' (fitted from feature matches in the first frames, default), 'none', or PITCH,ROLL[,YAW] in degrees")
     p.add_argument(f"--{prefix}calibration", choices=CALIBRATIONS, default="function", help="rectify with LeapRectilinearToPixel (function, default) or the images' 64x64 distortion lattice")
+    add_distance_arguments(p, prefix)
+
+
+def add_distance_arguments(p: argparse.ArgumentParser | Any, prefix: str = "leap-") -> None:
+    """The flags that keep a dim, far hand matchable (input gain, smoothness, hole filling, temporal median); see the README's tuning section."""
+    d = ls.StereoParams()
+    p.add_argument(f"--{prefix}contrast", choices=ls.CONTRAST_MODES, default=d.contrast, help="level the rectified pair before matching: 'gain' divides by the local mean so a dim far hand matches like a bright near one, 'lcn' normalises local contrast (loses the shading skin is matched on), 'none' (default: %(default)s)")
+    p.add_argument(f"--{prefix}contrast-window", type=int, default=d.contrast_window, help="window of the local mean/contrast, odd pixels of the view (default: %(default)s)")
+    p.add_argument(f"--{prefix}p1", type=int, default=d.p1, help="SGBM smoothness penalty for a 1-px disparity change, per block pixel: P1 = N * block^2 (default: %(default)s)")
+    p.add_argument(f"--{prefix}p2", type=int, default=d.p2, help="SGBM penalty for larger disparity changes, per block pixel: P2 = N * block^2 (default: %(default)s)")
+    p.add_argument(f"--{prefix}speckle", type=int, default=d.speckle_window, help="drop matched patches smaller than this many pixels at 320x240 (scaled with the view's area); 0 = off (default: %(default)s)")
+    p.add_argument(f"--{prefix}fill-radius", type=int, default=d.fill_radius, help="fill holes up to about twice this many pixels wide from the surrounding depth where it agrees; 0 = off (default: %(default)s)")
+    p.add_argument(f"--{prefix}temporal", type=int, default=d.temporal, help="median of the last N depth maps where they agree with the newest one (noise / sqrt(N), holes filled from older frames, no smearing of a moving hand); 0 or 1 = off (default: %(default)s)")
 
 
 def stereo_params_from_args(args: argparse.Namespace, min_depth_mm: float, prefix: str = "leap_") -> ls.StereoParams:
-    """:class:`leap_stereo.StereoParams` from the flags :func:`add_stereo_arguments` declares (``prefix`` with underscores)."""
-    def get(name: str) -> Any:
-        return getattr(args, prefix + name)
+    """:class:`leap_stereo.StereoParams` from the flags :func:`add_stereo_arguments` declares (``prefix`` with underscores).
+
+    The distance flags (:func:`add_distance_arguments`) fall back to their
+    defaults when a parser does not declare them.
+    """
+    d = ls.StereoParams()
+
+    def get(name: str, default: Any = None) -> Any:
+        return getattr(args, prefix + name) if default is None else getattr(args, prefix + name, default)
     return ls.StereoParams(
         min_depth_mm=min_depth_mm, min_intensity=get("min_intensity"), max_intensity=get("max_intensity"), min_lit=get("min_lit"),
         min_texture=get("min_texture"), uniqueness=get("uniqueness"), block_size=get("block"), mode=get("mode"), matcher=get("matcher"),
+        contrast=get("contrast", d.contrast), contrast_window=get("contrast_window", d.contrast_window), p1=get("p1", d.p1), p2=get("p2", d.p2),
+        speckle_window=get("speckle", d.speckle_window), fill_radius=get("fill_radius", d.fill_radius), temporal=get("temporal", d.temporal),
     )
 
 
@@ -1539,8 +1605,10 @@ def dump_images(source: LeapStereoSource | LeapSyntheticSource, count: int, out_
             hint = ""
             if inbox_other > 2 * max(inbox, 50):
                 hint = " <- the OTHER camera order puts far more pixels in the box: " + ("drop" if stereo.swap else "add") + " --swap-cameras"
-            log.info("frame %d: %dx%d, %d valid px, %d in [%.0f, %.0f] mm (swapped order: %d)%s, left mean %.1f",
-                     i, depth.shape[1], depth.shape[0], valid, inbox, near_mm, far_mm, inbox_other, hint, float(left.mean()))
+            stats = source.last_stats
+            log.info("frame %d: %dx%d, %d valid px, %d in [%.0f, %.0f] mm (swapped order: %d)%s, left mean %.1f; foreground valid %.0f%%, depth noise %.1f mm",
+                     i, depth.shape[1], depth.shape[0], valid, inbox, near_mm, far_mm, inbox_other, hint, float(left.mean()),
+                     100.0 * stats.get("depthValidFraction", 0.0), stats.get("depthNoiseMm", 0.0))
             matches = ls.match_pair(left, right)
             if len(matches):
                 rows = matches[:, 3] - matches[:, 1]
@@ -1606,9 +1674,9 @@ def main(argv: list[str] | None = None) -> int:
         view = ls.RectifiedView.from_fov(args.view[0], args.view[1], args.fov)
         params = stereo_params_from_args(args, args.near * 1000.0, prefix="")
         if args.synthetic:
-            source = LeapSyntheticSource(view, params, args.swap_cameras, args.orient, fps=args.fps, paced=False, hand_frame=args.hand_frame)
+            source = LeapSyntheticSource(view, params, args.swap_cameras, args.orient, fps=args.fps, paced=False, hand_frame=args.hand_frame, far_mm=args.far * 1000.0)
         else:
-            source = LeapStereoSource(args.leapc, view, params, args.swap_cameras, args.orient, fps=args.fps, hand_frame=args.hand_frame, alignment=args.align, calibration=args.calibration)
+            source = LeapStereoSource(args.leapc, view, params, args.swap_cameras, args.orient, fps=args.fps, hand_frame=args.hand_frame, alignment=args.align, calibration=args.calibration, far_mm=args.far * 1000.0)
         dump_images(source, args.dump_images, args.out, args.near * 1000.0, args.far * 1000.0)
     except (RuntimeError, ValueError) as exc:
         log.error("%s", exc)

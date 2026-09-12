@@ -53,6 +53,21 @@ Geometry conventions
   replaces it under the model, ``off`` leaves it alone), so the scan, the
   voxels, the occupancy and the blobs agree with the skeleton;
   ``stats.scanModelFraction`` says how much of the foreground came from it.
+* ``--frame upright`` (:class:`UprightGeometry`) is for a camera lying on the
+  desk and looking up, the Leap Motion Controller's case. Every depth pixel
+  is turned into a METRIC point with the source's pinhole ``intrinsics`` and
+  the box is a metric volume centred on the optical axis, so ``u`` runs along
+  the device's long axis, ``v`` runs DOWN from the top of the height range
+  (``v = 0`` at ``far``, ``1`` at ``near``) and ``w`` grows across the device
+  toward the display. The scan is then a height field over the FRONT of that
+  box: per ``(u, v)`` cell the nearest ``w`` of the solid hand, which is the
+  measured underside extruded up by ``slab_mm`` plus the tracked hands'
+  capsules rendered orthographically from the front (:func:`render_front_view`,
+  ``scan_fusion.fuse_front``); the voxels and the occupancy grid come from
+  the same solid (:func:`voxelize_solid`). Lifting a hand no longer moves it
+  sideways, and the browser's default depth mapping (mirror x, flip y, keep
+  w as z) puts reaching over the device into the scene. Image mode is
+  untouched.
 
 Dependencies: ``numpy`` and ``websockets`` (``pip install numpy websockets``).
 Optional: ``opencv-python`` for multi-blob connected components and for the
@@ -95,8 +110,8 @@ MAX_OCCUPANCY_SIDE = 256  # bridgeHelloSchema: occupancy width/height.max(256)
 MAX_VOXEL_SIDE = 128      # bridgeHelloSchema: voxels nx/ny/nz.max(128)
 MAX_SURFACE_SIDE = 512    # bridgeHelloSchema: surface width/height.max(512)
 #: How a tracked hand's capsule model is fused into the depth before the scan (``scan_fusion.fuse_depth``).
-SCAN_FUSE_MODES = ("off", "fill", "model")
-DEFAULT_SCAN_FUSE = "fill"
+SCAN_FUSE_MODES = ("off", "fill", "model", "blend")
+DEFAULT_SCAN_FUSE = "blend"
 DEFAULT_FUSE_TOLERANCE_MM = 40.0
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -104,6 +119,25 @@ DEFAULT_PORT = 8765
 log = logging.getLogger("depth_bridge")
 
 Vec3 = tuple[float, float, float]
+#: A pinhole's ``(fx, fy, cx, cy)`` in pixels of the depth image; see :attr:`FrameSource.intrinsics` for the convention.
+Intrinsics = tuple[float, float, float, float]
+#: How the box is oriented: ``image`` (u/v follow the camera image, w its depth) or ``upright`` (a metric box for a camera looking up).
+FRAMES = ("image", "upright")
+DEFAULT_FRAME = "image"
+#: Upright mode's metric box, ``(width across, depth toward the display)`` in mm: 16:9 x 350 mm of height range by 350 mm.
+DEFAULT_BOX_MM = (620.0, 350.0)
+#: How far the measured underside of a hand is extruded upward to make it a solid, in mm (hands and fingers are about that thick).
+DEFAULT_SLAB_MM = 30.0
+#: Reach cells of the front-view solid (``AnalyzerConfig.front_wcells``); 48 over the default 350 mm is 7 mm a cell.
+DEFAULT_FRONT_WCELLS = 48
+#: The front view's working grid ``(cols, rows)`` when ``--no-surface`` leaves no surface grid to size it.
+DEFAULT_FRONT_GRID = (64, 48)
+#: The hand model is rasterised from the front on cells at most this big (mm) before being reduced into the grid, so fingers survive a coarse scan.
+MODEL_CELL_MM = 4.0
+UPRIGHT_NEEDS_INTRINSICS = (
+    "--frame upright needs the depth image's intrinsics (fx, fy, cx, cy in pixels) to turn pixels into millimetres, "
+    "and this source provides none: use a Leap, synthetic or RealSense source, or --frame image"
+)
 
 # Skeleton joint layout, shared by every source that tracks hands and by the wire format: 28 points per hand.
 JOINT_PALM, JOINT_WRIST, JOINT_ELBOW = 0, 1, 2
@@ -226,6 +260,23 @@ class FrameSource(ABC):
     #: Focal length of the depth image in pixels when it is a perspective view (square pixels), else ``None``.
     #: It sizes the relief of the fused hand model; :func:`source_focal_px` also reads it off a Leap source's ``view``.
     focal_px: float | None = None
+    #: True when :attr:`intrinsics` are only known once ``start()`` has opened the device (the RealSense reads them off
+    #: its stream profile); ``start()`` must then be safe to call twice.
+    intrinsics_after_start: bool = False
+
+    @property
+    def intrinsics(self) -> Intrinsics | None:
+        """``(fx, fy, cx, cy)`` of the depth image ``read()`` returns, in pixels, or ``None`` for a source without a pinhole model.
+
+        ``cx``/``cy`` are in edge coordinates: pixel index ``i`` spans
+        ``[i, i + 1)`` and its centre is at ``i + 0.5``, so the ray through
+        pixel ``(col, row)`` at depth ``d`` mm hits ``X = (col + 0.5 - cx) *
+        d / fx`` across and ``V = (row + 0.5 - cy) * d / fy`` down (the
+        convention of ``leap_stereo.RectifiedView``, whose ``cx`` is
+        ``width / 2``). Only ``--frame upright`` uses them; a source that has
+        turned its image (``--leap-orient``) reports the turned pinhole.
+        """
+        return None
 
     def start(self) -> None:
         """Open the device. Called once before the first ``read()``."""
@@ -268,6 +319,9 @@ class SyntheticSource(FrameSource):
 
     name = "synthetic"
     skeleton = True
+    #: The virtual pinhole the performer is seen through in ``--frame upright``: this many degrees across the width, square
+    #: pixels, principal point at the centre. Image mode never looks at it.
+    hfov_deg = 90.0
 
     def __init__(
         self,
@@ -295,6 +349,11 @@ class SyntheticSource(FrameSource):
         self._next_due = 0.0
         self._xs = (np.arange(width, dtype=np.float32) + 0.5) / width
         self._ys = (np.arange(height, dtype=np.float32) + 0.5) / height
+
+    @property
+    def intrinsics(self) -> Intrinsics:
+        focal = self.width / (2.0 * math.tan(math.radians(self.hfov_deg) / 2.0))
+        return (focal, focal, self.width / 2.0, self.height / 2.0)
 
     def start(self) -> None:
         self._origin = None
@@ -399,6 +458,7 @@ class RealSenseSource(FrameSource):
     """
 
     name = "realsense"
+    intrinsics_after_start = True  # they come with the stream profile, so start() is idempotent and may be called early
 
     def __init__(self, width: int = 640, height: int = 480, fps: float = 30.0, decimation: int = 0, hole_filling: bool = False) -> None:
         self.width, self.height, self.fps = width, height, float(fps)
@@ -406,8 +466,16 @@ class RealSenseSource(FrameSource):
         self._pipeline: Any = None
         self._filters: list[Any] = []
         self._mm_per_unit = 1.0
+        self._intrinsics: Intrinsics | None = None
+
+    @property
+    def intrinsics(self) -> Intrinsics | None:
+        """The depth stream's pinhole once started (``ppx``/``ppy`` are pixel-centre coordinates: ``+0.5`` makes them edge ones), scaled by the decimation."""
+        return self._intrinsics
 
     def start(self) -> None:
+        if self._pipeline is not None:
+            return
         try:
             import pyrealsense2 as rs  # type: ignore[import-not-found]
         except ImportError as exc:
@@ -421,6 +489,13 @@ class RealSenseSource(FrameSource):
         profile = pipeline.start(config)
         depth_scale = float(profile.get_device().first_depth_sensor().get_depth_scale())  # metres per unit
         self._mm_per_unit = depth_scale * 1000.0
+        try:
+            intr = profile.get_stream(rs.stream.depth).as_video_stream_profile().get_intrinsics()
+            scale = float(self.decimation) if self.decimation > 0 else 1.0  # the decimation filter shrinks the image and its pinhole alike
+            self._intrinsics = (float(intr.fx) / scale, float(intr.fy) / scale, (float(intr.ppx) + 0.5) / scale, (float(intr.ppy) + 0.5) / scale)
+        except Exception as exc:  # noqa: BLE001 - only --frame upright needs them
+            log.warning("RealSense intrinsics unavailable (%s); --frame upright will not work", exc)
+            self._intrinsics = None
         self._filters = []
         if self.decimation > 0:
             dec = rs.decimation_filter()
@@ -508,6 +583,15 @@ class BoxConfig:
     bounds it laterally. ``box_x``/``box_y`` are the box's metric extents,
     reported in ``hello`` for humans and telemetry only; the bridge never uses
     them for maths because it has no intrinsics.
+
+    ``frame = "upright"`` changes what the box is: the camera lies on the desk
+    looking up, ``near_m``/``far_m`` become the HEIGHT range above it, and
+    laterally the box is a metric rectangle ``box_mm = (W, D)`` (across the
+    device's long axis, and toward the display) centred ``box_center_mm =
+    (X0, Z0)`` from the optical axis; the ROI is then only a crop of the
+    image, the normalization is metric (:class:`UprightGeometry`).
+    ``reach_sign`` says which image-down direction faces the display (+1:
+    image down, -1: image up), since that depends on how the device is placed.
     """
 
     near_m: float = 0.4
@@ -515,6 +599,10 @@ class BoxConfig:
     roi: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
     box_x: tuple[float, float] = (-0.5, 0.5)
     box_y: tuple[float, float] = (-0.4, 0.4)
+    frame: str = DEFAULT_FRAME
+    box_mm: tuple[float, float] = DEFAULT_BOX_MM
+    box_center_mm: tuple[float, float] = (0.0, 0.0)
+    reach_sign: int = 1
 
     def __post_init__(self) -> None:
         if not (0.0 <= self.near_m < self.far_m):
@@ -522,6 +610,14 @@ class BoxConfig:
         x0, y0, x1, y1 = self.roi
         if not (0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0):
             raise ValueError(f"roi must satisfy 0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1, got {self.roi}")
+        if self.frame not in FRAMES:
+            raise ValueError(f"frame must be one of {FRAMES}, got {self.frame!r}")
+        if len(self.box_mm) != 2 or not all(math.isfinite(s) and s > 0.0 for s in self.box_mm):
+            raise ValueError(f"box-mm must be two positive sizes (width, depth) in millimetres, got {self.box_mm}")
+        if len(self.box_center_mm) != 2 or not all(math.isfinite(c) for c in self.box_center_mm):
+            raise ValueError(f"box-center must be two finite millimetre offsets, got {self.box_center_mm}")
+        if self.reach_sign not in (1, -1):
+            raise ValueError(f"reach-sign must be +1 or -1, got {self.reach_sign}")
 
     @property
     def near_mm(self) -> float:
@@ -530,6 +626,37 @@ class BoxConfig:
     @property
     def far_mm(self) -> float:
         return self.far_m * 1000.0
+
+    @property
+    def span_mm(self) -> float:
+        """The depth (image mode) or height (upright mode) range in millimetres."""
+        return (self.far_m - self.near_m) * 1000.0
+
+    @property
+    def upright(self) -> bool:
+        return self.frame == "upright"
+
+    @property
+    def width_mm(self) -> float:
+        """Upright mode: the box across the device (``u`` spans it)."""
+        return float(self.box_mm[0])
+
+    @property
+    def depth_mm(self) -> float:
+        """Upright mode: the box toward the display (``w`` spans it)."""
+        return float(self.box_mm[1])
+
+    @property
+    def x_range_mm(self) -> tuple[float, float]:
+        """Upright mode: the box's extent across, ``u = 0`` to ``u = 1``, in mm from the optical axis."""
+        half = self.width_mm / 2.0
+        return (float(self.box_center_mm[0]) - half, float(self.box_center_mm[0]) + half)
+
+    @property
+    def z_range_mm(self) -> tuple[float, float]:
+        """Upright mode: the box's extent along the reach axis, ``w = 0`` (the glass) to ``w = 1`` (toward the display), in mm."""
+        half = self.depth_mm / 2.0
+        return (float(self.box_center_mm[1]) - half, float(self.box_center_mm[1]) + half)
 
     def roi_pixels(self, width: int, height: int) -> tuple[int, int, int, int]:
         """The ROI as ``(x0, y0, x1, y1)`` pixel bounds (exclusive max), at least 1x1."""
@@ -563,8 +690,15 @@ class AnalyzerConfig:
     the voxels and the scan are computed from it: ``fill`` keeps a measurement
     that exists and agrees with the model within ``fuse_tolerance_mm``, takes
     the model where the measurement is missing or disagrees, and leaves pixels
-    outside the model alone; ``model`` takes the model wherever it has a
-    surface; ``off`` is a plain depth camera.
+    outside the model alone; ``blend`` is ``fill`` with the measurement
+    median-smoothed under the model and mixed toward the model by its local
+    noise and its depth (a far, noisy hand reads as the smooth model);
+    ``model`` takes the model wherever it has a surface; ``off`` is a plain
+    depth camera.
+    In upright mode (:class:`BoxConfig.frame`), ``slab_mm`` is how far the
+    measured underside is extruded upward to make the hand a solid, and
+    ``front_wcells`` how many reach cells the front-view solid has (the scan
+    keeps the exact reach; the cells only bin the extrusion and the voxels).
     """
 
     occupancy: tuple[int, int] | None = (32, 24)
@@ -581,12 +715,18 @@ class AnalyzerConfig:
     hand_margin: float = 0.25
     scan_fuse: str = DEFAULT_SCAN_FUSE
     fuse_tolerance_mm: float = DEFAULT_FUSE_TOLERANCE_MM
+    slab_mm: float = DEFAULT_SLAB_MM
+    front_wcells: int = DEFAULT_FRONT_WCELLS
 
     def __post_init__(self) -> None:
         if self.scan_fuse not in SCAN_FUSE_MODES:
             raise ValueError(f"scan_fuse must be one of {SCAN_FUSE_MODES}, got {self.scan_fuse!r}")
         if not (self.fuse_tolerance_mm >= 0.0):
             raise ValueError("fuse_tolerance_mm must be non-negative")
+        if not (math.isfinite(self.slab_mm) and self.slab_mm >= 0.0):
+            raise ValueError("slab_mm must be non-negative")
+        if not (1 <= self.front_wcells <= 256):
+            raise ValueError(f"front_wcells must be 1..256, got {self.front_wcells}")
         if self.occupancy is not None:
             w, h = self.occupancy
             if not (1 <= w <= MAX_OCCUPANCY_SIDE and 1 <= h <= MAX_OCCUPANCY_SIDE):
@@ -673,23 +813,116 @@ class SkeletonHand:
 MIN_TRACKED_CONF = 0.5
 
 
-def normalize_tracked_hand(hand: TrackedHand, roi: tuple[int, int, int, int], near_mm: float, far_mm: float, sample_points: int = MAX_POINTS) -> SkeletonHand:
+@dataclass(frozen=True)
+class UprightGeometry:
+    """The metric box of ``--frame upright`` and the pinhole that puts depth pixels into it.
+
+    A depth pixel ``(col, row, d mm)`` of the (whole, un-cropped) image is
+    first made metric with the intrinsics, ``X = (col + 0.5 - cx) * d / fx``
+    across the image, ``V = (row + 0.5 - cy) * d / fy`` down the image and
+    ``Y = d`` along the optical axis (the height above a device looking up),
+    then normalized into the box::
+
+        u = (X - x_lo) / W                 x_lo = X0 - W / 2      (along the device's long axis)
+        v = 1 - (Y - near) / (far - near)  v = 0 at the top of the height range, 1 at the bottom
+        w = (s * V - z_lo) / D             z_lo = Z0 - D / 2, s = reach_sign  (toward the display)
+
+    which is the same ``[u right, v down, w deep]`` layout as image mode, so
+    the browser's default depth mapping (mirror x, flip y so image-down
+    becomes sim-up, w = z) needs no change: height becomes sim y and reaching
+    across the device toward the display becomes sim z. It is orthographic:
+    a hand lifted straight up keeps its ``u`` and ``w``. Widths in pixels at
+    a depth become millimetres (``px * d / fx``) and then fractions of ``W``.
+    The joint coordinates a source reports (integer = pixel centre) use the
+    same ``+ 0.5`` as pixel indices, so joints and pixels share the maths.
+    """
+
+    intrinsics: Intrinsics
+    box: BoxConfig
+
+    def __post_init__(self) -> None:
+        if len(self.intrinsics) != 4 or not all(math.isfinite(float(c)) for c in self.intrinsics):
+            raise ValueError(f"intrinsics must be four finite numbers (fx, fy, cx, cy), got {self.intrinsics}")
+        fx, fy = float(self.intrinsics[0]), float(self.intrinsics[1])
+        if not (fx > 0.0 and fy > 0.0):
+            raise ValueError("focal lengths must be positive")
+        if not self.box.upright:
+            raise ValueError("UprightGeometry needs a BoxConfig with frame='upright'")
+
+    def metric_from_pixels(self, cols: Any, rows: Any, depth_mm: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """``(X, V, Y)`` in millimetres of pixel-centre coordinates ``cols``/``rows`` (whole image) at ``depth_mm``; arrays broadcast."""
+        fx, fy, cx, cy = (float(c) for c in self.intrinsics)
+        d = np.asarray(depth_mm, dtype=np.float64)
+        x = (np.asarray(cols, dtype=np.float64) + 0.5 - cx) * d / fx
+        v = (np.asarray(rows, dtype=np.float64) + 0.5 - cy) * d / fy
+        return x, v, d
+
+    def pixels_from_metric(self, x: Any, v: Any, y: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """The inverse of :meth:`metric_from_pixels`: pixel-centre ``(cols, rows, depth_mm)`` of metric points (``y > 0``)."""
+        fx, fy, cx, cy = (float(c) for c in self.intrinsics)
+        y_arr = np.asarray(y, dtype=np.float64)
+        cols = cx + np.asarray(x, dtype=np.float64) * fx / y_arr - 0.5
+        rows = cy + np.asarray(v, dtype=np.float64) * fy / y_arr - 0.5
+        return cols, rows, y_arr
+
+    def unit_from_metric(self, x: Any, v: Any, y: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Box units ``(u, v, w)`` of metric ``(X, V, Y)`` millimetres, unclamped."""
+        box = self.box
+        u = (np.asarray(x, dtype=np.float64) - box.x_range_mm[0]) / box.width_mm
+        down = 1.0 - (np.asarray(y, dtype=np.float64) - box.near_mm) / box.span_mm
+        w = (box.reach_sign * np.asarray(v, dtype=np.float64) - box.z_range_mm[0]) / box.depth_mm
+        return u, down, w
+
+    def metric_from_unit(self, u: Any, v: Any, w: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """The inverse of :meth:`unit_from_metric`."""
+        box = self.box
+        x = box.x_range_mm[0] + np.asarray(u, dtype=np.float64) * box.width_mm
+        y = box.near_mm + (1.0 - np.asarray(v, dtype=np.float64)) * box.span_mm
+        side = box.reach_sign * (box.z_range_mm[0] + np.asarray(w, dtype=np.float64) * box.depth_mm)
+        return x, side, y
+
+    def unit_from_pixels(self, cols: Any, rows: Any, depth_mm: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Box units of depth pixels: :meth:`metric_from_pixels` then :meth:`unit_from_metric`."""
+        return self.unit_from_metric(*self.metric_from_pixels(cols, rows, depth_mm))
+
+    def width_to_u(self, width_px: Any, depth_mm: Any) -> np.ndarray:
+        """A diameter in pixels at ``depth_mm`` as a fraction of the box width (metric, so it no longer depends on the height)."""
+        fx = float(self.intrinsics[0])
+        return np.asarray(width_px, dtype=np.float64) * np.asarray(depth_mm, dtype=np.float64) / fx / self.box.width_mm
+
+
+def normalize_tracked_hand(
+    hand: TrackedHand, roi: tuple[int, int, int, int], near_mm: float, far_mm: float, sample_points: int = MAX_POINTS,
+    upright: UprightGeometry | None = None,
+) -> SkeletonHand:
     """Normalize a :class:`TrackedHand` with the same box as the pixels: ``u``/``v`` over the ROI, ``w`` over the depth range.
 
     A pixel-centre coordinate ``c`` (integer = centre) becomes
     ``(c + 0.5 - roi_start) / roi_size``, the rule the blob centroids and the
     grids use, so a joint and the scan cell under it agree. Widths divide by
     the ROI width. Nothing is clamped here; ``sample_points == 0`` (``--points
-    0``) suppresses the point list like it does for blobs.
+    0``) suppresses the point list like it does for blobs. With ``upright``
+    the joints go through the metric box instead (:class:`UprightGeometry`;
+    the ROI is then irrelevant) and the widths become millimetres at their own
+    part's depth (the palm's, the wrist's for the forearm, a finger's mean)
+    over the box width.
     """
     x0, y0, x1, y1 = roi
     rw, rh = float(x1 - x0), float(y1 - y0)
     src = hand.joints
     joints = np.empty_like(src)
-    joints[:, 0] = (src[:, 0] + 0.5 - x0) / rw
-    joints[:, 1] = (src[:, 1] + 0.5 - y0) / rh
-    joints[:, 2] = (src[:, 2] - near_mm) / (far_mm - near_mm)
-    widths = hand.widths_px / rw
+    if upright is None:
+        joints[:, 0] = (src[:, 0] + 0.5 - x0) / rw
+        joints[:, 1] = (src[:, 1] + 0.5 - y0) / rh
+        joints[:, 2] = (src[:, 2] - near_mm) / (far_mm - near_mm)
+        widths = hand.widths_px / rw
+    else:
+        joints[:, 0], joints[:, 1], joints[:, 2] = upright.unit_from_pixels(src[:, 0], src[:, 1], src[:, 2])
+        depth_of_part = np.empty(N_WIDTHS, dtype=np.float64)
+        depth_of_part[WIDTH_PALM], depth_of_part[WIDTH_ARM] = src[JOINT_PALM, 2], src[JOINT_WRIST, 2]
+        for f in range(N_FINGERS):
+            depth_of_part[WIDTH_FINGERS + f] = hand.finger(f)[:, 2].mean()
+        widths = upright.width_to_u(hand.widths_px, depth_of_part)
     palm = joints[JOINT_PALM]
     tips = [joints[finger_joint(f, JOINTS_PER_FINGER - 1)] for f in range(N_FINGERS)]
     points: tuple[Vec3, ...] = tuple((float(p[0]), float(p[1]), float(p[2])) for p in (palm, *tips)) if sample_points > 0 else ()
@@ -896,6 +1129,89 @@ def scan_surface(roi_mm: np.ndarray, mask: np.ndarray, near_mm: float, far_mm: f
     return out
 
 
+def render_front_view(
+    u: np.ndarray, w: np.ndarray, height_mm: np.ndarray, near_mm: float, far_mm: float, depth_mm: float, slab_mm: float,
+    rows: int, cols: int, wcells: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """The measured underside of the foreground, extruded up by ``slab_mm``, seen from the FRONT of the upright box.
+
+    ``u``/``w`` are the in-box points' box units (across, toward the display)
+    and ``height_mm`` their height above the device (the camera's depth).
+    Returns ``(reach, occupancy)``: ``reach`` is ``float32`` of shape
+    ``(rows, cols)`` over ``(v down, u across)`` holding each cell's nearest
+    reach in millimetres from the box's front plane (``w * depth_mm``), or
+    ``inf`` where the solid does not cover the cell; ``occupancy`` is a bool
+    ``(rows, cols, wcells)`` grid of the same solid (``w`` binned into
+    ``wcells``), which the voxels are made from.
+
+    How: the points are min-scattered into a BOTTOM view ``(cols, wcells)``,
+    the lowest height per ``(u, w)`` column being the underside the camera
+    saw there and the smallest reach per column its front edge (one
+    ``np.minimum.at`` each over the points). A column's solid spans the
+    heights ``[y, y + slab]``, i.e. the front-view rows from the row of
+    ``y + slab`` down to the row of ``y`` (``v = 1 - (height - near) / (far -
+    near)``, clipped to the grid); comparing every row index against those two
+    bounds fills the ``(rows, cols, wcells)`` occupancy in three vector
+    operations, and the first occupied reach cell of each ``(row, col)``
+    (``argmax`` along ``w``) picks the column whose exact front edge the cell
+    reports. Cost is dominated by the ``rows x cols x wcells`` comparisons:
+    about 4 ms at 160x120x48 on a desktop for a hand of 30 000 points.
+    """
+    rows, cols, wcells = int(rows), int(cols), int(wcells)
+    span_mm = float(far_mm) - float(near_mm)
+    u = np.asarray(u, dtype=np.float64)
+    w = np.asarray(w, dtype=np.float64)
+    col = np.clip(np.floor(u * cols), 0, cols - 1).astype(np.int64)
+    cell = np.clip(np.floor(w * wcells), 0, wcells - 1).astype(np.int64)
+    flat = col * wcells + cell
+    y_min = np.full(cols * wcells, np.inf, dtype=np.float32)
+    np.minimum.at(y_min, flat, np.asarray(height_mm, dtype=np.float32))
+    reach_min = np.full(cols * wcells, np.inf, dtype=np.float32)
+    np.minimum.at(reach_min, flat, (w * float(depth_mm)).astype(np.float32))
+    filled = np.isfinite(y_min)
+    top = np.full(cols * wcells, rows, dtype=np.int16)  # an empty column occupies no row: top past the last, bottom before the first
+    bottom = np.full(cols * wcells, -1, dtype=np.int16)
+    if filled.any():
+        y = y_min[filled].astype(np.float64)
+        v_bottom = 1.0 - (y - float(near_mm)) / span_mm
+        v_top = 1.0 - (y + float(slab_mm) - float(near_mm)) / span_mm
+        bottom[filled] = np.clip(np.floor(v_bottom * rows), 0, rows - 1).astype(np.int16)
+        top[filled] = np.clip(np.floor(v_top * rows), 0, rows - 1).astype(np.int16)
+    top, bottom = top.reshape(cols, wcells), bottom.reshape(cols, wcells)
+    row_index = np.arange(rows, dtype=np.int16)[:, None, None]
+    occupancy = (row_index >= top[None, :, :]) & (row_index <= bottom[None, :, :])  # (rows, cols, wcells)
+    first = occupancy.argmax(axis=2)
+    has = occupancy.any(axis=2)
+    reach = reach_min.reshape(cols, wcells)[np.arange(cols)[None, :], first]
+    return np.where(has, reach, np.float32(np.inf)).astype(np.float32), occupancy
+
+
+@functools.lru_cache(maxsize=8)
+def _solid_tables(rows: int, cols: int, wcells: int, nx: int, ny: int, nz: int) -> tuple[np.ndarray, np.ndarray]:
+    """Per front-view cell its flat voxel index, and per voxel how many cells it holds (read-only, cached per pair of grids)."""
+    row_bin, col_bin, cell_bin = cell_bins(rows, ny), cell_bins(cols, nx), cell_bins(wcells, nz)
+    voxel = (cell_bin[None, None, :] * ny + row_bin[:, None, None]) * nx + col_bin[None, :, None]
+    area = (np.bincount(cell_bin, minlength=nz)[:, None, None] * np.bincount(row_bin, minlength=ny)[None, :, None]
+            * np.bincount(col_bin, minlength=nx)[None, None, :])
+    return np.ascontiguousarray(voxel, dtype=np.int32).ravel(), area
+
+
+def voxelize_solid(occupancy: np.ndarray, nx: int, ny: int, nz: int) -> np.ndarray:
+    """The front-view solid (:func:`render_front_view`'s ``(rows, cols, wcells)`` occupancy) as a ``(nz, ny, nx)`` ``uint8`` voxel grid.
+
+    Each voxel holds the fraction of its front-view cells that are solid,
+    scaled to 0..255, with the same pixel-centre binning rule as
+    :func:`voxelize` (:func:`cell_bins`) along all three axes, so a scanned
+    cell and the voxel holding it agree. Layout as on the wire: slab 0 is
+    ``w = 0`` (the glass), row 0 the top of the box, x across.
+    """
+    rows, cols, wcells = occupancy.shape
+    voxel, area = _solid_tables(int(rows), int(cols), int(wcells), int(nx), int(ny), int(nz))
+    counts = np.bincount(np.take(voxel, np.flatnonzero(occupancy)), minlength=nx * ny * nz)
+    frac = counts.reshape(nz, ny, nx) / np.maximum(area, 1)
+    return np.clip(np.round(frac * 255.0), 0, 255).astype(np.uint8)
+
+
 def label_components(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Connected components of a boolean mask.
 
@@ -1005,21 +1321,192 @@ class BoxAnalyzer:
     module docstring). ``focal_px`` is the depth image's focal length when it
     is a perspective view (:func:`source_focal_px`); without one the model's
     relief is scaled as if the box were isotropic.
+
+    With an upright box (``box.frame == "upright"``) the source's
+    ``intrinsics`` are required and :meth:`_analyze_upright` runs instead:
+    pixels become metric points (:class:`UprightGeometry`), the mask is the
+    pixels whose point is inside the metric box (opened as usual), the blobs
+    are still connected components of that mask but measured from their
+    metric points (``pos`` the centroid of the solid, i.e. the underside's
+    centroid raised by half the slab, ``w`` its nearest reach percentile), and
+    the scan, the voxels and the occupancy grid come from the front-view
+    solid (:func:`render_front_view`) into which the tracked hands' capsules
+    are fused from the front (``scan_fusion.fuse_front``).
     """
 
-    def __init__(self, box: BoxConfig, config: AnalyzerConfig | None = None, focal_px: float | None = None) -> None:
+    def __init__(self, box: BoxConfig, config: AnalyzerConfig | None = None, focal_px: float | None = None, intrinsics: Intrinsics | None = None) -> None:
         self.box = box
         self.config = config or AnalyzerConfig()
         self.focal_px = None if focal_px is None else float(focal_px)
         if self.focal_px is not None and not (self.focal_px > 0.0):
             raise ValueError("focal_px must be positive")
+        self.intrinsics: Intrinsics | None = None if intrinsics is None else tuple(float(c) for c in intrinsics)  # type: ignore[assignment]
+        self.upright: UprightGeometry | None = None
+        if box.upright:
+            if self.intrinsics is None:
+                raise ValueError(UPRIGHT_NEEDS_INTRINSICS)
+            self.upright = UprightGeometry(self.intrinsics, box)
         self.tracker = BlobTracker(self.config.max_jump, self.config.max_missed)
         self._rate = RateMeter()
         self._fusion = _import_scan_fusion() if self.config.scan_fuse != "off" else None
         self._model_canvas: np.ndarray | None = None  # reused across frames: a fresh 1 MB float32 image costs more than rendering into it
+        self._front_canvas: np.ndarray | None = None  # upright mode: the model's front and back faces over the front-view grid
+        self._back_canvas: np.ndarray | None = None
+
+    def _front_hands(self, hands: Sequence[SkeletonHand], rows: int, cols: int, reach_sign: float = 1.0) -> list[TrackedHand]:
+        """The normalized hands in front-view grid units: joints ``(col, row, reach mm)`` with integer = cell centre, widths in columns.
+
+        ``reach_sign = -1`` negates the reach, which renders the BACK face of
+        the capsules through the same nearest-surface rasteriser.
+        """
+        depth_mm = self.box.depth_mm
+        out: list[TrackedHand] = []
+        for hand in hands:
+            joints = np.empty_like(hand.joints)
+            joints[:, 0] = hand.joints[:, 0] * cols - 0.5
+            joints[:, 1] = hand.joints[:, 1] * rows - 0.5
+            joints[:, 2] = hand.joints[:, 2] * depth_mm * reach_sign
+            out.append(TrackedHand(id=hand.id, type=hand.type, joints=joints, widths_px=hand.widths * cols, extended=hand.extended, has_elbow=hand.has_elbow))
+        return out
+
+    def _front_model(self, hands: Sequence[SkeletonHand], rows: int, cols: int) -> tuple[np.ndarray, np.ndarray, Any]:
+        """The hands' capsules rendered orthographically from the front of the box: ``(front reach mm, back reach mm, bounds)`` over the ``(rows, cols)`` grid, ``inf`` where none.
+
+        Like the image-space model, which is rendered at pixel resolution and
+        min-reduced into the scan, the capsules are rasterised on a raster
+        fine enough for a finger to be several cells wide (an integer
+        multiple ``k`` of the grid with cells of at most
+        :data:`MODEL_CELL_MM`) and then block-reduced: the nearest front face
+        and the farthest back face per grid cell. The raster's cells are
+        ``W / cols`` wide and ``span / rows`` tall, so the rasteriser gets
+        ``row_scale`` to keep the tubes round; radii are millimetres over the
+        column size and the relief comes out in millimetres of reach, so a
+        capsule seen from the front is a rounded tube ``reach - relief``.
+        ``bounds`` is the model's bounding box on the grid, or ``None``.
+        """
+        assert self._fusion is not None
+        box = self.box
+        k = max(1, int(math.ceil(max(box.width_mm / cols, box.span_mm / rows) / MODEL_CELL_MM)))
+        fine_rows, fine_cols = rows * k, cols * k
+        mm_per_col = box.width_mm / fine_cols
+        row_scale = (box.span_mm / fine_rows) / mm_per_col
+        if self._front_canvas is None or self._front_canvas.shape != (fine_rows, fine_cols):
+            self._front_canvas = np.empty((fine_rows, fine_cols), dtype=np.float32)
+            self._back_canvas = np.empty((fine_rows, fine_cols), dtype=np.float32)
+        front, bounds = self._fusion.render_hands(self._front_hands(hands, fine_rows, fine_cols), (fine_rows, fine_cols), (0, 0), None, mm_per_col, out=self._front_canvas, row_scale=row_scale)
+        back, _ = self._fusion.render_hands(self._front_hands(hands, fine_rows, fine_cols, -1.0), (fine_rows, fine_cols), (0, 0), None, mm_per_col, out=self._back_canvas, row_scale=row_scale)
+        if k > 1:
+            front = front.reshape(rows, k, cols, k).min(axis=(1, 3))
+            back = back.reshape(rows, k, cols, k).min(axis=(1, 3))  # the back canvas holds -reach: its minimum is the farthest face
+            if bounds is not None:
+                r0, r1, c0, c1 = bounds
+                bounds = (r0 // k, min(rows, (r1 - 1) // k + 1), c0 // k, min(cols, (c1 - 1) // k + 1))
+        return front, -back, bounds
+
+    def _analyze_upright(self, frame: DepthFrame, started: float) -> AnalysisResult:
+        cfg, box, geometry = self.config, self.box, self.upright
+        assert geometry is not None
+        x0, y0, x1, y1 = box.roi_pixels(frame.width, frame.height)
+        roi = frame.depth_mm[y0:y1, x0:x1]
+        rh, rw = roi.shape
+        near_mm, far_mm, span_mm, depth_mm = box.near_mm, box.far_mm, box.span_mm, box.depth_mm
+
+        hands: list[SkeletonHand] = []
+        for hand in frame.hands or ():
+            skeleton = normalize_tracked_hand(hand, (x0, y0, x1, y1), near_mm, far_mm, cfg.sample_points, upright=geometry)
+            if hand_in_box(skeleton, cfg.hand_margin) and len(hands) < MAX_HANDS:
+                hands.append(skeleton)
+
+        # The height range first (cheap, over the whole ROI), then the metric box laterally, then the usual opening.
+        in_height = (roi >= max(near_mm, 1.0)) & (roi <= far_mm)  # depth 0 is "unknown", never inside the box
+        ys, xs = np.nonzero(in_height)
+        u, v, w = geometry.unit_from_pixels(xs + x0, ys + y0, roi[ys, xs])
+        inside = (u >= 0.0) & (u <= 1.0) & (w >= 0.0) & (w <= 1.0)
+        mask = np.zeros((rh, rw), dtype=bool)
+        mask[ys[inside], xs[inside]] = True
+        mask = open_mask(mask, cfg.morph_iterations)
+        keep = mask[ys, xs]  # opening only removes pixels, so the kept points are exactly the mask
+        ys, xs, u, v, w = ys[keep], xs[keep], u[keep], v[keep], w[keep]
+        height = roi[ys, xs]
+        in_range = int(ys.size)
+        slab_v = cfg.slab_mm / span_mm  # the solid's thickness in v units: pos and extent describe the solid, not its underside
+
+        blobs: list[Blob] = []
+        candidates: list[tuple[int, int]] = []
+        if in_range >= cfg.min_pixels and cfg.max_hands > 0:
+            labels, areas = label_components(mask)
+            order = np.argsort(-areas, kind="stable")
+            candidates = [(int(k) + 1, int(areas[k])) for k in order if areas[k] >= cfg.min_pixels]
+            label_of = labels[ys, xs]
+            for label, area in candidates[: cfg.max_hands]:
+                sel = label_of == label
+                ub, vb, wb = u[sel], v[sel], w[sel]
+                w_near = float(np.percentile(wb, cfg.depth_percentile))
+                w_far = float(np.percentile(wb, 100.0 - cfg.depth_percentile))
+                conf = min(1.0, area / (cfg.conf_saturation * cfg.min_pixels))
+                n_points = min(cfg.sample_points, area)
+                points: tuple[Vec3, ...] = ()
+                if n_points > 0:
+                    idx = np.round(np.linspace(0, area - 1, n_points)).astype(np.int64)
+                    points = tuple((float(ub[i]), float(vb[i]), float(wb[i])) for i in idx)
+                blobs.append(Blob(
+                    id=-1,
+                    u=float(ub.mean()), v=float(vb.mean()) - 0.5 * slab_v, w=w_near,
+                    extent=((float(ub.min()), float(vb.min()) - slab_v, w_near), (float(ub.max()), float(vb.max()), w_far)),
+                    conf=conf, pixels=area, points=points,
+                ))
+        ids = self.tracker.update([(b.u, b.v) for b in blobs])
+        tracked = tuple(Blob(id=i, u=b.u, v=b.v, w=b.w, extent=b.extent, conf=b.conf, pixels=b.pixels, points=b.points) for i, b in zip(ids, blobs))
+
+        occupancy = voxels = surface = None
+        fused_hands = model_cells = front_cells = 0
+        if cfg.surface or cfg.voxels or cfg.occupancy:
+            cols, rows = cfg.surface or DEFAULT_FRONT_GRID
+            wcells = cfg.front_wcells
+            reach, solid = render_front_view(u, w, height, near_mm, far_mm, depth_mm, cfg.slab_mm, rows, cols, wcells)
+            if self._fusion is not None and hands:
+                front, back, bounds = self._front_model(hands, rows, cols)
+                reach, take = self._fusion.fuse_front(reach, front, cfg.scan_fuse, cfg.fuse_tolerance_mm, depth_mm, (near_mm, far_mm))
+                fused_hands = len(hands)
+                model_cells = int(np.count_nonzero(take))
+                if model_cells and bounds is not None:
+                    # The model's solid replaces the measured column wherever the model won: the cells between its front and back faces.
+                    r0, r1, c0, c1 = bounds
+                    take_win = take[r0:r1, c0:c1]
+                    scale = wcells / depth_mm
+                    first = np.clip(np.floor(np.where(take_win, front[r0:r1, c0:c1], 0.0) * scale), 0, wcells - 1).astype(np.int16)
+                    last = np.clip(np.floor(np.where(take_win, back[r0:r1, c0:c1], 0.0) * scale), 0, wcells - 1).astype(np.int16)
+                    cells = np.arange(wcells, dtype=np.int16)[None, None, :]
+                    model_solid = (cells >= first[:, :, None]) & (cells <= np.maximum(first, last)[:, :, None])
+                    window = solid[r0:r1, c0:c1]
+                    window[take_win] = model_solid[take_win]
+            has = np.isfinite(reach)
+            front_cells = int(np.count_nonzero(has))
+            if cfg.surface:
+                surface = np.where(has, 1.0 + np.round(254.0 * np.clip(reach / depth_mm, 0.0, 1.0)), 0.0).astype(np.uint8)
+            if cfg.occupancy:
+                occupancy = downsample_occupancy(has, *cfg.occupancy)
+            if cfg.voxels:
+                voxels = voxelize_solid(solid, *cfg.voxels)
+
+        fps = self._rate.tick(frame.timestamp)
+        stats = {
+            "pixels": float(in_range),
+            "blobs": float(len(candidates)),
+            "trackedHands": float(len(hands)),
+            "fusedHands": float(fused_hands),
+            "scanModelFraction": round(model_cells / front_cells, 4) if front_cells else 0.0,
+            "fps": round(fps, 2),
+            "processingMs": round((time.perf_counter() - started) * 1000.0, 3),
+            "frameWidth": float(frame.width),
+            "frameHeight": float(frame.height),
+        }
+        return AnalysisResult(tracked, occupancy, source_stats(frame, stats), voxels, surface, tuple(hands))
 
     def analyze(self, frame: DepthFrame) -> AnalysisResult:
         started = time.perf_counter()
+        if self.upright is not None:
+            return self._analyze_upright(frame, started)
         cfg, box = self.config, self.box
         x0, y0, x1, y1 = box.roi_pixels(frame.width, frame.height)
         roi = frame.depth_mm[y0:y1, x0:x1]
@@ -1091,7 +1578,16 @@ class BoxAnalyzer:
             "frameWidth": float(frame.width),
             "frameHeight": float(frame.height),
         }
-        return AnalysisResult(tracked, occupancy, stats, voxels, surface, tuple(hands))
+        return AnalysisResult(tracked, occupancy, source_stats(frame, stats), voxels, surface, tuple(hands))
+
+
+def source_stats(frame: DepthFrame, stats: dict[str, float]) -> dict[str, float]:
+    """``stats`` with the frame's own per-frame statistics merged in, when its source attached any (``frame.stats``: the Leap sources' ``depthNoiseMm`` and ``depthValidFraction``)."""
+    extra = getattr(frame, "stats", None)
+    if extra:
+        for key, value in extra.items():
+            stats.setdefault(str(key), float(value))
+    return stats
 
 
 # --------------------------------------------------------------------------- #
@@ -1185,7 +1681,15 @@ def hello_message(
     source: str, box: BoxConfig, fps: float | None, occupancy: tuple[int, int] | None,
     voxels: tuple[int, int, int] | None = None, surface: tuple[int, int] | None = None, skeleton: bool = False,
 ) -> dict[str, Any]:
-    """The ``hello``; ``skeleton`` is announced only when the source tracks hands, omitted otherwise."""
+    """The ``hello``; ``skeleton`` is announced only when the source tracks hands, omitted otherwise.
+
+    In image mode ``box`` is the informational ``--box-x``/``--box-y`` plus
+    ``z = [near, far]`` and ``frame`` is omitted (the browser's default,
+    ``image``). In upright mode ``frame`` is ``"upright"`` and ``box`` is the
+    metric box in metres: ``x`` across the device (``u``), ``y`` the height
+    range above it (``v``, top first on the wire as ``[near, far]``) and
+    ``z`` the reach toward the display (``w``).
+    """
     msg: dict[str, Any] = {
         "type": "hello",
         "version": PROTOCOL_VERSION,
@@ -1196,6 +1700,15 @@ def hello_message(
             "z": [float(box.near_m), float(box.far_m)],
         },
     }
+    if box.upright:
+        x_lo, x_hi = box.x_range_mm
+        z_lo, z_hi = box.z_range_mm
+        msg["box"] = {
+            "x": [round(x_lo / 1000.0, 6), round(x_hi / 1000.0, 6)],
+            "y": [float(box.near_m), float(box.far_m)],
+            "z": [round(z_lo / 1000.0, 6), round(z_hi / 1000.0, 6)],
+        }
+        msg["frame"] = "upright"
     if fps is not None and fps > 0:
         msg["fps"] = float(fps)
     if occupancy is not None:
@@ -1394,16 +1907,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--near", type=float, default=None, metavar="M", help=f"nearest plane of the box in metres (default: {DEFAULT_RANGE_M[0]}, {LEAP_SOURCES['leap'][0]} for the Leap sources)")
     p.add_argument("--far", type=float, default=None, metavar="M", help=f"farthest plane of the box in metres (default: {DEFAULT_RANGE_M[1]}, {LEAP_SOURCES['leap'][1]} for the Leap sources)")
     p.add_argument("--roi", type=float, nargs=4, default=(0.0, 0.0, 1.0, 1.0), metavar=("X0", "Y0", "X1", "Y1"), help="image rectangle as fractions of width/height (default: full frame)")
-    p.add_argument("--box-x", type=float, nargs=2, default=(-0.5, 0.5), metavar=("MIN", "MAX"), help="metric x extent reported in hello (informational)")
-    p.add_argument("--box-y", type=float, nargs=2, default=(-0.4, 0.4), metavar=("MIN", "MAX"), help="metric y extent reported in hello (informational)")
+    p.add_argument("--box-x", type=float, nargs=2, default=(-0.5, 0.5), metavar=("MIN", "MAX"), help="metric x extent reported in hello (informational; image mode only)")
+    p.add_argument("--box-y", type=float, nargs=2, default=(-0.4, 0.4), metavar=("MIN", "MAX"), help="metric y extent reported in hello (informational; image mode only)")
+    upright = p.add_argument_group("Camera on the desk looking up (--frame upright; see bridge/README.md)")
+    upright.add_argument("--frame", choices=FRAMES, default=DEFAULT_FRAME, help="'image': u/v follow the camera image and w its depth (default). 'upright': the camera looks up from the desk; pixels are made metric with the source's intrinsics, --near/--far is the height range (v, top first), u runs along the device's long axis and w across it toward the display, so the browser's default depth mapping puts reaching over the device into the scene")
+    upright.add_argument("--box-mm", type=float, nargs=2, default=DEFAULT_BOX_MM, metavar=("W", "D"), help="upright box, millimetres: W across the device (u), D toward the display (w); size it to the sim volume as W = aspect x (far - near), D = volumeDepth x (far - near) (default: %(default)s)")
+    upright.add_argument("--box-center", type=float, nargs=2, default=(0.0, 0.0), metavar=("X", "Z"), help="where the upright box's centre sits, millimetres across (X) and along the reach axis (Z) from the camera's optical axis (default: 0 0)")
+    upright.add_argument("--reach-sign", type=int, choices=(1, -1), default=1, help="which image direction faces the display in upright mode: +1 image-down, -1 image-up (default: %(default)s; the browser can also mirror)")
+    upright.add_argument("--slab-mm", type=float, default=DEFAULT_SLAB_MM, metavar="MM", help="upright mode: the camera sees only the underside of a hand, so every measured point is extruded this far upward to make the solid the front view scans (default: %(default)s)")
+    upright.add_argument("--front-wcells", type=int, default=DEFAULT_FRONT_WCELLS, metavar="N", help="upright mode: reach cells of the front-view solid, 1..256; fewer is cheaper, the scan keeps exact reaches either way (default: %(default)s)")
     p.add_argument("--occupancy", type=int, nargs=2, default=(32, 24), metavar=("W", "H"), help="occupancy grid size (default: 32 24)")
     p.add_argument("--no-occupancy", action="store_true", help="do not send an occupancy grid")
     p.add_argument("--voxels", type=int, nargs=3, default=(32, 24, 16), metavar=("NX", "NY", "NZ"), help=f"foreground voxel grid: cells across, down and deep into the box, each 1..{MAX_VOXEL_SIDE} (default: 32 24 16)")
     p.add_argument("--no-voxels", action="store_true", help="do not send a voxel grid")
     p.add_argument("--surface", type=int, nargs=2, default=None, metavar=("W", "H"), help=f"nearest-depth surface scan size, each side 1..{MAX_SURFACE_SIDE} (default: {DEFAULT_SURFACE[0]} {DEFAULT_SURFACE[1]}, {LEAP_DEFAULT_SURFACE[0]} {LEAP_DEFAULT_SURFACE[1]} for the Leap sources)")
     p.add_argument("--no-surface", action="store_true", help="do not send a surface scan")
-    p.add_argument("--scan-fuse", choices=SCAN_FUSE_MODES, default=DEFAULT_SCAN_FUSE, help="fuse the tracked hands' capsule model into the depth before the scan, voxels, occupancy and blobs: 'fill' keeps measurements that agree with the model within --fuse-tolerance and takes the model where the measurement is missing or disagrees, 'model' takes the model wherever it has a surface, 'off' uses the measurement alone (default: %(default)s)")
-    p.add_argument("--fuse-tolerance", type=float, default=DEFAULT_FUSE_TOLERANCE_MM, metavar="MM", help="under --scan-fuse fill, how far a measurement may differ from the model and still be kept (default: %(default)s mm)")
+    p.add_argument("--scan-fuse", choices=SCAN_FUSE_MODES, default=DEFAULT_SCAN_FUSE, help="fuse the tracked hands' capsule model into the depth before the scan, voxels, occupancy and blobs: 'fill' keeps measurements that agree with the model within --fuse-tolerance and takes the model where the measurement is missing or disagrees, 'blend' does the same with the measurement median-smoothed under the model and mixed toward the model by its local noise and depth (a far, noisy hand reads as the smooth model), 'model' takes the model wherever it has a surface, 'off' uses the measurement alone (default: %(default)s)")
+    p.add_argument("--fuse-tolerance", type=float, default=DEFAULT_FUSE_TOLERANCE_MM, metavar="MM", help="under --scan-fuse fill or blend, how far a measurement may differ from the model and still be kept (default: %(default)s mm)")
     p.add_argument("--min-pixels", type=int, default=150, help="smallest blob in pixels (default: %(default)s)")
     p.add_argument("--max-hands", type=int, default=2, help=f"largest number of blobs to report, 0..{MAX_HANDS} (default: %(default)s)")
     p.add_argument("--fps", type=float, default=30.0, help="capture rate (default: %(default)s)")
@@ -1427,10 +1947,18 @@ def build_parser() -> argparse.ArgumentParser:
     leap.add_argument("--leap-min-texture", type=int, default=0, help="ignore pixels whose 7x7 neighbourhood spans fewer grey levels than this; 0 = off (default: %(default)s; skin is smooth, so this hollows a hand before it removes phantoms)")
     leap.add_argument("--leap-uniqueness", type=int, default=15, help="percent margin the best disparity must win by, 0..100 (default: %(default)s)")
     leap.add_argument("--leap-block", type=int, default=5, help="matching block size, odd (default: %(default)s)")
-    leap.add_argument("--leap-mode", choices=("sgbm", "hh", "3way"), default="3way", help="SGBM path aggregation: 3way (parallel, fastest), sgbm (5 directions), hh (8 directions, slowest) (default: %(default)s)")
+    leap.add_argument("--leap-mode", choices=("sgbm", "hh", "hh4", "3way"), default="3way", help="SGBM path aggregation: 3way (parallel, fastest), sgbm (5 directions), hh4 (4 directions in one pass), hh (8 directions, slowest) (default: %(default)s)")
     leap.add_argument("--leap-matcher", choices=("sgbm", "bm"), default="sgbm", help="sgbm or plain block matching (bm: faster, far sparser on skin) (default: %(default)s)")
     leap.add_argument("--leap-align", default="auto", metavar="MODE", help="right-camera alignment: 'auto' (fitted from feature matches in the first frames, default), 'none', or PITCH,ROLL[,YAW] in degrees")
     leap.add_argument("--leap-calibration", choices=("function", "lattice"), default="function", help="rectify with LeapRectilinearToPixel (function, default) or the images' 64x64 distortion lattice")
+    # The distance flags repeat leap_source.add_distance_arguments (same defaults as leap_stereo.StereoParams; README "Distance").
+    leap.add_argument("--leap-contrast", choices=("none", "gain", "lcn"), default="none", help="level the rectified pair before matching: 'gain' divides by the local mean so a dim far hand matches like a bright near one, 'lcn' normalises local contrast (loses the shading skin is matched on), 'none' (default: %(default)s; on the real frames neither helps)")
+    leap.add_argument("--leap-contrast-window", type=int, default=31, help="window of the local mean/contrast, odd pixels of the view (default: %(default)s)")
+    leap.add_argument("--leap-p1", type=int, default=8, help="SGBM smoothness penalty for a 1-px disparity change, per block pixel: P1 = N * block^2 (default: %(default)s)")
+    leap.add_argument("--leap-p2", type=int, default=32, help="SGBM penalty for larger disparity changes, per block pixel: P2 = N * block^2 (default: %(default)s)")
+    leap.add_argument("--leap-speckle", type=int, default=200, help="drop matched patches smaller than this many pixels at 320x240 (scaled with the view's area); 0 = off (default: %(default)s)")
+    leap.add_argument("--leap-fill-radius", type=int, default=2, help="fill holes up to about twice this many pixels wide from the surrounding depth where it agrees; 0 = off (default: %(default)s)")
+    leap.add_argument("--leap-temporal", type=int, default=3, help="median of the last N depth maps where they agree with the newest one (noise / sqrt(N), holes filled from older frames, no smearing of a moving hand); 0 or 1 = off (default: %(default)s)")
     leap.add_argument("--swap-cameras", action="store_true", help="exchange the two cameras before matching (use when the depth image stays empty with a hand over the device)")
     leap.add_argument("--leap-orient", choices=LEAP_ORIENTATIONS, default="none", help="rotate/flip the depth image before analysis so image right/down mean what the browser expects (default: none)")
     leap.add_argument("--leap-hand-frame", default="auto", metavar="MODE", help="how the LeapC hand skeleton is projected onto the depth image: 'auto' (default: every convention is scored against the scan until one clearly leads) or a convention name u{+|-}{x|z}_v{+|-}{z|x}_ref{+|-}, see bridge/README.md")
@@ -1450,12 +1978,29 @@ def make_source(args: argparse.Namespace) -> FrameSource:
             view = leap.ls.RectifiedView.from_fov(args.leap_view[0], args.leap_view[1], args.leap_fov)
             params = leap.stereo_params_from_args(args, args.near * 1000.0, prefix="leap_")
             if args.source == "leap-synthetic":
-                return leap.LeapSyntheticSource(view, params, args.swap_cameras, args.leap_orient, fps=args.fps, paced=args.dump is None, hand_frame=args.leap_hand_frame)
+                return leap.LeapSyntheticSource(view, params, args.swap_cameras, args.leap_orient, fps=args.fps, paced=args.dump is None, hand_frame=args.leap_hand_frame, far_mm=args.far * 1000.0)
             return leap.LeapStereoSource(args.leapc, view, params, args.swap_cameras, args.leap_orient, fps=args.fps, hand_frame=args.leap_hand_frame,
-                                         alignment=args.leap_align, calibration=args.leap_calibration)
+                                         alignment=args.leap_align, calibration=args.leap_calibration, far_mm=args.far * 1000.0)
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
     raise SystemExit(f"unknown source {args.source!r}")
+
+
+def resolve_intrinsics(source: FrameSource, frame: str) -> Intrinsics | None:
+    """The source's pinhole for ``--frame upright`` (opening a source that only knows it once started), ``None`` in image mode.
+
+    Raises ``SystemExit`` with the fix when the source has none, and lets a
+    device's ``start()`` errors (``RuntimeError``) through for the caller.
+    """
+    if frame != "upright":
+        return None
+    intrinsics = source.intrinsics
+    if intrinsics is None and source.intrinsics_after_start:
+        source.start()  # idempotent for such sources: the server or --dump calls it again
+        intrinsics = source.intrinsics
+    if intrinsics is None:
+        raise SystemExit(f"{UPRIGHT_NEEDS_INTRINSICS} (source: {source.name})")
+    return intrinsics
 
 
 def _finish(source: FrameSource, code: int) -> int:
@@ -1475,7 +2020,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args.surface = resolve_surface(args)
     logging.basicConfig(level=getattr(logging, args.log_level.upper()), stream=sys.stderr, format="%(asctime)s %(levelname)s %(message)s")
     try:
-        box = BoxConfig(near_m=args.near, far_m=args.far, roi=tuple(args.roi), box_x=tuple(args.box_x), box_y=tuple(args.box_y))
+        box = BoxConfig(
+            near_m=args.near, far_m=args.far, roi=tuple(args.roi), box_x=tuple(args.box_x), box_y=tuple(args.box_y),
+            frame=args.frame, box_mm=tuple(args.box_mm), box_center_mm=tuple(args.box_center), reach_sign=args.reach_sign,
+        )
         config = AnalyzerConfig(
             occupancy=None if args.no_occupancy else tuple(args.occupancy),
             voxels=None if args.no_voxels else tuple(args.voxels),
@@ -1483,11 +2031,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             min_pixels=args.min_pixels, max_hands=args.max_hands, morph_iterations=args.morph,
             sample_points=args.points, max_jump=args.max_jump,
             scan_fuse=args.scan_fuse, fuse_tolerance_mm=args.fuse_tolerance,
+            slab_mm=args.slab_mm, front_wcells=args.front_wcells,
         )
     except ValueError as exc:
         parser.error(str(exc))
     source = make_source(args)
-    analyzer = BoxAnalyzer(box, config, focal_px=source_focal_px(source))
+    try:
+        intrinsics = resolve_intrinsics(source, args.frame)
+    except (RuntimeError, NotImplementedError) as exc:
+        log.error("%s", exc)
+        return 1
+    analyzer = BoxAnalyzer(box, config, focal_px=source_focal_px(source), intrinsics=intrinsics)
+    if box.upright:
+        fx, fy, cx, cy = intrinsics or (0.0, 0.0, 0.0, 0.0)
+        log.info("upright frame: intrinsics fx=%.1f fy=%.1f cx=%.1f cy=%.1f px, box %g x %g mm centred (%g, %g), height %g-%g m, reach sign %+d, slab %g mm",
+                 fx, fy, cx, cy, box.width_mm, box.depth_mm, box.box_center_mm[0], box.box_center_mm[1], box.near_m, box.far_m, box.reach_sign, config.slab_mm)
     hello = hello_message(source.name, box, source.fps, config.occupancy, config.voxels, config.surface, skeleton=source.skeleton)
 
     if args.dump is not None:
