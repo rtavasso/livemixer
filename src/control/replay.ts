@@ -3,7 +3,7 @@ import type { AudioAction, PlannerEnvironment } from '../music/planner';
 import type { TraceInput, TraceRecord } from '../trace';
 export interface ReplayedAction { atMs: number; audioTime: number; action: AudioAction }
 export function replayRawControl(records: TraceRecord[], environment: PlannerEnvironment): { actions: ReplayedAction[]; session: PerformanceSession } {
-  const session = new PerformanceSession(environment, 0), actions: ReplayedAction[] = [];
+  const session = new PerformanceSession({ ...environment, sampleRate: typeof records[0]?.sampleRate === 'number' ? records[0].sampleRate : environment.sampleRate }, 0), actions: ReplayedAction[] = [];
   for (const record of records) if (record.type === 'input') {
     const row = record as TraceInput;
     if (!row.input || !Number.isFinite(row.audioTime) || row.audioTime < 0) throw new Error('Invalid raw-control input.');
@@ -25,7 +25,7 @@ export class RawReplayAdapter {
     while (this.cursor < this.inputs.length && this.inputs[this.cursor].atMs <= nowMs - this.originMs) {
       const row = this.inputs[this.cursor++], input = row.input;
       if (input.type === 'frame') inputs.push({ ...input, frame: { ...input.frame, source: 'replay', observedAtMs: this.originMs + input.frame.observedAtMs, receivedAtMs: this.originMs + input.frame.receivedAtMs } });
-      else if (['mode', 'hold', 'bypass', 'metronome', 'recipe', 'advance', 'calibration', 'cancel', 'start', 'stop'].includes(input.type)) inputs.push(input);
+      else if (['space', 'timing', 'rate', 'mode', 'hold', 'bypass', 'metronome', 'recipe', 'advance', 'calibration', 'cancel', 'start', 'stop'].includes(input.type)) inputs.push(input);
       else if (input.type === 'adapter') inputs.push({ type: 'adapter', source: 'replay' });
     }
     return inputs;

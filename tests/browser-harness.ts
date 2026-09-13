@@ -125,3 +125,95 @@ export async function workerSmoke() {
     worker.postMessage({ type: 'init', wasmRoot: new URL('/models/wasm', location.href).href, modelUrl: new URL('/models/hand_landmarker.task', location.href).href });
   });
 }
+
+// Exercise the shared live engine with speed changes, including a muted fourth stem.
+export async function rateAlignment() {
+  const context = new OfflineAudioContext(4, rate * 2, rate);
+  const loaded = bufferScene(context, 'a', rate, i => .1 * Math.sin(2 * Math.PI * 97 * i / rate));
+  loaded.buffers.vocals = loaded.buffers.other;
+  loaded.scene.stems.vocals = { file: 'vocals.wav', trimDb: 0 };
+  loaded.scene.recipes.open.vocals = 0; loaded.scene.recipes.sparse.vocals = null;
+  const engine = new AudioEngine(context, testManifest(), { scenes: { a: loaded }, decodedBytes: 0, fingerprint: '', edgeFingerprints: {} }, context.createGain());
+  engine.setBypass(true);
+  const clock = { start: .1, duration: 1, loopBars: 4, beatsPerBar: 4 };
+  engine.execute({ type: 'StartTransport', id: 1, generation: 1, sceneId: 'a', at: .1, recipe: 'sparse', clock });
+  const merger = context.createChannelMerger(4); merger.connect(context.destination);
+  Object.values(engine.decks[0].stems).forEach((stem, i) => stem.recipe.connect(merger, 0, i));
+  for (const [id, at, speed] of [[2, .512, 1.1], [3, 1.024, .9]]) engine.execute({ type: 'SetPlaybackRate', id, generation: 1, sceneId: 'a', at, rate: speed, clock });
+  engine.execute({ type: 'RampRecipe', id: 4, generation: 1, sceneId: 'a', recipe: 'open', start: 1.18, end: 1.2 });
+  const buffer = await context.startRendering(), a = buffer.getChannelData(0);
+  let error = 0, phaseError = 0, mutedPeak = 0;
+  for (let c = 1; c < 4; c++) for (let i = rate * 1.21; i < a.length; i++) error = Math.max(error, Math.abs(a[i] - buffer.getChannelData(c)[i]));
+  for (let i = rate * 1.21; i < a.length; i++) {
+    const sourceSeconds = .412 + .512 * Math.fround(1.1) + (i / rate - 1.024) * Math.fround(.9);
+    phaseError = Math.max(phaseError, Math.abs(a[i] - .1 * Math.sin(2 * Math.PI * 97 * sourceSeconds)));
+  }
+  for (const v of buffer.getChannelData(3).slice(0, rate)) mutedPeak = Math.max(mutedPeak, Math.abs(v));
+  return { error, phaseError, mutedPeak, playbackRates: Object.values(engine.decks[0].stems).map(s => s.source.playbackRate.value) };
+}
+export async function sunReactiveAudio() {
+  const { PerformanceSession } = await import('../src/music/session');
+  const url = new URL('/scenes/love-supreme-sun/manifest.json', location.href);
+  const manifest = validateManifest(await (await fetch(url)).json());
+  const loadingContext = new OfflineAudioContext(2, 1, rate);
+  const assets = await loadAssets(loadingContext, manifest, urlReader(url.href));
+  const instrumentalAssets = { ...assets, scenes: Object.fromEntries(Object.entries(assets.scenes).map(([id, loaded]) => [id, { ...loaded, buffers: { ...loaded.buffers, vocals: loadingContext.createBuffer(2, loaded.buffers.other!.length, rate) } }])) };
+  const results = [];
+  for (const timing of ['beat', 'immediate'] as const) {
+    const session = new PerformanceSession({ manifest, sampleRate: rate, scenes: Object.fromEntries(Object.entries(assets.scenes).map(([id, s]) => [id, { duration: s.duration }])), edgeErrors: {} });
+    const events: import('../src/audio/offline').TimedEvent[] = [{ at: 0, openness: 0 }];
+    const send = (input: import('../src/music/session').SessionInput, at: number) => { for (const action of session.dispatch(input, at * 1000, at)) events.push({ at, action }); };
+    send({ type: 'timing', timing }, 0); send({ type: 'mode', mode: 'timbre_only' }, 0); send({ type: 'start' }, 0);
+    for (let ms = 25; ms <= 8000; ms += 25) {
+      const at = ms / 1000;
+      if (ms === 200 || ms === 4000) send({ type: 'recipe', recipe: 'open' }, at);
+      if (ms === 350 || ms === 5000) send({ type: 'recipe', recipe: 'sparse' }, at);
+      if (ms === 1000 || ms === 3000) send({ type: 'advance' }, at);
+      if (ms === 2000 || ms === 6000) send({ type: 'rate', rate: ms === 2000 ? 1.1 : .9 }, at);
+      send({ type: 'tick' }, at);
+    }
+    const actual = await renderEventPlan(manifest, assets, events, 8, rate);
+    const instrumental = await renderEventPlan(manifest, instrumentalAssets, events, 8, rate);
+    const clear = await renderEventPlan(manifest, instrumentalAssets, [{ at: 0, bypass: true }, ...events], 8, rate);
+    const analysis = new OfflineAudioContext(2, 8 * rate, rate), merger = analysis.createChannelMerger(2); merger.connect(analysis.destination);
+    for (const [i, buffer] of [instrumental.buffer, clear.buffer].entries()) {
+      const source = analysis.createBufferSource(), high = analysis.createBiquadFilter(); source.buffer = buffer;
+      high.type = 'highpass'; high.frequency.value = 1500; high.Q.value = 0;
+      source.connect(high).connect(merger, 0, i); source.start();
+    }
+    const bands = await analysis.startRendering();
+    const rms = (c: number, start: number, end: number) => {
+      const a = bands.getChannelData(c).slice(Math.round(start * rate), Math.round(end * rate));
+      return Math.sqrt(a.reduce((sum, v) => sum + v * v, 0) / a.length);
+    };
+    const resets = events.flatMap(e => e.action?.type === 'CommitSceneReset' ? [e.action] : []);
+    const starts = [.1, ...resets.map(a => a.at)];
+    const bandsByPassage = starts.map((start, i) => { const end = starts[i + 1] ?? 8; return { dark: rms(0, start + .05, end - .05), clear: rms(1, start + .05, end - .05) }; });
+    let mutedError = 0, vocalDifference = 0;
+    for (const [start, end] of [[.9, 1], [1.8, 1.9], [3.8, 3.9], [6.5, 7.5]]) for (let c = 0; c < 2; c++) {
+      const a = actual.buffer.getChannelData(c), b = instrumental.buffer.getChannelData(c);
+      for (let i = start * rate; i < end * rate; i++) mutedError = Math.max(mutedError, Math.abs(a[i] - b[i]));
+    }
+    for (let i = Math.round(4.8 * rate); i < 5 * rate; i++) vocalDifference = Math.max(vocalDifference, Math.abs(actual.buffer.getChannelData(0)[i] - instrumental.buffer.getChannelData(0)[i]));
+    results.push({ timing, bandsByPassage, mutedError, vocalDifference, peakDbfs: actual.peakDbfs, nonfinite: actual.nonfinite, resets: resets.map(a => ({ to: a.to, at: a.at, recipe: a.recipe, rate: a.rate ?? 1 })), speedChanges: events.filter(e => e.action?.type === 'SetPlaybackRate').length });
+  }
+  return results;
+}
+
+export async function metronomeRateChange() {
+  const context = new OfflineAudioContext(2, rate, rate), merger = context.createChannelMerger(2); merger.connect(context.destination);
+  const loaded = bufferScene(context, 'a', rate, () => 0);
+  const assets = { scenes: { a: loaded }, decodedBytes: 0, fingerprint: '', edgeFingerprints: {} };
+  const clock = { start: .2, duration: 8, loopBars: 4, beatsPerBar: 4 };
+  const { idleTransport } = await import('../src/music/planner');
+  for (const [i, at] of [.18, .21].entries()) {
+    const output = context.createGain(); output.connect(merger, 0, i);
+    const engine = new AudioEngine(context, testManifest(), assets, output); engine.metronome = true;
+    engine.execute({ type: 'StartTransport', id: 1, generation: 1, sceneId: 'a', at: .1, recipe: 'sparse', clock });
+    engine.tickMetronome({ ...idleTransport(), running: true, generation: 1, clock }, .06);
+    engine.execute({ type: 'SetPlaybackRate', id: 2, generation: 1, sceneId: 'a', at, rate: 1.1, clock });
+  }
+  const b = await context.startRendering();
+  const peak = (c: number, start: number, end: number) => Math.max(...b.getChannelData(c).slice(Math.round(start * rate), Math.round(end * rate)).map(Math.abs));
+  return { canceled: peak(0, .19, .24), completed: peak(1, .215, .225), tail: peak(1, .231, .26) };
+}

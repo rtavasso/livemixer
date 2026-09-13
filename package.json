@@ -14,6 +14,7 @@
     "test:browser": "playwright test",
     "fixtures": "tsx scripts/create-fixtures.ts",
     "inspect:stems": "tsx scripts/inspect-stems.ts",
+    "inspect:leap": "tsx scripts/check-leap.ts",
     "prepare:fadr": "tsx scripts/prepare-fadr.ts",
     "setup:models": "tsx scripts/setup-models.ts && npm run build:worker"
   },

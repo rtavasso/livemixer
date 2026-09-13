@@ -2,7 +2,8 @@ import { test, expect } from '@playwright/test';
 test.beforeEach(async ({ page }) => { await page.goto('/?fixtures=1&tools=1'); await expect(page.locator('#start')).toBeEnabled(); });
 test('sound shape clearly filters the instrumental bed while keeping vocals dry and bypass reversible', async ({ page }) => {
   const result = await page.evaluate(async () => { const path = '/tests/browser-harness.ts'; return (await import(path)).instrumentalTone(); });
-  expect(result.low[0]).toBeLessThan(result.high[0] * .01);
+  expect(result.low[0]).toBeGreaterThan(result.high[0] * .3);
+  expect(result.low[0]).toBeLessThan(result.high[0] * .45);
   expect(result.low[1]).toBeCloseTo(result.high[1], 6);
   expect(result.bypass[0]).toBeCloseTo(.24 / Math.sqrt(2), 5);
   expect(result.bypass[1]).toBeCloseTo(result.low[1], 6);

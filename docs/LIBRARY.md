@@ -4,14 +4,14 @@ The library extension was added after completing the base instrument, in respons
 
 ## From a folder to a mix
 
-1. Open **Library & mix builder → Choose library folder**. Select the external folder containing your demixed WAVs. The files remain local and are not uploaded or copied into the repository. **Try test library** exercises the interface with the two engineering fixtures.
+1. Open **Build mix > Open songs folder (WAV)**. Select the external folder containing your demixed WAVs. The files remain local and are not uploaded or copied into the repository. **Setup > Engineering test audio > Synthetic tone library** exercises the interface with the two engineering fixtures.
 2. Browse or search the song list. Automatic assignment supports folders such as `Library/Song Name/other.wav`, `bass.wav`, `drums.wav`, `vocals.wav`, as well as flat filenames such as `Song Name_bass.wav`. Use **Stem assignment** for unusual names. Missing roles, duplicate choices, unsupported files, or mismatched frame counts are shown explicitly.
-3. Use **Analyze song** or **Analyze all songs**. Analysis runs in a separate worker, one song at a time; it can be canceled while preserving completed results. Import itself reads WAV headers and does not decode all 50 songs.
+3. Use **Analyze song** or **Analyze missing songs**. Analysis runs in a separate worker, one song at a time; it can be canceled while preserving completed results. Import itself reads WAV headers and does not decode all 50 songs.
 4. Set **Grid BPM** and **Downbeat offset** by listening. Select a start bar and four or eight bars. Click a waveform to move to the nearest bar on your declared grid. Estimates are starting points, not an approved clock.
-5. **Audition loop**, solo or mute stems, and enable **Grid metronome** to check timing against the excerpt. All audition stems share a start and loop phase. Adjust the grid or choose another passage if transients drift, the seam is poor, or a phrase is cut. This is a passage selector, not a waveform repair editor.
-6. **Add passage to mix**. Optional vocals force whole-loop recipe changes. Add more passages, reorder them with the arrow buttons, write connection notes, and optionally repeat the path. Multiple passages from one song are supported.
-7. **Review connection** opens the corresponding edge audition in the instrument. **Open mix in instrument** prepares the full path. Tune complete recipes, trims, and filter controls, render headroom checks, listen to all required cases, then save manual reviews. Instrument edits to these prepared scenes flow back into the library project and ZIP export.
-8. **Save project** retains song annotations, analysis, selections, order, recipe tuning, and saved review records in a JSON file. To restore, first select the same unchanged library folder, then **Restore project**. **Export playable mix ZIP** contains the aligned excerpts and `manifest.json`; extract it and select that folder in the instrument.
+5. **Preview selection**, solo or mute stems, and enable **Grid metronome** to check timing against the excerpt. All audition stems share a start and loop phase. Adjust the grid or choose another passage if transients drift, the seam is poor, or a phrase is cut. This is a passage selector, not a waveform repair editor.
+6. **Add passage to mix**. Optional vocals save a whole-loop grid for authored auditions; live playback defaults to Next beat and also offers Immediate timing. Add more passages, reorder them with the arrow buttons, write connection notes, and optionally repeat the path. Multiple passages from one song are supported.
+7. **Audio checks** opens the corresponding transition audition in Setup. **Use this mix in Play** prepares the full path. Tune complete recipes, trims, and filter controls, render headroom checks, listen to all required cases, then save manual reviews. Instrument edits to these prepared scenes flow back into the library project and ZIP export.
+8. **Save or reopen a project > Save project** retains song annotations, analysis, selections, order, recipe tuning, and saved review records in a JSON file. To restore, first select the same unchanged library folder, then **Open saved project**. **Save mix with audio (ZIP)** contains the aligned excerpts and `manifest.json`; extract it and select that folder in the instrument.
 
 Changing a source length or introducing media outside the library project in the instrument's advanced manifest editor cannot be reconstructed by the library cutter. The UI reports this; export that instrument configuration separately. Normal trim, gain, filter, note, and approval edits are retained.
 
@@ -33,7 +33,7 @@ Level measurements and overview bins scan complete WAV files in approximately 4 
 
 The implementation is an intentionally small local analyzer, not Essentia or librosa. Spectral pitch-class profiles are a common basis for key estimation; the [Essentia KeyExtractor documentation](https://essentia.upf.edu/reference/streaming_KeyExtractor.html) describes a more comprehensive implementation including tuning correction and profile choices. This project's simpler estimator lacks that full tuning/whitening pipeline and has not been benchmarked on your songs. Use the visible alternatives and your ears.
 
-Connection hints never authorize arbitrary cross-song bass, drums, or vocals to overlap. The supported transition ends one source scene before the next starts at native tempo. An actual simultaneous hybrid would require separately prepared, synchronized assets and its own reviewed scene.
+Connection hints never authorize arbitrary cross-song bass, drums, or vocals to overlap. The supported transition ends one source scene before the next starts at its native tempo multiplied by the current shared Speed & pitch setting. An actual simultaneous hybrid would require separately prepared, synchronized assets and its own reviewed scene.
 
 ## Files, memory, and persistence
 
@@ -49,3 +49,7 @@ Connection hints never authorize arbitrary cross-song bass, drums, or vocals to 
 Automated tests cover a 50-song generated folder through Chromium's real directory-picker control, both filename grouping conventions, exact frame-preserving WAV crops, 24-bit/float sample interpretation, known 120 BPM pulses, a C-major triad, silence/uncertain tonality, measured constant-signal RMS, project restore and mismatch rejection, ZIP contents, analysis cancellation, solo audition, path ordering, instrument transfer, and persistence of instrument tuning/reviews back into the project.
 
 These tests establish implementation behavior on generated signals. No actual user library was available for import, tempo/key accuracy assessment, or musical review during implementation.
+
+## Hand-space material checks
+
+After loading a mix into Play, Setup > Hand space & Leap bounds shows instrumental, melodic and vocal signal coverage for the selected passage. Quarter-second RMS windows use the loudest saved level per stem and its trim; instrumental gaps of at least half a second below -50 dBFS are listed. A vocal rest is acceptable because the accompaniment supplies the effects. An entirely quiet instrumental passage cannot supply new effect material, so use the waveform editor to choose a different section if continuous response is important. This analysis does not invent notes or automatically layer unrelated stems. Hand-space bounds and the Leap tracking preset persist in browser storage; project and audio saving remains explicit.

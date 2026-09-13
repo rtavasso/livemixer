@@ -10,3 +10,6 @@ public/models/**
 *.local.json
 *.jsonl
 .env*
+__pycache__/
+*.pyc
+.claude/worktrees/

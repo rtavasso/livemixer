@@ -8,7 +8,7 @@ import { calibrate, stableCapture } from './control/conditioning';
 import { RawReplayAdapter, replayRawControl } from './control/replay';
 import { SliderAdapter } from './control/slider';
 import type { Adapter, MappingMode } from './control/types';
-import { edgeKey, type PlannerEnvironment } from './music/planner';
+import { edgeKey, type PlannerEnvironment, type ResponseTiming } from './music/planner';
 import { PerformanceSession, type SessionInput } from './music/session';
 import { TraceRecorder, download, parseTrace, type TraceRecord } from './trace';
 import { button, element, escapeHtml, input, mount, readEditor, renderEditor, select } from './ui/controls';
@@ -16,6 +16,8 @@ import { diagnostics, renderStemMeters } from './ui/diagnostics';
 import { LibraryWorkspace } from './library/workspace';
 import { preparedCollection } from './library/prepared';
 import { mountPerformance, updatePerformance, vocalChoices } from './ui/performance';
+import { SpacePanel } from './ui/space';
+import { analyzeActivity } from './audio/activity';
 
 mount();
 mountPerformance();
@@ -30,17 +32,21 @@ let importedTrace: TraceRecord[] | undefined, replay: RawReplayAdapter | undefin
 let low: number | undefined, high: number | undefined;
 const slider = new SliderAdapter();
 const camera = new CameraAdapter(element<HTMLVideoElement>('video'), frame => { if (session?.source === 'camera') dispatch({ type: 'frame', frame }, frame.receivedAtMs); }, message => setText('camera-status', message));
+const spacePanel = new SpacePanel(state => dispatch({ type: 'space', state }), enabled => {
+  if (enabled && session) { switchAdapter('slider'); dispatch({ type: 'mode', mode: 'timbre_only' }); dispatch({ type: 'hold', enabled: false }); }
+});
 const library = new LibraryWorkspace(context, {
   beforeAudition: () => { if (session?.state.running) dispatch({ type: 'stop' }); stopPreview(); },
   loadPerformance: async (config, media, edge) => {
     if (session?.state.running) dispatch({ type: 'stop' });
     await load(config, media, true); library.show('instrument');
     if (edge) {
+      library.show('setup'); element<HTMLDetailsElement>('setup-authoring').open = true;
       const index = cases.findIndex(c => c.kind === 'scene-transition' && `${c.from}→${c.to}` === edge);
       if (index >= 0) select('audition-case').value = String(index);
       element('author-panel').scrollIntoView({ behavior: 'smooth' });
     }
-  }, error: showError,
+  }, error: showError, playbackChanged: () => updateAvailability(),
 });
 function setText(id: string, text: string) { element(id).textContent = text; }
 function showError(error?: unknown) {
@@ -48,17 +54,20 @@ function showError(error?: unknown) {
   if (error && trace) trace.add('error', performance.now(), { message: box.textContent });
 }
 function environment(): PlannerEnvironment {
-  return { manifest, scenes: Object.fromEntries(Object.entries(assets.scenes).map(([id, loaded]) => [id, { duration: loaded.duration, error: authoring ? undefined : sceneApprovalError(loaded.scene, loaded.fingerprint) }])), edgeErrors: Object.fromEntries(manifest.edges.map(edge => [edgeKey(edge.from, edge.to), authoring ? undefined : edgeApprovalError(edge, assets.edgeFingerprints[edgeKey(edge.from, edge.to)])])) };
+  return { sampleRate: context.sampleRate, manifest, scenes: Object.fromEntries(Object.entries(assets.scenes).map(([id, loaded]) => [id, { duration: loaded.duration, error: authoring ? undefined : sceneApprovalError(loaded.scene, loaded.fingerprint) }])), edgeErrors: Object.fromEntries(manifest.edges.map(edge => [edgeKey(edge.from, edge.to), authoring ? undefined : edgeApprovalError(edge, assets.edgeFingerprints[edgeKey(edge.from, edge.to)])])) };
 }
 function newTrace() {
   importedTrace = undefined;
   select('adapter').value = session.source; select('mapping').value = session.mode;
   input('hold').checked = session.holdEnabled; input('bypass').checked = session.filterBypass; input('metronome').checked = session.metronome;
+  select('response-timing').value = session.state.timing ?? 'authored'; input('playback-rate').value = String(session.state.desiredRate ?? 1);
   engine.setBypass(session.filterBypass); engine.metronome = session.metronome;
   if (session.source !== 'camera') { camera.stop(); element('camera-panel').hidden = true; }
   trace = new TraceRecorder(session.originMs, { configFingerprint: assets.fingerprint, inputMode: session.source, sampleRate: context.sampleRate, authoring, readiness: session.environment.scenes, edgeErrors: session.environment.edgeErrors });
   trace.add('clock-map', performance.now(), { audioTime: context.currentTime, generation: session.state.generation });
+  spacePanel.reset(); spacePanel.setEnabled(!engineering);
   if (!engineering) {
+    dispatch({ type: 'timing', timing: 'beat' });
     dispatch({ type: 'mode', mode: 'timbre_only' });
     if (session.source === 'slider') { slider.value = .75; input('openness').value = '.75'; const now = performance.now(); dispatch({ type: 'frame', frame: slider.sample(now) }, now); }
   }
@@ -77,6 +86,7 @@ function updateAvailability() {
   const running = session?.state.running ?? false, blocked = !session || !!session.environment.scenes[authoring ? select('edit-scene').value : manifest.path[0]]?.error;
   button('start').disabled = loading || rendering || running || blocked;
   button('stop').disabled = !running;
+  button('stop-all').disabled = !running && !library.auditioning && !previewSource;
   const endOfPath = session && !manifest.repeatPath && manifest.path.indexOf(session.state.sceneId) === manifest.path.length - 1;
   button('next').disabled = !running || !!endOfPath || !!session?.state.pendingAdvance || !!session?.state.committedAdvance;
   select('performance-scene').disabled = running || loading || rendering || !authoring;
@@ -97,9 +107,11 @@ function updateScene() {
   const id = session.state.running ? session.state.sceneId : authoring ? select('edit-scene').value || manifest.path[0] : manifest.path[0], loaded = assets.scenes[id];
   if (!loaded) return;
   setText('scene-name', loaded.scene.label);
-  setText('scene-meta', `Passage ${manifest.path.indexOf(id) + 1} of ${manifest.path.length} · ${loaded.duration.toFixed(1)}-second loop${authoring ? ' · draft for listening' : ''}`);
+  setText('scene-meta', `Passage ${manifest.path.indexOf(id) + 1} of ${manifest.path.length} · ${(session.state.running ? session.state.clock.duration : loaded.duration / (session.state.desiredRate ?? 1)).toFixed(1)}-second loop${authoring ? ' · draft for listening' : ''}`);
   select('performance-scene').value = id;
+  setText('context-state', library.auditioning ? 'Previewing selection' : previewSource ? 'Playing audio check' : session.state.running ? 'Audio running' : 'Ready to play');
   updatePerformance(session, loaded.scene, context.currentTime);
+  spacePanel.showActivity(loaded);
   if (lastScene !== id) { lastScene = id; renderStemMeters(engine, id); }
 }
 function updateApproval() {
@@ -130,10 +142,12 @@ function populate() {
 }
 async function load(inputManifest: unknown, mediaReader: ReadMedia, mode: boolean) {
   guardStopped(); const candidate = validateManifest(inputManifest), generation = ++loadGeneration;
-  loading = true; stopPreview(); camera.stop(); if (timer) clearInterval(timer); updateAvailability();
+  loading = true; stopPreview(); camera.stop(); spacePanel.disconnect(); if (timer) clearInterval(timer); updateAvailability();
   try {
     const loaded = await loadAssets(context, candidate, mediaReader, message => setText('load-status', message));
     if (generation !== loadGeneration) return;
+    // Do this while stopped/loading, never on the timing-critical passage-change tick.
+    for (const scene of Object.values(loaded.scenes)) analyzeActivity(scene);
     engine?.dispose(); manifest = candidate; assets = loaded; reader = mediaReader; authoring = mode; input('authoring').checked = authoring;
     engineering = manifest.scenes.every(scene => scene.id.startsWith('fixture_'));
     engine = new AudioEngine(context, manifest, assets); session = new PerformanceSession(environment(), performance.now());
@@ -148,8 +162,12 @@ function dispatch(inputEvent: SessionInput, at = performance.now(), audio = cont
   const previous = session.state;
   trace.input(inputEvent, at, audio);
   const actions = session.dispatch(inputEvent, at, audio);
+  engine.setSpace(session.space, audio);
+  if (inputEvent.type === 'stop') spacePanel.reset();
   if (inputEvent.type === 'bypass') { engine.setBypass(session.filterBypass); input('bypass').checked = session.filterBypass; }
   if (inputEvent.type === 'metronome') { engine.metronome = session.metronome; input('metronome').checked = session.metronome; }
+  if (inputEvent.type === 'timing') select('response-timing').value = session.state.timing ?? 'authored';
+  if (inputEvent.type === 'rate') input('playback-rate').value = String(session.state.desiredRate ?? 1);
   if (inputEvent.type === 'mode') select('mapping').value = session.mode;
   if (inputEvent.type === 'hold') input('hold').checked = session.holdEnabled;
   try {
@@ -168,6 +186,7 @@ function dispatch(inputEvent: SessionInput, at = performance.now(), audio = cont
 }
 function tick() {
   if (!session || loading) return;
+  spacePanel.tick(engine, session.state.running, session.source === 'replay' ? session.space : undefined);
   const now = performance.now();
   if (session.source === 'slider') dispatch({ type: 'frame', frame: slider.sample(now) }, now);
   if (session.source === 'replay' && replay) {
@@ -189,6 +208,7 @@ function drawLandmarks() {
 }
 async function startAudio() { library.stopAudition(); stopPreview(); await context.resume(); trace.add('clock-map', performance.now(), { audioTime: context.currentTime, generation: session.state.generation + 1 }); dispatch({ type: 'start', sceneId: authoring ? select('edit-scene').value : manifest.path[0] }); }
 handle('start', startAudio);
+handle('stop-all', () => { replay = undefined; if (session) dispatch({ type: 'stop' }); library.stopAudition(); stopPreview(); updateAvailability(); });
 handle('stop', () => { replay = undefined; dispatch({ type: 'stop' }); stopPreview(); });
 handle('next', () => dispatch({ type: 'advance' })); handle('cancel', () => dispatch({ type: 'cancel' }));
 handle('vocal-toggle', () => {
@@ -224,7 +244,7 @@ function capture(which: 'low' | 'high') {
   else setText('calibration', `${which} captured. Capture the other endpoint.`);
 }
 handle('cal-low', () => capture('low')); handle('cal-high', () => capture('high'));
-handle('load-fixtures', async () => { const url = new URL('/fixtures/manifest.json', location.href); const response = await fetch(url); if (!response.ok) throw new Error('Generate fixtures with npm run fixtures.'); await load(await response.json(), urlReader(url.href), true); });
+handle('load-fixtures', async () => { const url = new URL('/fixtures/manifest.json', location.href); const response = await fetch(url); if (!response.ok) throw new Error('Generate fixtures with npm run fixtures.'); await load(await response.json(), urlReader(url.href), true); library.show('instrument'); });
 input('folder').onchange = async () => {
   try { const files = Array.from(input('folder').files ?? []), manifests = files.filter(f => f.name.endsWith('.json'));
     const preferred = manifests.filter(f => /^(manifest|scene_manifest)(\.local)?\.json$/.test(f.name));
@@ -243,6 +263,9 @@ input('authoring').onchange = () => {
   catch (error) { showError(error); }
 };
 select('edit-scene').onchange = refreshEditor; select('edit-edge').onchange = refreshEdge;
+select('response-timing').onchange = () => dispatch({ type: 'timing', timing: select('response-timing').value as ResponseTiming });
+input('playback-rate').oninput = () => dispatch({ type: 'rate', rate: Number(input('playback-rate').value) });
+handle('rate-reset', () => dispatch({ type: 'rate', rate: 1 }));
 select('performance-scene').onchange = () => { select('edit-scene').value = select('performance-scene').value; refreshEditor(); };
 handle('apply-editor', async () => { guardStopped(); await load(readEditor(manifest.scenes.find(s => s.id === select('edit-scene').value)!, manifest), reader, true); });
 handle('apply-json', async () => { guardStopped(); await load(JSON.parse(element<HTMLTextAreaElement>('manifest-editor').value), reader, true); });
@@ -289,6 +312,7 @@ handle('render-preview', async () => {
     setText('audition-status', 'Rendering audition…');
     renderedPreview = await renderEventPlan(manifest, assets, plan.events, plan.duration, context.sampleRate);
     previewSource = context.createBufferSource(); previewSource.buffer = renderedPreview.buffer; previewSource.connect(context.destination); previewSource.start(context.currentTime + .05, plan.focusAt);
+    const activePreview = previewSource; activePreview.onended = () => { if (previewSource === activePreview) { activePreview.disconnect(); previewSource = undefined; updateAvailability(); } };
     setText('audition-status', `Audition playing · sample peak ${renderedPreview.peakDbfs.toFixed(2)} dBFS · ${renderedPreview.nonfinite} nonfinite samples. WAV export contains the full render.`);
   } finally { rendering = false; updateAvailability(); }
 });
@@ -313,7 +337,7 @@ context.onstatechange = () => {
   setText('context-state', `Audio ${context.state}`);
   if (session && context.state !== 'running' && session.state.running) { dispatch({ type: 'stop' }); showError('Audio context was suspended. Transport stopped; Start audio establishes a fresh clock mapping.'); }
 };
-window.addEventListener('pagehide', () => { camera.stop(); library.stopAudition(); engine?.dispose(); stopPreview(); if (timer) clearInterval(timer); void context.close(); });
+window.addEventListener('pagehide', () => { spacePanel.dispose(); camera.stop(); library.stopAudition(); engine?.dispose(); stopPreview(); if (timer) clearInterval(timer); void context.close(); });
 async function openInitialCollection() {
   let prepared = preparedCollection(location.search);
   const fixtures = new URLSearchParams(location.search).get('fixtures') === '1';

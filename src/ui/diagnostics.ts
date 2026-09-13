@@ -28,11 +28,12 @@ export function diagnostics(session: PerformanceSession, engine: AudioEngine, no
   text('boundary', boundary === undefined ? 'Next boundary —' : `Recipe in ${Math.max(0, boundary - now).toFixed(2)} s`);
   const transition = s.committedAdvance ?? s.pendingAdvance;
   text('transition', transition ? `${s.committedAdvance ? 'Committed' : 'Pending'} → ${transition.to ?? 'next'}${transition.at ? ` · ${Math.max(0, transition.at - now).toFixed(2)} s` : ''}` : 'No scene transition');
-  text('gesture', session.gesture.armed ? 'Advance armed · hold above 0.92 after one loop' : 'Advance disarmed · hold below 0.75 to rearm');
+  text('gesture', session.gesture.armed ? `Advance armed · hold above 0.92${(s.timing ?? 'authored') === 'authored' ? ' after one loop' : ''}` : 'Advance disarmed · hold below 0.75 to rearm');
   element<HTMLProgressElement>('hold-progress').value = session.gesture.progress;
   for (const id of STEMS) if (deck?.stems[id] && document.getElementById(`meter-${id}`)) {
-    element<HTMLMeterElement>(`meter-${id}`).value = peak(deck.stems[id]!.meter);
-    const gain = deck.stems[id]!.envelope.valueAt(now); text(`gain-${id}`, gain > 0 ? `${(20 * Math.log10(gain)).toFixed(1)} dB` : 'muted');
+    const gain = session.space.enabled ? deck.space.levels[id]!.valueAt(now) : deck.stems[id]!.envelope.valueAt(now);
+    element<HTMLMeterElement>(`meter-${id}`).value = session.space.enabled ? peak(deck.space.meters[id]!) * gain : peak(deck.stems[id]!.meter);
+    text(`gain-${id}`, gain > 0 ? session.space.enabled ? `${Math.round(gain * 100)}% hand mix` : `${(20 * Math.log10(gain)).toFixed(1)} dB` : 'muted');
   } else if (document.getElementById(`meter-${id}`)) {
     element<HTMLMeterElement>(`meter-${id}`).value = 0; text(`gain-${id}`, '—');
   }

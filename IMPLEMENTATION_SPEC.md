@@ -1,8 +1,14 @@
 # Hand-Controlled Stem Performance Demo
 
+> Update, 2026-09-09: The user requested responsive main playing controls. Live performance now defaults to next-beat recipe/passage changes, offers Immediate timing, and supports linked 90-110% speed/pitch. The original phrase-only, fixed-rate rules below describe Phrase endings behavior at 100% and the base acceptance auditions. See README.md and tests/reactivity.* for the current interaction contract.
+
+> Installation update, 2026-09-09: The current default is a bounded hand space using Leap palm height/depth and presence, with a mouse/touch/keyboard preview. Both instrumental and available vocal audio feed an echo/reverb transformation. Stillness holds the chosen sound; withdrawal fades back to the instrumental bed. The optional local LeapC reader supersedes the original webcam-only/no-backend scope. Manual controls preserve the original scalar mapping. See README.md for the implemented interaction, setup and limitations.
+
+> Tracking update, 2026-09-09: Leap input now conditions palm motion, confirms new hands and position outliers, recovers nearby hand-ID changes, and adapts loss hold to 300-650 ms. Native frame-age acceptance adapts to tracking cadence with a 400 ms hard cap. Setup provides per-connection tracking presets, camera/tracking/receive metrics and a diagnostic export. These changes supersede earlier Leap timing notes; the legacy webcam rules below remain separate. Synthetic trajectories and native no-hand checks validate control behavior and connection health, not physical detection accuracy in sunlight.
+
 **Version:** 0.1 · **Date:** September 5, 2026  
 **Deliverable:** A local, single-user desktop-browser instrument, not a general-purpose automatic DJ.  
-**Status:** Proposed implementation specification. No user audio, camera trace, or target hardware has been tested.
+**Status:** Base implementation and subsequent user-requested extensions are implemented. Sun recordings have automated waveform validation, and the installed Leap service has returned live palms. Musical approval and outdoor enclosure/latency testing remain open. Historical v0 requirements below are superseded where noted above.
 
 ## 1. Product decision
 
@@ -194,6 +200,8 @@ scene sum
 Use one `AudioContext`. Prepare all buffers before enabling Start. With two or three short scenes, preload the whole demo; do not implement streaming or an LRU cache. Show estimated decoded memory and fail cleanly on load errors.
 
 At scene entry, create one looping source per stem and call `start(T, 0)` on all of them with the **same future audio timestamp**. All have the same loop bounds and playback rate. Native buffer sources can be scheduled against the audio-context timeline and configured to loop [1, 2].
+
+Derive the full-buffer endpoint from decoded frame count and sample rate. If converting that endpoint back to frames rounds above the buffer length, move it inward by floating-point precision only. Explicitly apply this bound to performance stems, library previews and preview metronomes; the browser's default endpoint can exhibit the same rounding error. Regress repeated-loop waveform fidelity at 44.1/48 kHz and 90/100/110% playback speed, including frame lengths whose seconds-to-frames conversion rounds upward.
 
 **Muted stems continue to play silently.** A recipe change moves gains, not source positions. Unmuting bass exposes the bass at the current harmonic position, rather than replaying the bass from the beginning.
 

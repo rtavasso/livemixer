@@ -94,7 +94,7 @@ export function scenePlaybackConfig(scene: Scene) {
   return playback;
 }
 export async function sceneFingerprint(scene: Scene, hashes: Partial<Record<StemId, string>>, masterTrimDb: number, control: ControlSettings) {
-  return sha256(stableJson({ scene: scenePlaybackConfig(scene), media: hashes, masterTrimDb, control }));
+  return sha256(stableJson({ audioGraphVersion: 'hand-space-instrumental-v2-safe-loops', scene: scenePlaybackConfig(scene), media: hashes, masterTrimDb, control }));
 }
 export async function edgeFingerprint(edge: ResetEdge, fingerprints: Record<string, string>) {
   const { approved: _approved, reviewedFingerprint: _fingerprint, notes: _notes, ...settings } = edge;

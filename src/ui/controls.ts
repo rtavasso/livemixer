@@ -1,3 +1,4 @@
+import { describeRecipes } from './recipes';
 import { RECIPES, STEMS, type Manifest, type Scene } from '../config';
 export const escapeHtml = (value: unknown) => String(value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
 export function element<T extends HTMLElement = HTMLElement>(id: string): T { const node = document.getElementById(id); if (!node) throw new Error(`Missing UI element ${id}`); return node as T; }
@@ -6,11 +7,11 @@ export const input = (id: string) => element<HTMLInputElement>(id);
 export const select = (id: string) => element<HTMLSelectElement>(id);
 export function mount() {
   element('app').innerHTML = `
-  <header><div><span class="eyebrow">LOCAL STEM INSTRUMENT</span><h1>Live Mixer<span class="version">v0.1</span></h1></div><div id="context-state" class="chip">Audio suspended</div></header>
+  <header><div><span class="eyebrow">LOCAL STEM INSTRUMENT</span><h1>Live Mixer<span class="version">v0.1</span></h1></div><div id="context-state" class="chip">Stopped</div></header>
   <div id="error" role="alert" hidden></div>
   <section class="load-row" aria-label="Audio collection">
     <div><strong id="collection">Loading your music…</strong><div id="load-status" class="subtle">Preparing synchronized audio</div></div>
-    <div class="actions"><button id="load-prepared" hidden>Load prepared song</button><button id="load-fixtures">Load test scenes</button><label class="file-button">Open stem folder<input id="folder" type="file" webkitdirectory multiple /></label><label class="file-button">Open manifest<input id="manifest-file" type="file" accept=".json" /></label></div>
+    <div class="actions"><button id="load-prepared" hidden>Load prepared song</button><button id="load-fixtures">Load test scenes</button><label class="file-button">Open saved mix folder<input id="folder" type="file" webkitdirectory multiple /></label><label class="file-button">Open manifest<input id="manifest-file" type="file" accept=".json" /></label></div>
   </section>
   <div class="mode-row"><label><input id="authoring" type="checkbox" checked /> Authoring mode</label><span id="approval-status">Unapproved material may be auditioned.</span><span id="memory" class="subtle"></span></div>
   <section class="transport panel" aria-label="Transport">
@@ -40,7 +41,7 @@ export function mount() {
     </section>
   </div>
   <section class="panel" aria-label="Trace and replay"><div class="section-heading"><h2>Trace & replay</h2><span id="trace-state" class="subtle">Recording locally</span></div><div class="actions"><button id="trace-export">Export trace</button><label class="file-button">Open raw trace<input id="trace-file" type="file" accept=".jsonl,.json" /></label><button id="replay-start" disabled>Play raw replay</button><button id="replay-verify" disabled>Verify decision replay</button><button id="config-export">Export configuration</button></div><p id="replay-status" class="subtle">Raw replay passes through the same smoothing, dwell, and musical planner. Decision verification uses the recorded timing simulation.</p></section>
-  <section id="author-panel" class="panel author-panel" aria-label="Authoring"><div class="section-heading"><h2>Authoring & audition</h2><label>Scene <select id="edit-scene"></select></label></div>
+  <section id="author-panel" class="panel author-panel" aria-label="Authoring"><div class="section-heading"><h2>Passage sound</h2><label>Scene <select id="edit-scene"></select></label></div>
     <p class="subtle">Stop playback to edit. Review all recipes, the filter sweep, seams, every directed recipe change at each allowed bar, and all nine combinations per scene edge.</p>
     <fieldset id="author-fields"><div id="scene-editor"></div><div class="actions"><button id="apply-editor">Apply & revalidate</button><button id="approve-scene">Save manual scene approval</button></div><label class="review-confirm"><input id="review-scene" type="checkbox" /> I have listened to and approved every required recipe, boundary, seam, and filter setting.</label>
     <details><summary>Full manifest editor</summary><textarea id="manifest-editor" spellcheck="false" aria-label="Manifest JSON"></textarea><button id="apply-json">Apply manifest JSON</button></details>
@@ -52,7 +53,7 @@ export function mount() {
 }
 export function renderEditor(scene: Scene, manifest: Manifest) {
   element('scene-editor').innerHTML = `<div class="editor-grid"><label>Scene trim (dB)<input id="scene-trim" type="number" min="-120" max="0" step=".5" value="${scene.sceneTrimDb}" /></label><label>Master trim (dB)<input id="master-trim" type="number" min="-120" max="0" step=".5" value="${manifest.masterTrimDb}" /></label><label>Filter low (Hz)<input id="filter-min" type="number" min="1" value="${scene.filter.minHz}" /></label><label>Filter high (Hz)<input id="filter-max" type="number" min="1" value="${scene.filter.maxHz}" /></label><label>Filter Q (API units)<input id="filter-q" type="number" step=".1" value="${scene.filter.q}" /></label></div>
-    <table><thead><tr><th>Stem</th><th>Static trim, dB</th>${RECIPES.map(r => `<th>${r}, dB</th>`).join('')}</tr></thead><tbody>${STEMS.filter(id => scene.stems[id]).map(id => `<tr><th>${id}${id === scene.anchorStem ? ' · anchor' : ''}</th><td><input type="number" min="-120" max="0" step=".5" id="trim-${id}" aria-label="${id} static trim" value="${scene.stems[id]!.trimDb}" /></td>${RECIPES.map(r => `<td><input type="text" inputmode="decimal" id="gain-${r}-${id}" aria-label="${r} ${id} gain" value="${scene.recipes[r][id] ?? 'mute'}" /></td>`).join('')}</tr>`).join('')}</tbody></table><p class="subtle">Use “mute” for silence. Gains are at most 0 dB.</p><label class="notes">Approval notes<textarea id="scene-notes">${escapeHtml(scene.approval.notes)}</textarea></label>`;
+    <table><thead><tr><th>Stem</th><th>Static trim, dB</th>${RECIPES.map((r, i) => `<th>${escapeHtml(describeRecipes(scene).find(p => p.ids.includes(r))!.label)}<br><small>Slot ${i + 1}, dB</small></th>`).join('')}</tr></thead><tbody>${STEMS.filter(id => scene.stems[id]).map(id => `<tr><th>${id}${id === scene.anchorStem ? ' · anchor' : ''}</th><td><input type="number" min="-120" max="0" step=".5" id="trim-${id}" aria-label="${id} static trim" value="${scene.stems[id]!.trimDb}" /></td>${RECIPES.map(r => `<td><input type="text" inputmode="decimal" id="gain-${r}-${id}" aria-label="${r} ${id} gain" value="${scene.recipes[r][id] ?? 'mute'}" /></td>`).join('')}</tr>`).join('')}</tbody></table><p class="subtle">Use “mute” for silence. Gains are at most 0 dB.</p><label class="notes">Approval notes<textarea id="scene-notes">${escapeHtml(scene.approval.notes)}</textarea></label>`;
   element<HTMLTextAreaElement>('manifest-editor').value = JSON.stringify(manifest, null, 2);
   input('review-scene').checked = false;
 }

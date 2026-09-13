@@ -2,8 +2,9 @@ import { RECIPES, type Manifest, type RecipeId } from '../config';
 import { AudioEngine } from './engine';
 import type { LoadedAssets } from './assets';
 import type { AudioAction, CommitSceneReset, RampRecipe, StartTransport } from '../music/planner';
+import type { SpaceState } from '../control/space';
 export interface RenderedAudio { buffer: AudioBuffer; peak: number; peakDbfs: number; nonfinite: number }
-export interface TimedEvent { at: number; action?: AudioAction; openness?: number; bypass?: boolean }
+export interface TimedEvent { at: number; action?: AudioAction; openness?: number; bypass?: boolean; space?: SpaceState }
 export function measure(buffer: AudioBuffer): RenderedAudio {
   let peak = 0, nonfinite = 0;
   for (let c = 0; c < buffer.numberOfChannels; c++) for (const value of buffer.getChannelData(c)) { if (!Number.isFinite(value)) nonfinite++; else peak = Math.max(peak, Math.abs(value)); }
@@ -14,6 +15,7 @@ export async function renderEventPlan(manifest: Manifest, assets: LoadedAssets, 
   let engine = new AudioEngine(context, manifest, assets);
   const engines = [engine];
   const stopScheduled = (at: number) => {
+    engine.master.gain.setValueAtTime(0, at);
     for (const deck of engine.decks) {
       const stop = Math.min(at, deck.stopAt ?? Infinity); deck.stopAt = stop;
       for (const stem of Object.values(deck.stems)) stem.source.stop(stop);
@@ -21,13 +23,14 @@ export async function renderEventPlan(manifest: Manifest, assets: LoadedAssets, 
   };
   // StopTransport requires a scheduled stop, never pre-render disconnection.
   for (const event of [...events].sort((a, b) => a.at - b.at)) {
+    if (event.space) engine.setSpace(event.space, event.at);
     if (event.bypass !== undefined) engine.setBypass(event.bypass);
     if (event.action?.type === 'StopTransport') {
       stopScheduled(event.action.at);
     } else if (event.action) {
       if (event.action.type === 'StartTransport' && engine.decks.length) {
         stopScheduled(event.at);
-        const prior = engine; engine = new AudioEngine(context, manifest, assets); engine.openness = prior.openness; engine.bypass = prior.bypass; engines.push(engine);
+        const prior = engine; engine = new AudioEngine(context, manifest, assets); engine.openness = prior.openness; engine.bypass = prior.bypass; engine.space = { ...prior.space }; engines.push(engine);
       }
       engine.execute(event.action);
     }

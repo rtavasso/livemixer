@@ -1,4 +1,8 @@
 export interface SceneClock { start: number; duration: number; loopBars: number; beatsPerBar: number }
+export function changeClockRate(clock: SceneClock, at: number, oldRate: number, rate: number): SceneClock {
+  const duration = clock.duration * oldRate / rate;
+  return { ...clock, duration, start: at - (at - clock.start) * duration / clock.duration };
+}
 export const beatSeconds = (clock: SceneClock) => clock.duration / (clock.loopBars * clock.beatsPerBar);
 export const boundary = (clock: SceneClock, index: number, quantumBars: number) => clock.start + index * quantumBars * clock.duration / clock.loopBars;
 export function nextBoundary(clock: SceneClock, earliest: number, quantumBars: number) {

@@ -5,11 +5,11 @@ import { readFile } from 'node:fs/promises';
 test('invalid and missing prepared collections show an error and allow fixture recovery', async ({ page }) => {
   await page.goto('/?collection=..%2Fsecret&tools=1');
   await expect(page.locator('#error')).toContainText('Invalid local collection ID');
-  await page.locator('#load-fixtures').click(); await expect(page.locator('#start')).toBeEnabled();
+  await page.locator('#setup-tab').click(); await page.locator('#load-fixtures').click(); await expect(page.locator('#start')).toBeEnabled();
   await page.route('**/scenes/missing-test-collection/manifest.json', route => route.fulfill({ status: 404, body: '' }));
   await page.goto('/?collection=missing-test-collection&tools=1');
   await expect(page.locator('#error')).toContainText('Prepared collection is missing');
-  await page.locator('#load-fixtures').click(); await expect(page.locator('#start')).toBeEnabled();
+  await page.locator('#setup-tab').click(); await page.locator('#load-fixtures').click(); await expect(page.locator('#start')).toBeEnabled();
 });
 
 test('prepared real stems play, measure with headroom, and restore their full-song library', async ({ page }) => {
@@ -18,6 +18,7 @@ test('prepared real stems play, measure with headroom, and restore their full-so
   const errors: string[] = []; page.on('pageerror', error => errors.push(error.message));
   await page.goto('/?collection=love-supreme-sun');
   await expect(page.locator('#start')).toBeEnabled(); await expect(page.locator('#collection')).toContainText('LOVE SUPREME - Sun');
+  await page.locator('#play-mode').selectOption('manual');
   const manifest = JSON.parse(await page.locator('#manifest-editor').inputValue());
   expect(Object.keys(manifest.scenes[0].stems)).toHaveLength(4);
   expect(manifest.scenes[0].recipes.sparse.vocals).toBeNull();
@@ -25,7 +26,7 @@ test('prepared real stems play, measure with headroom, and restore their full-so
   await page.locator('#vocal-toggle').click();
   await expect(page.locator('#current-recipe')).toHaveText('open', { timeout: 30000 });
   await page.locator('#stop').click();
-  await page.locator('#studio-tools > summary').click(); await page.locator('#render-all').click();
+  await page.locator('#setup-tab').click(); await page.locator('#setup-authoring > summary').click(); await page.locator('#render-all').click();
   await expect(page.locator('#render-status')).toContainText('Complete', { timeout: 90000 });
   await expect(page.locator('#render-status')).toContainText('0 failed');
   const reportEvent = page.waitForEvent('download'); await page.locator('#report-export').click();
@@ -34,7 +35,7 @@ test('prepared real stems play, measure with headroom, and restore their full-so
   expect(report.completed).toBe(true); expect(report.results.every((r: any) => r.nonfinite === 0 && r.peakDbfs < -1)).toBe(true);
   await page.screenshot({ path: 'test-results/sun-instrument.png', fullPage: true });
   await page.locator('#library-tab').click(); await page.locator('#library-prepared').click();
-  await expect(page.locator('#analysis-progress')).toContainText('Prepared song loaded', { timeout: 30000 });
+  await expect(page.locator('#analysis-progress')).toContainText('Full song opened', { timeout: 30000 });
   await expect(page.locator('#library-count')).toContainText('1 analyzed');
   await expect(page.locator('#song-detail')).toContainText('vocals');
   await expect(page.locator('#mix-path .path-card')).toHaveCount(3);

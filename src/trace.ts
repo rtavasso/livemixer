@@ -1,5 +1,5 @@
 import type { SessionInput } from './music/session';
-export const BUILD_VERSION = '0.1.0';
+export const BUILD_VERSION = '0.1.0-hand-space-2';
 export interface TraceRecord { type: string; atMs: number; [key: string]: unknown }
 export interface TraceInput extends TraceRecord { type: 'input'; input: SessionInput; audioTime: number }
 export class TraceRecorder {

@@ -3,8 +3,8 @@ import { readFile } from 'node:fs/promises';
 test('slider performance, desired/committed state, stop, and authoring gate', async ({ page }) => {
   const errors: string[] = []; page.on('pageerror', e => errors.push(e.message));
   await page.goto('/?fixtures=1&tools=1'); await expect(page.locator('#start')).toBeEnabled();
-  await page.locator('#authoring').uncheck(); await expect(page.locator('#start')).toBeDisabled(); await expect(page.locator('#approval-status')).toContainText('review');
-  await page.locator('#authoring').check(); await page.getByRole('button', { name: 'Start audio', exact: true }).click();
+  await page.locator('#setup-tab').click(); await page.locator('#authoring').uncheck(); await expect(page.locator('#start')).toBeDisabled(); await expect(page.locator('#approval-status')).toContainText('review');
+  await page.locator('#authoring').check(); await page.locator('#instrument-tab').click(); await page.getByRole('button', { name: 'Start audio', exact: true }).click();
   await expect(page.locator('#context-state')).toHaveText('Audio running'); await expect(page.locator('#nodes')).toContainText('3 sources');
   await page.locator('#openness').fill('1'); await page.locator('#openness').dispatchEvent('input');
   await expect(page.locator('#desired-recipe')).toHaveText('open'); await expect(page.locator('#current-recipe')).toHaveText('open', { timeout: 4000 });
@@ -15,7 +15,7 @@ test('slider performance, desired/committed state, stop, and authoring gate', as
 });
 test('trace export and deterministic raw-control verification', async ({ page }) => {
   await page.goto('/?fixtures=1&tools=1'); await expect(page.locator('#start')).toBeEnabled(); await page.locator('#start').click();
-  await page.locator('[data-recipe="open"]').click(); await expect(page.locator('#current-recipe')).toHaveText('open', { timeout: 4000 }); await page.locator('#stop').click();
+  await page.locator('#setup-tab').click(); await page.locator('[data-recipe="open"]').click(); await expect(page.locator('#current-recipe')).toHaveText('open', { timeout: 4000 }); await page.locator('#stop-all').click();
   const downloadPromise = page.waitForEvent('download'); await page.locator('#trace-export').click(); const download = await downloadPromise;
   const text = await readFile((await download.path())!, 'utf8');
   await page.locator('#trace-file').setInputFiles({ name: 'trace.jsonl', mimeType: 'application/x-ndjson', buffer: Buffer.from(text) });
@@ -30,7 +30,7 @@ test('a missing user asset fails clearly and retains the loaded collection', asy
 });
 test('authoring edits invalidate approval and configuration can be exported', async ({ page }) => {
   await page.goto('/?fixtures=1&tools=1'); await expect(page.locator('#start')).toBeEnabled();
-  await page.locator('#review-scene').check(); await page.locator('#approve-scene').click();
+  await page.locator('#setup-tab').click(); await page.locator('#review-scene').check(); await page.locator('#approve-scene').click();
   await expect(page.locator('#load-status')).toContainText('approval saved');
   await page.locator('#filter-max').fill('7000'); await page.locator('#apply-editor').click();
   await expect(page.locator('#load-status')).toContainText('Ready'); await page.locator('#authoring').uncheck();
