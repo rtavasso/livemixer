@@ -72,6 +72,7 @@ export default defineSimulation({
     caustics: { kind: 'number', default: .7, min: 0, max: 2, step: .01, label: 'Caustics', description: 'Brightness of the refracted light playing on the bowl floor.' },
     ripples: { kind: 'number', default: .65, min: 0, max: 1.5, step: .01, label: 'Ripples', description: 'Surface response to drops and moving hands. Waves travel, reflect off the rim, and settle independently of the ink.' },
     glaze: { kind: 'color', default: '#a6a394', label: 'Bowl glaze', description: 'Ceramic colour beneath the clear water. Pale glazes reveal pigment; dark glazes emphasize reflections.' },
+    ceramicTexture: { kind: 'number', default: 1, min: 0, max: 1.5, step: .05, label: 'Ceramic texture', description: 'Fine speckles, wheel marks and glaze variation in the submerged bowl. Set to zero for a smooth finish.' },
     elevation: { kind: 'number', default: DEFAULT_ELEVATION, min: 35, max: 90, step: 1, unit: '°', label: 'Camera elevation', description: 'Angle above the table: 40° shows the bowl profile and water depth; 90° looks straight down. Physics and mixer signals are unchanged.' },
   },
   signals: {
@@ -326,6 +327,7 @@ export default defineSimulation({
           .f1('u_light', params.light).f1('u_caustics', params.caustics).f1('u_presence', presence)
           .texture('u_wave', wave.read.texture, 4).f2('u_waveTexel', 1 / waveN, 1 / waveN)
           .f3('u_glaze', glaze[0] ** 2.2, glaze[1] ** 2.2, glaze[2] ** 2.2)
+          .f1('u_ceramicTexture', params.ceramicTexture)
           .f2('u_viewAngle', Math.sin(elevation), Math.cos(elevation))
           .i1('u_shadowCount', shadowCount).f4v('u_shadowHands', shadowHands).f4v('u_shadowMeta', shadowMeta).f4v('u_capSeg', capSeg).f4v('u_capMeta', capMeta)
           .f4('u_scan', scan.bx, scan.by, scan.bound, scanOpacity);

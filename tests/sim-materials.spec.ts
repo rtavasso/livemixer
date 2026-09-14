@@ -70,17 +70,19 @@ test('corrected GPU ink transport retains detail without introducing pigment ext
   }
 });
 
-for (const packed of [false, true]) test(`Basin camera changes preserve the running fluid (${packed ? 'RGBA8' : 'float'})`, async ({ page }) => {
+for (const packed of [false, true]) test(`Basin material and camera changes preserve the running fluid (${packed ? 'RGBA8' : 'float'})`, async ({ page }) => {
   await page.goto(`/sim.html?sim=basin&source=synthetic&overlay=0&quality=medium&forceRgba8=${packed ? 1 : 0}`);
   await page.waitForFunction(() => !!window.livemixerSim?.host.latestOutput);
   await page.waitForFunction(() => window.livemixerSim.host.state().signals.ink > .01);
   for (const elevation of [35, 40, 90]) {
-    const change = await page.evaluate(angle => {
+    const texture = elevation === 35 ? 1.5 : elevation === 90 ? 0 : 1;
+    const change = await page.evaluate(({ angle, texture }) => {
       const h = window.livemixerSim.host, before = h.latestOutput;
       h.setParam('elevation', angle);
-      return { preserved: h.latestOutput === before, angle: h.currentParams.elevation };
-    }, elevation);
-    expect(change).toEqual({ preserved: true, angle: elevation });
+      h.setParam('ceramicTexture', texture);
+      return { preserved: h.latestOutput === before, angle: h.currentParams.elevation, texture: h.currentParams.ceramicTexture };
+    }, { angle: elevation, texture });
+    expect(change).toEqual({ preserved: true, angle: elevation, texture });
     await page.waitForTimeout(300);
     const s = await page.evaluate(() => { const h = window.livemixerSim.host, s = h.state(); return { warnings: s.warnings.map(w => w.message), violations: s.signalViolations, ink: s.signals.ink, glError: h.gl.getError() }; });
     expect(s.warnings.filter(w => !/8-bit precision|reduced precision/.test(w))).toEqual([]);

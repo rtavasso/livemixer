@@ -8,7 +8,7 @@ so opposing fold movements cannot cancel into an incorrectly silent signal.
 
 | Study | Material and motion | New controls |
 | --- | --- | --- |
-| Basin | Absorbing ink under clear water, travelling ripples, refracted glaze, window reflections, curved porcelain bowl and stone table | Ripples, bowl glaze, camera elevation |
+| Basin | Absorbing ink under clear water, travelling ripples, refracted glaze, window reflections, curved porcelain bowl and stone table | Ripples, bowl glaze, ceramic texture, camera elevation |
 | Veil | Woven linen with independent fibre colour, translucent folds, soft sheen, layered hems and stitching in daylight | Fabric colour, fibre sheen |
 | Prism | Closed optical glass, entry/exit refraction, thickness absorption, polished studio reflections and a stone light table | Glass polish |
 
@@ -25,6 +25,13 @@ an interior floor refracted through water. The default glaze is warm ivory.
 Water mirrors a window with sharp, derivative-filtered edges, while ceramic
 keeps broader reflections. Four subpixel samples around the rim and exterior
 silhouette smooth geometric edges without blurring the ink across the image.
+The submerged ceramic has a deeper inner curve, irregular wheel marks, fine
+iron speckles and mottled glaze. Marks use the refracted surface position and
+bend around the inner wall. Small normal variations let light catch the ridges;
+the wall blocks light that cannot reach the floor through the opening. Water
+attenuation follows the optical path length. **H → Ceramic texture** controls
+the finish (default 1; zero gives smooth glaze). Detail fades below pixel size.
+These changes add no textures, render targets or simulation passes.
 The physical x/depth input plane and mixer signal coordinates stay fixed when
 the camera moves.
 
@@ -87,20 +94,20 @@ to 0.397 instead of remaining zero. Audio was running with a nonzero output
 meter in all three. Those local reports are in `shots/benchmark-mixer/` and
 `shots/benchmark-veil-final/`; no long-duration thermal claim is implied.
 
-The final Basin camera/ink refinement was measured again on the same GPU,
+The Basin camera, ink and ceramic refinements were measured on the same GPU,
 with the same warmup and 20-second sampling window. These runs count actual
 published simulation frames as well as browser animation frames:
 
 | Basin view | Drawing buffer | Simulation fps | Frame p95 / p99 | Longest simulation gap | Dropped simulation time |
 | --- | --- | ---: | --- | ---: | ---: |
-| Studio | 1280 × 800 | 58.7 | 17.6 / 19.9 ms | 129.6 ms | 76.7 ms |
-| Fullscreen mixer with audio | 1405 × 728 | 56.9 | 17.7 / 49.8 ms | 133.1 ms | 134.0 ms |
+| Studio | 1280 × 800 | 60.0 | 17.6 / 17.7 ms | 29.2 ms | 0.0 ms |
+| Fullscreen mixer with audio | 1405 × 728 | 60.0 | 17.6 / 17.7 ms | 18.9 ms | 0.0 ms |
 
-There were no rendering warnings or signal-range violations, and mixer audio
-was running with a nonzero meter. These samples show occasional stalls rather
-than an uninterrupted 60 fps. Reports are in `shots/basin-depth/verified-studio/`
-and `shots/basin-depth/verified-mixer/`; the final visual capture is in
-`shots/basin-depth/final-studio/basin.png`.
+There were no rendering warnings, signal-range violations or dropped simulation
+time, and mixer audio was running with a nonzero meter. These are short samples,
+not a frame-rate guarantee. Reports are in `shots/basin-ceramic/benchmark-studio/`
+and `shots/basin-ceramic/benchmark-mixer/`; the visual capture is
+`shots/basin-ceramic/benchmark-studio/basin.png`.
 
 ```sh
 PORT=4190 npm run dev
@@ -130,11 +137,11 @@ or webcam inference performance.
 
 ## Validation
 
-The Basin refinement passed 57 focused unit checks and 13 browser checks,
-including GPU ink transport on floating and RGBA8 targets, camera changes at
-35°, 40° and 90° without a fluid reset, wave propagation, Retina pixel budgets,
-and the mixer workflows. The existing replay UI test timed out once clicking
-Setup and passed in an isolated retry. The production build also passed.
+The submerged ceramic update passed 57 focused unit checks and three browser
+checks covering floating/RGBA8 targets, material strengths 0–1.5, camera angles
+35–90° without a fluid reset, all quality tiers, and Retina pixel budgets.
+Older performance patches acquire the texture default while preserving authored
+controls and routes. The production build also passed.
 
 ## Physical models and limits
 

@@ -17,6 +17,7 @@ import { GLSL_HEADER } from '../../gl/program';
 import { MATERIAL_GLSL } from '../../gl/material';
 import { WAVE_STORAGE_GLSL } from './waves';
 import { BASIN_VIEW_GLSL } from './view';
+import { BASIN_CERAMIC_GLSL } from './ceramic';
 import { surfaceGlsl } from '../../gl/surface';
 import {
   CAUSTIC_LACUNARITY, CAUSTIC_PERIOD, LIGHT_SHIFT, MAX_FOOTPRINTS, MAX_SHADOW_CAPSULES, PACKED_VELOCITY_SCALE, PENUMBRA_BASE, PENUMBRA_PER_HEIGHT,
@@ -294,6 +295,7 @@ uniform sampler2D u_dye, u_velocity, u_pressure, u_wave;
 uniform vec2 u_pixel, u_dyeTexel, u_waveTexel;
 uniform vec3 u_glaze;
 ${MATERIAL_GLSL}
+${BASIN_CERAMIC_GLSL}
 ${WAVE_STORAGE_GLSL}
 ${BASIN_VIEW_GLSL}
 uniform float u_aspect, u_domain, u_light, u_caustics, u_presence;
@@ -521,12 +523,15 @@ vec4 shadeBasin(vec2 uv) {
   // Snell refraction through a shallow water layer. Floor and ink share the
   // displaced coordinate so highlights slide over pigment, rather than sticking to it.
   vec3 transmitted = refract(-V, n, 1.0 / 1.333);
-  vec3 innerCentre = vec3(0, 0, 0.12 * scale);
-  float innerZ = 0.235 * scale;
+  vec3 innerCentre = vec3(0, 0, 0.04 * scale);
+  float innerZ = 0.24 * scale;
   float innerXY = R / sqrt(1.0 - pow(innerCentre.z / innerZ, 2.0));
   vec3 innerRadii = vec3(innerXY, innerXY, innerZ);
   vec3 underOrigin = waterPoint + transmitted * 0.0001;
   float floorT = ellipsoidRoots(underOrigin, transmitted, innerCentre, innerRadii).y;
+  // A ripple at the boundary can put its ray just outside the inner bowl.
+  // Shade the wet wall locally on a miss, never an extrapolated far-away point.
+  if (floorT < 0.0 || floorT > 2.0 * R) floorT = 0.0;
   vec3 floorPoint = underOrigin + transmitted * floorT;
   vec3 floorNormal = -ellipsoidNormal(floorPoint, innerCentre, innerRadii);
   vec2 floorUV = floorPoint.xy + 0.5;
@@ -535,14 +540,12 @@ vec4 shadeBasin(vec2 uv) {
   // Beer-Lambert absorption: complementary channels absorb, thick pigment darkens.
   vec3 absorption = (vec3(dye.r + dye.g + dye.b) - dye) * 3.2 + density * 0.45;
   vec3 transmission = exp(-absorption);
-  float grain = materialNoise(floorUV * 210.0) - 0.5;
-  vec3 ceramic = u_glaze * (1.0 + grain * 0.035);
-  float diffuse = 0.30 + 0.70 * max(dot(floorNormal, Ld), 0.0);
-  // A curved, directional-lit interior makes depth legible through still water.
-  ceramic *= diffuse * (0.78 + 0.22 * max(floorNormal.z, 0.0));
+  vec3 lightUnder = -refract(-Ld, vec3(0, 0, 1), 1.0 / 1.333);
+  vec3 ceramic = basinCeramic(floorPoint, floorNormal, (floorPoint - innerCentre) / innerRadii,
+    -transmitted, lightUnder, R, scale);
   float focus = clamp(1.0 - (hL + hR + hB + hT - 4.0 * h) / (e.x * e.x) * 0.045, 0.5, 1.8);
   ceramic *= 0.9 + u_caustics * focus * 0.14;
-  vec3 water = ceramic * transmission * vec3(0.91, 0.97, 0.99) * shade;
+  vec3 water = ceramic * transmission * exp(-vec3(0.32, 0.12, 0.055) * max(floorT, 0.0)) * shade;
   vec3 bowlCol = water * (1.0 - fres) + reflected;
   bowlCol += vec3(0.85, 0.92, 1.0) * ringLit * 0.13 * u_light;
 
