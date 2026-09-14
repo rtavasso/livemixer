@@ -2,7 +2,8 @@
  * WebGL2 setup and capability probing. Simulations get a `SimContext`; this
  * module owns the raw context, resizing, and context-loss recovery signals.
  */
-import type { GlCapabilities } from '../core/types';
+import type { GlCapabilities, Quality } from '../core/types';
+import { renderSize } from './resolution';
 
 export interface GlSetup { gl: WebGL2RenderingContext; capabilities: GlCapabilities }
 
@@ -19,12 +20,11 @@ export function createGl(canvas: HTMLCanvasElement): GlSetup {
   return { gl, capabilities: { floatColor, halfFloatColor, linearFloat, maxTextureSize: gl.getParameter(gl.MAX_TEXTURE_SIZE) as number } };
 }
 
-/** Resize the drawing buffer to the element size × dpr (capped). Returns true when it changed. */
-export function fitCanvas(canvas: HTMLCanvasElement, maxDpr: number): boolean {
+/** Resize within both the requested DPR and the quality tier's pixel budget. */
+export function fitCanvas(canvas: HTMLCanvasElement, maxDpr: number, quality: Quality = 'medium'): boolean {
   // Switching mixer tabs hides the element. Keep the world dimensions while audio continues.
   if (!canvas.clientWidth || !canvas.clientHeight) return false;
-  const dpr = Math.min(maxDpr, window.devicePixelRatio || 1);
-  const width = Math.max(1, Math.round(canvas.clientWidth * dpr)), height = Math.max(1, Math.round(canvas.clientHeight * dpr));
+  const { width, height } = renderSize(canvas.clientWidth, canvas.clientHeight, maxDpr, window.devicePixelRatio, quality);
   if (canvas.width === width && canvas.height === height) return false;
   canvas.width = width; canvas.height = height;
   return true;

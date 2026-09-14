@@ -24,6 +24,22 @@ describe('portable performance patches', () => {
       expect(Object.keys(p.settings.params[sim.id])).toEqual(Object.keys(sim.params));
     }
   });
+  it('loads earlier material patches with defaults while preserving authored controls and routes', () => {
+    for (const [sim, added, authored, value] of [
+      ['basin', ['ripples', 'glaze'], 'viscosity', .45],
+      ['veil', ['fabric', 'sheen'], 'opacity', .2],
+      ['prism', ['roughness'], 'dispersion', 1],
+    ] as const) {
+      const p = defaultPatch(settingsSchema.parse({ sim }));
+      for (const name of added) delete p.settings.params[sim][name];
+      p.settings.params[sim][authored] = value;
+      p.routes.engagement.outputMax = .8;
+      const restored = parsePatch(JSON.parse(JSON.stringify(p)));
+      expect(restored.settings.params[sim][authored]).toBe(value);
+      expect(restored.routes).toEqual(p.routes);
+      for (const name of added) expect(restored.settings.params[sim][name]).toBeDefined();
+    }
+  });
   it('rejects unavailable simulations, removed signals, bad parameters and unsupported versions', () => {
     const p = patch();
     expect(() => parsePatch({ ...p, version: 2 })).toThrow();

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CAPSULE_STRIDE, Cloth, COLLIDER_STRIDE, type ColliderPack, CONTACT_SKIN, MAX_COLLIDER_CAPSULES, MAX_COLLIDERS, NO_COLLIDERS, type ClothStepParams } from '../../src/sim/sims/veil/cloth';
+import { CAPSULE_STRIDE, Cloth, COLLIDER_STRIDE, type ColliderPack, CONTACT_SKIN, lateralDisplacement, MAX_COLLIDER_CAPSULES, MAX_COLLIDERS, NO_COLLIDERS, type ClothStepParams } from '../../src/sim/sims/veil/cloth';
 import { CAPSULE_PAD, type ColliderHand, HandColliders, handRadius, RADIUS_MAX, RADIUS_PAD, strengthEase } from '../../src/sim/sims/veil/colliders';
 import { SCAN_SLOPE_MAX, SCAN_THICKNESS, ScanShell } from '../../src/sim/sims/veil/scan';
 import { WindField } from '../../src/sim/sims/veil/wind';
@@ -697,9 +697,16 @@ describe('veil layout', () => {
 });
 
 describe('veil definition', () => {
+  it('measures lateral motion even when straightening one fold cancels the mean offset of another', () => {
+    const settled = new Float64Array([-.1, 1.1]);
+    // Relative to straight columns [0, 1], both states have a mean offset of .1.
+    // Each material point has nevertheless moved left by .1.
+    expect(lateralDisplacement(new Float64Array([-.2, 0, 0, 1, 0, 0]), settled)).toBeCloseTo(.1);
+    expect(lateralDisplacement(new Float64Array([-.1, 2, .4, 1.1, 3, -.4]), settled)).toBe(0);
+  });
   it('declares the contract', () => {
     expect(veil.id).toBe('veil'); expect(veil.title).toBe('Veil'); expect(veil.stepHz).toBe(60);
-    expect(Object.keys(veil.params).sort()).toEqual(['backlight', 'damping', 'drape', 'gustiness', 'opacity', 'plane', 'stiffness', 'tint', 'weave', 'wind']);
+    expect(Object.keys(veil.params).sort()).toEqual(['backlight', 'damping', 'drape', 'fabric', 'gustiness', 'opacity', 'plane', 'sheen', 'stiffness', 'tint', 'weave', 'wind']);
     expect(veil.params.plane.default).toBeCloseTo(.45, 6); expect(veil.params.plane.min).toBeGreaterThan(0); expect(veil.params.plane.max).toBeLessThan(1);
     expect(Object.keys(veil.signals).sort()).toEqual(['contact', 'depth', 'flutter', 'gust', 'sway', 'tension']);
     expect(veil.signals.depth.min).toBe(-1); expect(veil.signals.depth.max).toBe(1);

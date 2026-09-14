@@ -554,6 +554,16 @@ export class Cloth {
   }
 }
 
+/** Mean displacement from each point's settled x, in world units. Subtracting
+ * two mean fold offsets loses motion whenever one fold straightens while
+ * another moves outward; compare corresponding points before averaging.
+ */
+export function lateralDisplacement(positions: Float64Array, settledX: Float64Array): number {
+  let distance = 0;
+  for (let i = 0; i < settledX.length; i++) distance += Math.abs(positions[i * 3] - settledX[i]);
+  return settledX.length ? distance / settledX.length : 0;
+}
+
 /** Per-constraint correction shares wa/(wa+wb), wb/(wa+wb); zero for pinned pairs. */
 function weights(w: Float64Array, A: Int32Array, B: Int32Array, outA: Float64Array, outB: Float64Array) {
   for (let c = 0; c < A.length; c++) { const wa = w[A[c]], wb = w[B[c]], ws = wa + wb; outA[c] = ws > 0 ? wa / ws : 0; outB[c] = ws > 0 ? wb / ws : 0; }

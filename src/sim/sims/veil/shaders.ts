@@ -19,6 +19,7 @@
  * only rays that cross the box sample it.
  */
 import { GLSL_HEADER } from '../../gl/program';
+import { MATERIAL_GLSL } from '../../gl/material';
 import { handSdfGlsl } from '../../gl/hand';
 import { surfaceGlsl } from '../../gl/surface';
 
@@ -92,6 +93,7 @@ vec4 scanHit(vec3 ro, vec3 rd, float zExit, int steps) {
  */
 export const BACKGROUND_FS = `${GLSL_HEADER}
 in vec2 v_uv; out vec4 o;
+${MATERIAL_GLSL}
 uniform float u_aspect, u_depth, u_eye, u_plane;
 uniform vec3 u_tint;
 uniform float u_backlight;
@@ -113,7 +115,7 @@ void main() {
     // Floor: near black, a little lighter toward the wall.
     vec3 P = E + D * tFloor;
     float far = clamp(P.z / u_depth, 0.0, 1.0);
-    vec3 ground = mix(vec3(0.0040, 0.0041, 0.0058), vec3(0.0060, 0.0061, 0.0080), far);
+    vec3 ground = mix(vec3(0.027, 0.023, 0.019), vec3(0.045, 0.038, 0.03), far);
     // Light through the window pooling on the floor by the wall.
     float toWall = (u_depth - P.z) / (u_window.w + 0.3);
     float across = (P.x - u_window.x) / (u_window.z + 0.4);
@@ -124,18 +126,22 @@ void main() {
     float mirror = (1.0 - smoothstep(0.0, 0.3, dm.x)) * (1.0 - smoothstep(0.0, 0.6, dm.y));
     // In front of the curtain the reflection is seen through the sheet: dimmer.
     mirror *= mix(0.35, 1.0, smoothstep(u_plane - 0.04, u_plane + 0.04, P.z));
-    c = ground + glow * (0.045 * pool + 0.014 * mirror);
+    ground *= 0.85 + 0.3 * materialNoise(P.xz * vec2(9.0, 180.0));
+    c = ground + glow * (0.11 * pool + 0.05 * mirror);
   } else {
     // Back wall: a deep, slightly cool ground, lighter near the floor, with the soft window and its halo.
     vec3 P = E + D * tWall;
-    vec3 ground = mix(vec3(0.0052, 0.0054, 0.0076), vec3(0.0016, 0.0017, 0.0028), smoothstep(-0.2, 1.4, P.y));
+    vec3 ground = mix(vec3(0.065, 0.064, 0.06), vec3(0.028, 0.034, 0.045), smoothstep(-0.2, 1.4, P.y));
     vec2 d = abs(P.xy - u_window.xy) - u_window.zw;
-    float box = (1.0 - smoothstep(0.0, 0.2, d.x)) * (1.0 - smoothstep(0.0, 0.2, d.y));
+    float box = (1.0 - smoothstep(0.0, 0.055, d.x)) * (1.0 - smoothstep(0.0, 0.055, d.y));
+    vec2 pane = abs(P.xy - u_window.xy);
+    float frame = smoothstep(0.009, 0.028, pane.x) * smoothstep(0.009, 0.028, pane.y);
+    box *= mix(0.28, 1.0, frame);
     vec2 q = d / (u_window.zw + 0.7);
     float halo = exp(-dot(q, q) * 1.5);
     // A touch brighter toward the top of the pane, like sky.
     float sky = 0.85 + 0.3 * smoothstep(u_window.y - u_window.w, u_window.y + u_window.w, P.y);
-    c = ground + glow * (0.095 * box * sky + 0.028 * halo);
+    c = ground + glow * (0.42 * box * sky + 0.055 * halo);
   }
   // Hands: sphere-trace the capsule field along the part of the ray inside a hand's bounds, stopping at the room.
   // A dark silhouette with a faint rim from the window behind it. What lies in front of the sheet's plane stays
@@ -220,9 +226,11 @@ void main() {
  */
 export const CLOTH_FS = `${GLSL_HEADER}
 in vec3 v_pos; in vec3 v_normal; in vec2 v_uv; out vec4 o;
+${MATERIAL_GLSL}
 uniform float u_opacity;
 uniform float u_backlight;
-uniform float u_weave;
+uniform float u_weave, u_sheen;
+uniform vec3 u_fabric;
 uniform vec3 u_tint;
 uniform vec3 u_cam;       // the window camera's eye
 uniform vec3 u_light;     // the window's light, a little behind the back wall
@@ -249,9 +257,14 @@ void main() {
   vec2 keep = 1.0 - smoothstep(0.15, 0.4, periodsPerPixel);
   vec2 stripes = 0.5 + 0.5 * cos(v_uv * u_threads * 6.2831853);
   // Warp-dominant striations; the weft is faint so the two never multiply into a dot grid.
-  float weave = 1.0 + u_weave * (0.3 * (stripes.x - 0.5) * keep.x + 0.1 * (stripes.y - 0.5) * keep.y);
+  float weave = 1.0 + u_weave * (0.22 * (stripes.x - 0.5) * keep.x + 0.18 * (stripes.y - 0.5) * keep.y);
   float uneven = 1.0 + 0.15 * (vnoise(v_uv * vec2(11.0, 7.0)) - 0.5) + 0.06 * (vnoise(v_uv * vec2(37.0, 23.0)) - 0.5);
-  float density = tau * weave * uneven;
+  // Turned hems have three layers, two fine stitch rows, and a slightly puckered edge.
+  float hem = smoothstep(0.94, 0.95, v_uv.y);
+  float selvedge = 1.0 - smoothstep(0.008, 0.018, min(v_uv.x, 1.0 - v_uv.x));
+  float stitch = exp(-pow((v_uv.y - 0.952) / max(fwidth(v_uv.y), 0.0006), 2.0))
+               + exp(-pow((v_uv.y - 0.978) / max(fwidth(v_uv.y), 0.0006), 2.0));
+  float density = tau * weave * uneven * (1.0 + 1.8 * hem + 1.2 * selvedge);
   float cover = 1.0 - exp(-density / max(facing, 0.07));
   // Soft selvedge and hem so the cut edges do not read as a hard polygon.
   float edge = smoothstep(0.0, u_fade.x, v_uv.x) * smoothstep(0.0, u_fade.x, 1.0 - v_uv.x) * smoothstep(0.0, u_fade.y, 1.0 - v_uv.y);
@@ -303,31 +316,37 @@ void main() {
       shadow *= mix(1.0, 0.55, cover);
     }
   }
-  float through = 0.45 + 0.55 * abs(dot(n, L));
+  float through = 0.35 + 0.65 * abs(dot(n, L));
   float falloff = 1.6 / (1.0 + dist2 * 0.55);
   float grazing = 1.0 - facing;
-  float lobe = 1.0 + 2.5 * grazing * grazing;
-  vec3 glow = u_tint * u_backlight * through * falloff * lobe * shadow * 0.22;
-  // Faint cool fill from the room's front (the viewer's side), on whichever face looks at the viewer.
   vec3 nv = dot(n, V) < 0.0 ? -n : n;
-  vec3 Lf = normalize(vec3(-0.35, 0.55, -1.0));
-  vec3 fill = vec3(0.55, 0.65, 0.85) * (0.005 + 0.02 * max(0.0, dot(nv, Lf)));
-  vec3 fabric = (glow + fill) * cover;
-  // Soft rim where the sheet turns away from the viewer.
-  float rim = grazing * grazing * grazing * grazing * edge;
-  fabric += u_tint * u_backlight * rim * 0.08;
+  vec3 Lf = normalize(vec3(-0.65, 0.45, -0.8));
+  float noL = max(dot(nv, Lf), 0.0);
+  // Wrapped diffuse and transmitted daylight. Edge-on fibres absorb more
+  // light, while front-lit folds reveal the independent colour of the yarn.
+  vec3 diffuse = u_fabric * (vec3(0.10, 0.13, 0.18) + vec3(0.52, 0.48, 0.40) * noL);
+  vec3 transmission = sqrt(u_fabric) * u_tint * u_backlight * through * falloff * shadow * 0.28;
+  // Charlie fibre distribution (Imageworks / Filament), broad and non-metallic.
+  vec3 H = normalize(Lf + V);
+  float noH = max(dot(nv, H), 0.0);
+  float distribution = 3.0 * pow(max(1.0 - noH * noH, 0.0), 1.25) / 6.2831853;
+  float visibility = 1.0 / max(4.0 * (noL + facing - noL * facing), 0.12);
+  vec3 sheen = sqrt(u_fabric) * u_sheen * distribution * visibility * noL * 2.0;
+  // Fine slubs modulate radiance without aliasing into a screen-space dot grid.
+  float fibre = 1.0 + u_weave * 0.07 * (vnoise(v_uv * vec2(320.0, 90.0)) - 0.5);
+  vec3 fabric = ((diffuse + transmission) * fibre + sheen) * cover;
+  fabric *= 1.0 - 0.10 * clamp(stitch, 0.0, 1.0);
+  fabric += sqrt(u_fabric) * u_tint * u_sheen * pow(grazing, 4.0) * edge * 0.035;
   o = vec4(fabric, cover);
 }`;
 
 /** Exposure, soft shoulder, gamma and a static dither. */
 export const POST_FS = `${GLSL_HEADER}
 in vec2 v_uv; out vec4 o;
+${MATERIAL_GLSL}
 uniform sampler2D u_scene;
 uniform float u_exposure;
 void main() {
   vec3 c = texture(u_scene, v_uv).rgb * u_exposure;
-  c = c / (1.0 + c);
-  c = pow(max(c, 0.0), vec3(1.0 / 2.2));
-  float d = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
-  o = vec4(c + d / 255.0, 1.0);
+  o = vec4(filmicOutput(c, gl_FragCoord.xy), 1.0);
 }`;

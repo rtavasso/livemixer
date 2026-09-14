@@ -14,6 +14,8 @@
  * height, and a meniscus ring wherever the solid breaks the surface.
  */
 import { GLSL_HEADER } from '../../gl/program';
+import { MATERIAL_GLSL } from '../../gl/material';
+import { WAVE_STORAGE_GLSL } from './waves';
 import { surfaceGlsl } from '../../gl/surface';
 import {
   CAUSTIC_LACUNARITY, CAUSTIC_PERIOD, LIGHT_SHIFT, MAX_FOOTPRINTS, MAX_SHADOW_CAPSULES, PACKED_VELOCITY_SCALE, PENUMBRA_BASE, PENUMBRA_PER_HEIGHT,
@@ -252,10 +254,9 @@ void main() {
 }`;
 
 /**
- * Composite: dark water over a shadowed bowl floor with faint caustics, ink
- * from the dye field, a fake surface normal (ink density + vortex dimples)
- * that catches the reflection of a window, a meniscus at the wall, a thin
- * ceramic lip outside, and the hands. Each hand's shadow on the floor is the
+ * Composite: clear water over glazed ceramic, absorbing ink, normals from the
+ * independent wave field, refracted caustics and a Fresnel window reflection,
+ * a meniscus at the wall, a rounded ceramic lip, and the hands. Each shadow is the
  * union of its capsules on the plane (a disc and a stub of forearm for the
  * sphere fallback): every endpoint slides away from the window and softens
  * by its own height, so a tilted finger's shadow leans, a high hand's is a
@@ -266,8 +267,11 @@ void main() {
  * is the outline of the row at the water level. Runs once at canvas resolution.
  */
 export const composite = (packed: boolean) => `${prelude(packed)}
-uniform sampler2D u_dye, u_velocity, u_pressure;
-uniform vec2 u_pixel, u_dyeTexel;
+uniform sampler2D u_dye, u_velocity, u_pressure, u_wave;
+uniform vec2 u_pixel, u_dyeTexel, u_waveTexel;
+uniform vec3 u_glaze;
+${MATERIAL_GLSL}
+${WAVE_STORAGE_GLSL}
 uniform float u_aspect, u_domain, u_light, u_caustics, u_presence;
 // Caustic scroll offsets in lattice units, each in [0, HASH_PERIOD): layer a in xy, layer b in zw;
 // u_caustT for the first value-noise octave, u_caustT2 for the second (see model.ts causticOffsets).
@@ -408,74 +412,64 @@ void main() {
     }
   }
 
-  // Dye: centre plus a cross two dye texels out (halo and a smooth gradient).
-  vec2 t = u_dyeTexel;
-  vec3 dC = texture(u_dye, g).rgb;
-  vec3 dL = texture(u_dye, g - vec2(2.0 * t.x, 0.0)).rgb, dR = texture(u_dye, g + vec2(2.0 * t.x, 0.0)).rgb;
-  vec3 dB = texture(u_dye, g - vec2(0.0, 2.0 * t.y)).rgb, dT = texture(u_dye, g + vec2(0.0, 2.0 * t.y)).rgb;
-  vec3 softDye = (dL + dR + dB + dT) * 0.25;
-  float hC = lum(dC);
-  // The surface: pressure is smooth by construction and low at vortex cores, which dimple the
-  // water; ink density adds a little relief so filaments catch glints.
-  vec2 s = u_texel * 3.5;
-  float pL = readS(u_pressure, g - vec2(s.x, 0.0)), pR = readS(u_pressure, g + vec2(s.x, 0.0));
-  float pB = readS(u_pressure, g - vec2(0.0, s.y)), pT = readS(u_pressure, g + vec2(0.0, s.y));
+  // Surface geometry comes from a separate damped wave field. Pigment is below it.
+  vec2 e = u_waveTexel;
+  float h = waveHeight(u_wave, g);
+  float hL = waveHeight(u_wave, g - vec2(e.x, 0)), hR = waveHeight(u_wave, g + vec2(e.x, 0));
+  float hB = waveHeight(u_wave, g - vec2(0, e.y)), hT = waveHeight(u_wave, g + vec2(0, e.y));
+  vec2 slope = vec2(hR - hL, hT - hB) / (2.0 * e);
   vec2 v = readV(u_velocity, g);
-
-  vec2 grad = vec2(lum(dR) - lum(dL), lum(dT) - lum(dB)) * 0.5 + vec2(pR - pL, pT - pB) * 0.1 + v * 0.06;
-  vec3 n = normalize(vec3(-grad, 1.0));
-  float men = smoothstep(R - 0.028, R, d);
-  n = normalize(mix(n, vec3(dir * 0.9, 0.42), men));
-  n = normalize(mix(n, vec3(ringTilt * 0.9, 0.45), min(ringBand, 1.0)));
-
+  vec3 n = normalize(vec3(-slope, 1.0));
+  float men = smoothstep(R - 0.018, R, d);
+  n = normalize(mix(n, vec3(dir * 0.65, 0.65), men));
+  n = normalize(mix(n, vec3(ringTilt * 0.7, 0.6), min(ringBand * 0.65, 1.0)));
   vec3 V = normalize(vec3(-rel * 1.2, 1.0));
   vec3 rr = reflect(-V, n);
-  float ndv = max(dot(n, V), 0.0);
-  float fres = 0.03 + 0.97 * pow(1.0 - ndv, 5.0);
-  float rl = max(dot(rr, Ld), 0.0);
-  float win = pow(rl, 220.0), core = pow(rl, 1600.0);
-  vec3 sky = vec3(0.07, 0.10, 0.15) * (0.45 + 0.55 * rr.y);
-  vec3 window = vec3(0.96, 0.98, 1.0) * (win * 4.5 + core * 28.0) * u_light;
-  vec3 reflected = (sky + window) * fres;
-  // The meniscus catches the window as a thin arc on the lit side of the wall.
-  float arc = exp(-pow((R - d - 0.004) / 0.005, 2.0)) * (0.1 + 0.9 * max(0.0, dot(dir, L2)));
-  reflected += vec3(0.85, 0.9, 1.0) * arc * 0.4 * u_light;
+  float fres = 0.0204 + 0.9796 * pow(1.0 - max(dot(n, V), 0.0), 5.0);
+  vec3 reflected = studioEnvironment(rr, 0.035) * fres * u_light;
 
-  // Caustics on the floor: fine light webs, refracted through the surface and dragged by the flow.
-  vec2 refr = n.xy * 0.05;
-  float ca = causticLayer((g + refr) * 11.0 + v * 0.3, u_caustT.xy, u_caustT2.xy);
-  float cb = causticLayer((g - refr * 0.7) * 14.0 + 5.7 - v * 0.22, u_caustT.zw, u_caustT2.zw);
-  float caustic = (ca * cb * 4.0 + (ca + cb) * 0.03) * u_caustics;
-
-  // Ink: dense cores saturate toward the palette colour and darken slightly; thin skirts are faint.
-  vec3 ink = (1.0 - exp(-dC * 2.4)) / (1.0 + hC * 0.45);
-  vec3 halo = 1.0 - exp(-softDye * 0.5);
-  vec3 inkCol = ink * 0.75 + halo * 0.12;
-  float shadow = 1.0 - 0.8 * (1.0 - exp(-hC * 3.0));
-
-  // Floor and water; the hands' shadows fall on everything lit from above.
-  float wall = exp(-(R - d) / 0.035);
-  vec3 floorCol = vec3(0.007, 0.013, 0.022) * (1.0 - 0.3 * smoothstep(0.0, R, d));
-  floorCol += vec3(0.30, 0.50, 0.60) * caustic * 0.06;
-  floorCol *= shadow;
-  vec3 water = (floorCol + inkCol) * (1.0 - 0.8 * wall) * shade;
+  // Snell refraction through a shallow water layer. Floor and ink share the
+  // displaced coordinate so highlights slide over pigment, rather than sticking to it.
+  vec3 transmitted = refract(-V, n, 1.0 / 1.333);
+  float waterDepth = 0.065 + 0.055 * (1.0 - smoothstep(R * 0.5, R, d));
+  vec2 floorUV = g + transmitted.xy / max(abs(transmitted.z), 0.1) * waterDepth;
+  vec2 floorRel = floorUV - 0.5;
+  floorUV = 0.5 + floorRel * min(1.0, (R - 0.008) / max(length(floorRel), 0.001));
+  vec3 dye = max(texture(u_dye, floorUV).rgb, vec3(0.0));
+  float density = lum(dye);
+  // Beer-Lambert absorption: complementary channels absorb, thick pigment darkens.
+  vec3 absorption = (vec3(dye.r + dye.g + dye.b) - dye) * 3.2 + density * 0.45;
+  vec3 transmission = exp(-absorption);
+  float grain = materialNoise(floorUV * 210.0) - 0.5;
+  float wall = smoothstep(R - 0.055, R, d);
+  vec3 ceramic = u_glaze * (1.0 + grain * 0.045);
+  ceramic *= mix(1.0, 0.18, wall);
+  // Broad refracted illumination plus wave curvature focusing, bounded to avoid fireflies.
+  float focus = clamp(1.0 - (hL + hR + hB + hT - 4.0 * h) / (e.x * e.x) * 0.045, 0.45, 2.0);
+  float ca = causticLayer(floorUV * 11.0 + v * 0.15, u_caustT.xy, u_caustT2.xy);
+  ceramic *= 0.75 + u_caustics * (0.18 * focus + 0.08 * ca);
+  vec3 water = ceramic * transmission * vec3(0.91, 0.97, 0.99) * shade;
   vec3 bowlCol = water * (1.0 - fres) + reflected;
-  // Glints where ink filaments ripple the surface, and the waterline rings around the hands.
-  bowlCol += vec3(0.95, 0.97, 1.0) * core * u_light * 0.2 * min(hC * 2.0, 1.0);
-  bowlCol += vec3(0.85, 0.9, 1.0) * ringLit * 0.35 * u_light;
+  bowlCol += vec3(0.85, 0.92, 1.0) * ringLit * 0.13 * u_light;
 
-  // Outside: a dark table, a soft shadow hugging the bowl, and a thin lit ceramic lip.
+  // Rounded glazed porcelain rim, with a dark inner bevel and soft contact shadow.
   float lipDist = d - R;
-  float lip = exp(-pow((lipDist - 0.0035) / 0.0032, 2.0));
-  float lipLight = 0.2 + 0.8 * max(0.0, dot(dir, L2));
-  vec3 lipCol = vec3(0.22, 0.21, 0.20) * lipLight * lip;
-  float ao = 1.0 - 0.7 * exp(-max(lipDist, 0.0) / 0.04);
-  vec3 table = vec3(0.016, 0.015, 0.017) * ao * (0.75 + 0.25 * dot(dir, L2));
-  vec3 outside = (table + lipCol) * mix(1.0, shade, 0.6);
+  float lipWidth = min(0.023, (0.5 - R) * 0.7);
+  float lipT = clamp(lipDist / lipWidth, 0.0, 1.0);
+  vec3 lipN = normalize(vec3(dir * (lipT * 2.0 - 1.0), sin(lipT * 3.14159) + 0.18));
+  float lipMask = 1.0 - smoothstep(lipWidth - px, lipWidth + px, lipDist);
+  float lipDiffuse = 0.35 + 0.65 * max(0.0, dot(lipN, Ld));
+  vec3 lipColor = vec3(0.51, 0.53, 0.48) * lipDiffuse;
+  lipColor += studioEnvironment(reflect(-V, lipN), 0.14) * 0.035 * u_light;
+  lipColor *= 0.7 + 0.3 * smoothstep(0.0, 0.004, lipDist);
+  vec2 stoneUV = u * 65.0;
+  float stone = materialNoise(stoneUV) * 0.6 + materialNoise(stoneUV * 3.7) * 0.4;
+  float ao = 1.0 - 0.65 * exp(-max(lipDist - lipWidth, 0.0) / 0.026);
+  vec3 table = vec3(0.042, 0.038, 0.033) * (0.8 + 0.4 * stone) * ao;
+  vec3 outside = mix(table, lipColor, lipMask) * mix(1.0, shade, 0.6);
 
   vec3 col = mix(outside, bowlCol, inside);
   vec2 q = v_uv - 0.5; q.x *= u_aspect;
   col *= 1.0 - 0.45 * smoothstep(0.35, 0.95, length(q));
-  col = col / (1.0 + col * 0.25);
-  o = vec4(pow(max(col, vec3(0.0)), vec3(1.0 / 2.2)), 1.0);
+  o = vec4(filmicOutput(col, gl_FragCoord.xy), 1.0);
 }`;

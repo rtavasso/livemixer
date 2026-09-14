@@ -45,7 +45,7 @@ import { createPackedHands } from '../../gl/hand';
 import { Program } from '../../gl/program';
 import { drawQuad, quadProgram } from '../../gl/quad';
 import { SurfaceTexture } from '../../gl/surface';
-import { Cloth, NO_COLLIDERS, type ClothStepParams } from './cloth';
+import { Cloth, lateralDisplacement, NO_COLLIDERS, type ClothStepParams } from './cloth';
 import { HandColliders } from './colliders';
 import { SCAN_THICKNESS } from './scan';
 import { WindField } from './wind';
@@ -87,9 +87,11 @@ const PARAMS = {
   stiffness: { kind: 'number', default: .6, min: 0, max: 1, step: .01, label: 'Stiffness', description: 'Resistance to shearing and bending: low is a limp voile, high a crisp organza with wide folds.' },
   damping: { kind: 'number', default: .3, min: 0, max: 1, step: .01, label: 'Damping', description: 'How quickly motion dies away.' },
   drape: { kind: 'number', default: .45, min: 0, max: 1, step: .01, label: 'Drape', description: 'Weight of the fabric (gravity). Heavier hangs straighter, swings slower and resists the wind more.' },
-  opacity: { kind: 'number', default: .2, min: .05, max: .9, step: .01, label: 'Opacity', description: 'Coverage of the sheet seen face-on. Folds seen edge-on are always denser.' },
+  opacity: { kind: 'number', default: .38, min: .05, max: .9, step: .01, label: 'Opacity', description: 'Coverage of the sheet seen face-on. Folds seen edge-on are always denser.' },
   backlight: { kind: 'number', default: .7, min: 0, max: 1, step: .01, label: 'Backlight', description: 'Brightness of the warm light behind the curtain.' },
-  tint: { kind: 'color', default: '#ffbf80', label: 'Tint', description: 'Colour of the backlight and therefore of the fabric.' },
+  tint: { kind: 'color', default: '#ffe2b6', label: 'Tint', description: 'Colour of the daylight behind the fabric.' },
+  fabric: { kind: 'color', default: '#e5ded0', label: 'Fabric colour', description: 'Colour of the woven fibres, independent of the window light.' },
+  sheen: { kind: 'number', default: .45, min: 0, max: 1, step: .01, label: 'Fibre sheen', description: 'Soft grazing highlights: low for dry linen, high for a silky finish.' },
   plane: { kind: 'number', default: .45, min: .05, max: .95, step: .01, label: 'Plane', description: 'Depth at which the curtain hangs, as a fraction of the volume depth: 0 at the glass, 1 at the back wall. A hand nearer the glass hovers in front of the sheet; a deeper one passes through it.' },
   weave: { kind: 'number', default: .5, min: 0, max: 1, step: .01, label: 'Weave', description: 'Visibility of the fine thread texture.' },
 } satisfies ParamSpecs;
@@ -97,7 +99,7 @@ const PARAMS = {
 export default defineSimulation({
   id: 'veil',
   title: 'Veil',
-  description: 'A sheer curtain hanging in the volume, moving in a breeze from a dim window on the back wall. The hand hovers in front of the fabric, presses and sweeps it at its depth, and passes through it beyond, the fabric wrapping around it and trailing behind.',
+  description: 'Woven linen in warm window light, with translucent folds, fibre sheen and stitched hems. A breeze lifts the fabric; press and sweep through it to shape the folds and cast a soft silhouette.',
   params: PARAMS,
   signals: {
     sway: { min: 0, max: 1, description: 'Mean lateral displacement of the fabric from its hanging position, normalised (0.12 units = 1).', smoothing: .2 },
@@ -167,7 +169,8 @@ export default defineSimulation({
     // Signal baselines: the resting sheet's own fold offset and constraint strain, so `sway` and `tension`
     // read zero when nothing is happening. Recaptured whenever the sheet is re-hung. `contactNorm` keeps
     // "one hand pressed in ≈ 0.5" true whatever the sheet's size (a deeper sheet is larger, the hand is not).
-    let swayBase = 0, strainBase = 0, contactNorm = .3;
+    const settledX = new Float64Array(n);
+    let strainBase = 0, contactNorm = .3;
     /**
      * Run the sheet with no hands (the current wind is fine: its effect on the baselines is negligible) until it
      * has settled, then take the baselines and put the render history on the settled positions so the next
@@ -175,7 +178,8 @@ export default defineSimulation({
      */
     const settle = (steps: number) => {
       for (let i = 0; i < steps; i++) cloth.step(1 / 60, clothParams, NO_COLLIDERS);
-      swayBase = cloth.meanAbsDx; strainBase = cloth.meanStrain * .9;
+      for (let i = 0; i < n; i++) settledX[i] = cloth.pos[i * 3];
+      strainBase = cloth.meanStrain * .9;
       contactNorm = .3 / (layout.scale * layout.scale);
       renderPrev.set(cloth.pos); renderPos.set(cloth.pos);
     };
@@ -205,7 +209,7 @@ export default defineSimulation({
         renderPrev.set(cloth.pos);
         cloth.step(input.dt, clothParams, colliders);
         flutter = approach(flutter, clamp01(cloth.meanSpeed / .6), input.dt, .12);
-        signalValues.sway = clamp01(Math.max(0, cloth.meanAbsDx - swayBase) / .12);
+        signalValues.sway = clamp01(lateralDisplacement(cloth.pos, settledX) / .12);
         signalValues.flutter = flutter;
         signalValues.contact = clamp01(cloth.contactFraction / contactNorm);
         // The cloth measures z toward the viewer; the volume's z runs the other way.
@@ -235,6 +239,7 @@ export default defineSimulation({
           .f3('u_scanMin', shell.x0, shell.y0, shell.z0).f3('u_scanMax', shell.x1, shell.y1, shell.z1).f1('u_scanThick', SCAN_THICKNESS * depth);
 
         const [tr, tg, tb] = hexToRgb(params.tint);
+        const [fr, fg, fb] = hexToRgb(params.fabric).map(c => c ** 2.2);
         const cx = aspect * .5;
         // The window on the back wall, sized from the wall's visible extent so it reads alike at any volume depth.
         const wallScale = (EYE + depth) / EYE, wallHalfH = .5 * wallScale;
@@ -249,6 +254,7 @@ export default defineSimulation({
         gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
         bindHands(clothProgram.use().matrix4('u_matrix', camera.matrix).f1('u_plane', planeZ)
           .f1('u_opacity', params.opacity).f1('u_backlight', params.backlight).f1('u_weave', params.weave)
+          .f3('u_fabric', fr, fg, fb).f1('u_sheen', params.sheen)
           .f3('u_tint', tr, tg, tb).f3('u_cam', cx, .5, -EYE).f3('u_light', wx, wy, depth + LIGHT_BEHIND)
           .f2('u_threads', 340, 230).f2('u_fade', 1.5 / (cloth.cols - 1), 1.5 / (cloth.rows - 1)));
         gl.bindVertexArray(vao);

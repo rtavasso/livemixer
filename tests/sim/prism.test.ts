@@ -665,7 +665,7 @@ describe('solids in the light plane', () => {
 
 describe('declaration', () => {
   it('declares the volume-era params and signals with ranges the host can trust', () => {
-    expect(Object.keys(prism.params).length).toBeLessThanOrEqual(12);
+    expect(Object.keys(prism.params).length).toBeLessThanOrEqual(13);
     expect(prism.params.height.kind).toBe('number'); expect(prism.params.size.default).toBe(TRACE_DEFAULTS.size);
     for (const name of ['spread', 'hue', 'brightness', 'reflected', 'incidence', 'inside', 'elevation', 'occluded']) { expect(prism.signals[name as keyof typeof prism.signals].min).toBe(0); expect(prism.signals[name as keyof typeof prism.signals].max).toBe(1); }
     expect(prism.signals.elevation.description).toMatch(/height/i);

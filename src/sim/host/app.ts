@@ -163,14 +163,14 @@ export class SimHost {
 
   private context(): SimContext {
     const { width, height } = this.canvas;
-    return { gl: this.gl, canvas: this.canvas, width, height, aspect: width / Math.max(1, height), depth: this.settings.value.volumeDepth, dpr: Math.min(this.settings.value.maxDpr, window.devicePixelRatio || 1), quality: this.settings.value.quality, capabilities: this.capabilities, warn: message => this.warn(message) };
+    return { gl: this.gl, canvas: this.canvas, width, height, aspect: width / Math.max(1, height), depth: this.settings.value.volumeDepth, dpr: this.canvas.width / Math.max(1, this.canvas.clientWidth), quality: this.settings.value.quality, capabilities: this.capabilities, warn: message => this.warn(message) };
   }
 
   private createInstance() {
     this.disposeInstance();
     if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = undefined; }
     if (this.contextLost) return;
-    fitCanvas(this.canvas, this.settings.value.maxDpr);
+    fitCanvas(this.canvas, this.settings.value.maxDpr, this.settings.value.quality);
     try {
       this.simTime = 0;
       this.stepper = new FixedStepper(1000 / (this.definition.stepHz ?? 60));
@@ -369,9 +369,9 @@ export class SimHost {
   }
 
   private resize(force = false) {
-    if (!fitCanvas(this.canvas, this.settings.value.maxDpr) && !force) return;
+    if (!fitCanvas(this.canvas, this.settings.value.maxDpr, this.settings.value.quality) && !force) return;
     const { width, height } = this.canvas;
-    if (this.simContext) { this.simContext.width = width; this.simContext.height = height; this.simContext.aspect = width / Math.max(1, height); this.simContext.dpr = Math.min(this.settings.value.maxDpr, window.devicePixelRatio || 1); }
+    if (this.simContext) { this.simContext.width = width; this.simContext.height = height; this.simContext.aspect = width / Math.max(1, height); this.simContext.dpr = this.canvas.width / Math.max(1, this.canvas.clientWidth); }
     try { this.instance?.resize?.(width, height); } catch (error) { this.warn(`resize failed: ${String(error)}`); }
     this.notify();
   }
@@ -462,7 +462,7 @@ export class SimHost {
     return {
       simulation: this.definition, params: this.params, signals: this.signals, signalViolations: this.signalViolations,
       source: this.source, sourceId: this.sourceId, tracked: this.tracked, events: this.lastEvents, mapping: this.tracker.mapping, calibration: this.calibration,
-      perf: this.perf, warnings: this.warnings, gpu: this.gpu, dpr: Math.min(this.settings.value.maxDpr, window.devicePixelRatio || 1), width: this.canvas.width, height: this.canvas.height,
+      perf: this.perf, warnings: this.warnings, gpu: this.gpu, dpr: this.canvas.width / Math.max(1, this.canvas.clientWidth), width: this.canvas.width, height: this.canvas.height,
       quality: this.settings.value.quality, solid: this.settings.value.solid, recording: { active: this.recording, frames: this.recorder.length },
       telemetry: { sent: this.bus.sent, rateHz: this.bus.rateHz, transports: this.bus.transportStatus() }, contextLost: this.contextLost,
     };

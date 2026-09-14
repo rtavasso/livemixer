@@ -279,6 +279,7 @@ export class Overlay {
     const num = (key: 'enterMs' | 'leaveMs' | 'minCutoff' | 'beta', step: number) => { const i = el('input', { type: 'number', step, value: tracker[key] }); i.addEventListener('change', () => this.host.setTrackerSettings({ [key]: Number(i.value) })); return el('label', {}, key, i); };
     return el('div', {},
       el('div', { class: 'row' }, el('label', {}, 'Quality', quality), el('label', {}, 'Max pixel ratio', dpr), el('label', {}, 'Volume depth', depth), el('label', {}, 'Solid', solid)),
+      el('p', { class: 'hint' }, 'Medium is tuned for Intel laptops (up to 1 million pixels). Low reduces detail and uses up to 0.48 million; high uses up to 2.07 million. Fullscreen fills the display within that budget.'),
       el('p', { class: 'hint' }, 'Volume depth is the z size of the 3D space in units of the canvas height; hands live inside it. Solid: what a simulation is handed when the source knows both the depth scan and the hand skeleton — both (the scan for contact, the skeleton for fingertips and gestures), scan only, or skeleton only (the capsule hand collides).'),
       el('div', { class: 'row' }, num('enterMs', 10), num('leaveMs', 10), num('minCutoff', .1), num('beta', .005)),
       el('p', { class: 'hint' }, 'enter/leave: presence hysteresis. minCutoff lower = calmer at rest; beta higher = less lag when moving.'),
@@ -290,7 +291,7 @@ export class Overlay {
   private update() {
     if (!this.visible) return;
     const s = this.host.state();
-    this.fps.textContent = `${Math.round(s.perf.fps)} fps · step ${fmt(s.perf.stepMs, 1)} ms · draw ${fmt(s.perf.renderMs, 1)} ms${s.perf.droppedMs > 0 ? ` · dropped ${Math.round(s.perf.droppedMs)} ms` : ''}`;
+    this.fps.textContent = `${Math.round(s.perf.fps)} fps · CPU step ${fmt(s.perf.stepMs, 1)} ms · submit ${fmt(s.perf.renderMs, 1)} ms${s.perf.droppedMs > 0 ? ` · dropped ${Math.round(s.perf.droppedMs)} ms` : ''}`;
     this.presence.textContent = `presence ${fmt(s.tracked.presence)}`; this.activity.textContent = `activity ${fmt(s.tracked.activity)}`;
     const st = s.source?.status();
     const age = Number.isFinite(s.tracked.sourceAgeMs) ? `${Math.round(s.tracked.sourceAgeMs)} ms ago` : 'no frames yet';

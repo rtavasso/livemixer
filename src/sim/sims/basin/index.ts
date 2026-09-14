@@ -1,5 +1,5 @@
 /**
- * Basin — a bowl of dark water on the table, seen from above, holding drops of
+ * Basin — clear water in glazed porcelain, seen from above, holding drops of
  * ink that the hand can stir.
  *
  * The bowl sits on the floor of the volume and the view is top-down, so the
@@ -23,6 +23,7 @@
  * Neumann pressure at the wall). One physics step per `step()` call:
  *   advect velocity + forces → curl → vorticity confinement → divergence →
  *   Jacobi pressure ×N → gradient subtraction → advect dye + ink drops.
+ * A separate damped wave field (`waves.ts`) responds to drops and wet motion.
  * Rendering: one full-screen composite pass, plus a 16×16 probe pass that is
  * read back asynchronously (PBO + fence) for the signals.
  *
@@ -30,6 +31,7 @@
  */
 import { defineSimulation, type SimInput, type SurfaceField } from '../../core/types';
 import { approach, clamp, clamp01, smoothstep } from '../../core/math';
+import { hexToRgb } from '../../core/params';
 import { Fbo, PingPong, bindScreen, pickFormat } from '../../gl/fbo';
 import { drawQuad, quadProgram } from '../../gl/quad';
 import { SurfaceTexture } from '../../gl/surface';
@@ -41,6 +43,7 @@ import {
   type Drop, type DropContext, type Measures,
 } from './model';
 import * as glsl from './shaders';
+import { WAVE_FS, WAVE_GRID } from './waves';
 
 const PACKED_ZERO = 128 / 255;
 const INITIAL_DROPS = 4;
@@ -53,7 +56,7 @@ interface Shadow { id: number; opacity: number; present: boolean; solid: SolidSh
 export default defineSimulation({
   id: 'basin',
   title: 'Basin',
-  description: 'A bowl of dark water on the table, seen from above, holding drops of ink. Lower the hand into the water and move it to drag the water along and swirl the ink into filaments; dip the fingertips for five small stirs, plunge in to splash a fresh bead; hold it above the surface and its shadow hovers on the water; left alone, the water calms and the ink settles into slow drift.',
+  description: 'Ink in a glazed porcelain basin. Dip and sweep your hand to send ripples across the water and pull pigment into curling filaments. Window reflections bend with the waves; submerged colour absorbs the light.',
   params: {
     viscosity: { kind: 'number', default: .2, min: 0, max: 2, step: .01, unit: '1/s', label: 'Viscosity', description: 'Velocity dissipation rate: how quickly the water calms once nothing stirs it.' },
     vorticity: { kind: 'number', default: .2, min: 0, max: 1, step: .01, label: 'Vorticity', description: 'Vorticity confinement: keeps small eddies alive so the ink curls into filaments.' },
@@ -66,6 +69,8 @@ export default defineSimulation({
     dropOnEnter: { kind: 'boolean', default: true, label: 'Drop on dip', description: 'Drop a gentle bead where a hand dips into the water. A fast plunge always drops one, with a splash.' },
     light: { kind: 'number', default: 1, min: 0, max: 2, step: .01, label: 'Highlight', description: 'Strength of the window reflection, glints and waterline rings on the water surface.' },
     caustics: { kind: 'number', default: .7, min: 0, max: 2, step: .01, label: 'Caustics', description: 'Brightness of the refracted light playing on the bowl floor.' },
+    ripples: { kind: 'number', default: .65, min: 0, max: 1.5, step: .01, label: 'Ripples', description: 'Surface response to drops and moving hands. Waves travel, reflect off the rim, and settle independently of the ink.' },
+    glaze: { kind: 'color', default: '#789895', label: 'Bowl glaze', description: 'Ceramic colour beneath the clear water. Pale glazes reveal pigment; dark glazes emphasize reflections.' },
   },
   signals: {
     energy: { min: 0, max: 1, description: 'Mean water speed inside the bowl, normalised.', smoothing: .15 },
@@ -96,7 +101,18 @@ export default defineSimulation({
     const pDye = quadProgram(gl, glsl.advectDye(packed), 'basin.dye');
     const pProbe = quadProgram(gl, glsl.probe(packed), 'basin.probe');
     const pComposite = quadProgram(gl, glsl.composite(packed), 'basin.composite');
-    const programs = [pAdvect, pCurl, pVorticity, pDivergence, pJacobi, pGradient, pDye, pProbe, pComposite];
+    const pWave = quadProgram(gl, WAVE_FS, 'basin.waves');
+    const programs = [pAdvect, pCurl, pVorticity, pDivergence, pJacobi, pGradient, pDye, pProbe, pComposite, pWave];
+    const waveN = WAVE_GRID[ctx.quality];
+    const wave = new PingPong(gl, waveN, waveN, 'rgba8', 'linear');
+    for (const f of [wave.read, wave.write]) f.clear(128 / 255, 0, 128 / 255, 0);
+    const waveForces = new Float32Array(8 * 4);
+    let waveForceCount = 0, nextWake = 0;
+    const waveForce = (x: number, y: number, radius: number, strength: number) => {
+      if (waveForceCount === 8 || Math.abs(strength) < .0001) return;
+      const o = waveForceCount++ * 4;
+      waveForces[o] = x; waveForces[o + 1] = y; waveForces[o + 2] = Math.max(.015, radius); waveForces[o + 3] = clamp(strength, -.06, .06);
+    };
 
     // Targets. The sim grid is fixed; only the composite depends on the canvas.
     const velocity = new PingPong(gl, N, N, format, 'linear');
@@ -162,6 +178,9 @@ export default defineSimulation({
     return {
       step(input: SimInput, params) {
         const dt = input.dt, bowl = params.bowl, surface = params.surface, step = stepIndex++;
+        waveForceCount = 0;
+        const wake = input.time >= nextWake;
+        if (wake) nextWake = input.time + .1;
         presence = input.presence; scanLevel = surface;
         if (weightsBowl !== bowl) { weights = probeWeights(bowl); weightsBowl = bowl; }
         if (!seeded) { seeded = true; for (const d of scheduler.initial(INITIAL_DROPS, bowl, params.palette, params.ink)) pending.push(d); }
@@ -175,6 +194,7 @@ export default defineSimulation({
           const d = pending[i], o = i * 4, c = i * 3;
           dropData[o] = d.x; dropData[o + 1] = d.y; dropData[o + 2] = d.radius; dropData[o + 3] = d.amount;
           dropColor[c] = d.color[0]; dropColor[c + 1] = d.color[1]; dropColor[c + 2] = d.color[2];
+          waveForce(d.x, d.y, d.radius * .55, -(.016 + d.impulse * .07) * params.ripples);
           if (d.impulse > 0) { const k = impulses++ * 4; dropImpulse[k] = d.x; dropImpulse[k + 1] = d.y; dropImpulse[k + 2] = d.radius * 1.6; dropImpulse[k + 3] = d.impulse; }
         }
         if (dropCount) { pending.copyWithin(0, dropCount); pending.length -= dropCount; }
@@ -188,6 +208,7 @@ export default defineSimulation({
         if (field && scanActive) {
           if (field !== scanUploaded) { scanDilated = dilateScanDepth(field, scanDilated); scanTexture.upload(scanDilated); scanUploaded = field; }
           scanMotion.update(scan, dt);
+          if (wake && scan.wet) waveForce(scan.cx, scan.cy, scan.wetRadius * .55, -Math.min(.05, Math.hypot(scanMotion.vx, scanMotion.vy) * .055 + Math.max(0, scanMotion.descent) * .04) * params.ripples);
           const wetShare = scan.wet / scan.total;
           immersionNow = immersionSignal({ x: scan.cx, y: scan.cy, immersion: wetShare }, bowl);
           scanWet = approach(scanWet, smoothstep(0, .01, wetShare), dt, .08);
@@ -204,6 +225,7 @@ export default defineSimulation({
         for (let i = 0; i < handCount; i++) {
           const hand = input.hands[i];
           const h = handToGrid(hand, ctx.aspect, surface, gridHand);
+          if (wake && h.immersion > 0) waveForce(h.x, h.y, .026, -Math.min(.05, Math.hypot(h.vx, h.vy) * .055 + Math.max(0, h.descent) * .04) * Math.min(1, h.immersion * 5) * params.ripples);
           // Pressing down while in the water pushes it outward in a ring; the crossing itself splashes through the scheduler.
           const press = params.stir * 1.2 * clamp01(h.descent / .8) * Math.min(1, h.immersion * 5);
           if (hand === input.primary) immersionNow = immersionSignal(h, bowl);
@@ -265,10 +287,15 @@ export default defineSimulation({
           .f1('u_fadeFloor', dissipationFloor(packed, step, PACKED_FADE_STRIDE, 1))
           .i1('u_dropCount', dropCount).f4v('u_drops', dropData).f3v('u_dropColor', dropColor);
         run(dye.write); dye.swap();
+        // Independent surface displacement; no ink density is used as water height.
+        pWave.use().texture('u_wave', wave.read.texture, 0).f2('u_texel', 1 / waveN, 1 / waveN)
+          .f1('u_dt', dt).f1('u_bowl', bowl).i1('u_forceCount', waveForceCount).f4v('u_forces', waveForces);
+        run(wave.write); wave.swap();
       },
 
       render(frame, params) {
         const bowl = params.bowl;
+        const glaze = hexToRgb(params.glaze);
         // Pack every hand's capsules back to back; each hand's record says where its run starts.
         let first = 0, shadowCount = 0;
         for (let i = 0; i < shadows.length && i < glsl.MAX_HANDS; i++) {
@@ -285,6 +312,8 @@ export default defineSimulation({
           .f2('u_pixel', 1 / frame.width, 1 / frame.height).f2('u_dyeTexel', dyeTexel, dyeTexel)
           .f1('u_aspect', frame.aspect).f1('u_domain', domainScale(frame.aspect))
           .f1('u_light', params.light).f1('u_caustics', params.caustics).f1('u_presence', presence)
+          .texture('u_wave', wave.read.texture, 4).f2('u_waveTexel', 1 / waveN, 1 / waveN)
+          .f3('u_glaze', glaze[0] ** 2.2, glaze[1] ** 2.2, glaze[2] ** 2.2)
           .i1('u_shadowCount', shadowCount).f4v('u_shadowHands', shadowHands).f4v('u_shadowMeta', shadowMeta).f4v('u_capSeg', capSeg).f4v('u_capMeta', capMeta)
           .f4('u_scan', scan.bx, scan.by, scan.bound, scanOpacity);
         scanUniforms(pComposite, 3, scan.minY, scan.total ? Math.max(0, scan.maxY - scan.minY) + 1 / (scanTexture.height || 64) : 0, scanWet * scanOpacity);
@@ -340,7 +369,7 @@ export default defineSimulation({
         shadows.length = 0; pending.length = 0;
         for (const p of programs) p.dispose();
         scanTexture.dispose();
-        velocity.dispose(); dye.dispose(); pressure.dispose(); divergence.dispose(); curl.dispose(); probe.dispose();
+        velocity.dispose(); dye.dispose(); pressure.dispose(); divergence.dispose(); curl.dispose(); probe.dispose(); wave.dispose();
       },
     };
   },

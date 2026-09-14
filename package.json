@@ -17,7 +17,8 @@
     "inspect:leap": "tsx scripts/check-leap.ts",
     "prepare:fadr": "tsx scripts/prepare-fadr.ts",
     "setup:models": "tsx scripts/setup-models.ts && npm run build:worker",
-    "telemetry:sink": "tsx scripts/telemetry-sink.ts"
+    "telemetry:sink": "tsx scripts/telemetry-sink.ts",
+    "benchmark:sim": "tsx scripts/sim-benchmark.ts"
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "1.0.1",

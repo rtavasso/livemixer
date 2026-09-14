@@ -18,11 +18,11 @@
  * expands it into a thin anti-aliased quad accumulated additively into a
  * half-float target so overlapping wavelengths add back to white; the same
  * segments drawn at y = 0 are the beam's footprint on the floor, and a disc
- * per wall-ending segment is its splash. The glass is its nine edges (lines)
- * and five faces (faint additive fills, brighter edge-on), plus its projected
- * silhouette in the composite pass, whose outline is lit by the glow that
- * crosses it and whose interior is tinted by the light passing through. A
- * floor grid in the composite makes the volume readable.
+ * per wall-ending segment is its splash. The material composite intersects
+ * closed glass against those same polygon planes, refracts the stone table
+ * through entry and exit faces, and reflects procedural studio lights. The
+ * bounded camera-ray material is in `material.ts`; it replaces additive faces
+ * and edges without adding a rendering pass.
  *
  * Hands are bodies in the light plane (`solids.ts`): the depth scan when the
  * source has one (the primary representation), otherwise the skeleton's
@@ -55,7 +55,7 @@ import { SurfaceTexture, surfaceGlsl } from '../../gl/surface';
 import { GLSL_HEADER, Program } from '../../gl/program';
 import { drawQuad, quadProgram } from '../../gl/quad';
 import {
-  beamGain, beamWidth, CLEARANCE_MAX, FLOOR_LINE_GAIN, GHOST, GLASS, idleOrbit, lightPlane, LINE, MAX_OCCLUDER_GROUPS, MAX_OCCLUDERS, MAX_POLYGONS,
+  beamGain, beamWidth, CLEARANCE_MAX, FLOOR_LINE_GAIN, GHOST, idleOrbit, lightPlane, LINE, MAX_OCCLUDER_GROUPS, MAX_OCCLUDERS, MAX_POLYGONS,
   MAX_SEGMENTS, MAX_VERTICES, nextRayBudget, PALM_REACH, prismCentre, prismRadius, QUALITY, rayCount, SCAN_THICKNESS, SCAN_TOLERANCE, SKIN_SPLASH,
   SPLASH, TOUCH_MARGIN, TRACE_DEFAULTS, traceOptionsFor, type PlanePoint,
 } from './config';
@@ -64,23 +64,17 @@ import {
   type BeamSource, type Polygon, type RawSignals, type Spectrum,
 } from './optics';
 import { addHandOccluders, addScanOccluders, type Emitter } from './solids';
-import { EYE_HEIGHT, faceBrightness, prismCamera, prismCorners, prismSilhouette } from './geometry';
+import { EYE_HEIGHT, prismCamera } from './geometry';
+import { COMPOSITE_FS } from './material';
 
 const TAU = Math.PI * 2;
 /** Height the idle beam orbits at, in uniform units. */
 const IDLE_HEIGHT = .5;
 /** Beam openness the source relaxes to with no hand. */
 const IDLE_OPENNESS = .5;
-/** Floats per glass edge in the edge VBO: x0 z0 x1 z1, r g b intensity, y0 y1. */
-const EDGE_STRIDE = 10;
-const EDGES_PER_PRISM = 9;
-/** Floats per face vertex: x y z, intensity. Three side quads and two triangles = 8 triangles per prism. */
-const FACE_STRIDE = 4;
-const FACE_VERTICES_PER_PRISM = 24;
-
 // Line quads: each segment instance is expanded in the vertex shader after projection, so the fan recedes with
 // perspective while the line itself keeps a crisp core and halo measured in scene pixels. The endpoints' heights
-// come from attribute 2: a constant (the light plane's height) for traced segments, a real array for glass edges.
+// come from attribute 2: a constant containing the light plane's height for traced segments.
 const LINE_VS = `${GLSL_HEADER}
 layout(location = 0) in vec4 a_seg;   // x0 z0 x1 z1 in the light plane, uniform units
 layout(location = 1) in vec4 a_col;   // r g b intensity
@@ -252,18 +246,6 @@ void main() {
   o = vec4(light, 1.0);
 }`;
 
-// Glass faces: flat additive fills with a per-face brightness computed on the CPU.
-const FACE_VS = `${GLSL_HEADER}
-layout(location = 0) in vec3 a_pos;
-layout(location = 1) in float a_int;
-uniform mat4 u_matrix;
-out float v_int;
-void main() { v_int = a_int; gl_Position = u_matrix * vec4(a_pos, 1.0); }`;
-
-const FACE_FS = `${GLSL_HEADER}
-in float v_int; out vec4 o; uniform vec3 u_color;
-void main() { o = vec4(u_color * v_int, 1.0); }`;
-
 const DOWNSAMPLE_FS = `${GLSL_HEADER}
 in vec2 v_uv; out vec4 o; uniform sampler2D u_source; uniform vec2 u_texel;
 void main() {
@@ -279,77 +261,6 @@ void main() {
   c += (texture(u_source, v_uv + u_dir * 1.3846153846).rgb + texture(u_source, v_uv - u_dir * 1.3846153846).rgb) * .3162162162;
   c += (texture(u_source, v_uv + u_dir * 3.2307692308).rgb + texture(u_source, v_uv - u_dir * 3.2307692308).rgb) * .0702702703;
   o = vec4(c, 1.0);
-}`;
-
-const COMPOSITE_FS = `${GLSL_HEADER}
-in vec2 v_uv; out vec4 o;
-uniform sampler2D u_scene, u_glow, u_wide;
-uniform float u_aspect, u_depth, u_eye, u_eyeY, u_pxPerUnit, u_exposure, u_glowGain, u_wideGain, u_time, u_floor;
-uniform vec2 u_poly[${MAX_POLYGONS * MAX_VERTICES}];
-uniform int u_polyCount[${MAX_POLYGONS}];
-uniform int u_polys;
-uniform vec3 u_glassColor;
-uniform float u_edgeBase, u_edgeGlow, u_tint;
-
-float sdPolygon(int start, int count, vec2 p) {
-  vec2 v0 = u_poly[start];
-  float d = dot(p - v0, p - v0);
-  float s = 1.0;
-  for (int i = 0; i < ${MAX_VERTICES}; i++) {
-    if (i >= count) break;
-    int j = i == 0 ? count - 1 : i - 1;
-    vec2 vi = u_poly[start + i], vj = u_poly[start + j];
-    vec2 e = vj - vi, w = p - vi;
-    vec2 b = w - e * clamp(dot(w, e) / dot(e, e), 0.0, 1.0);
-    d = min(d, dot(b, b));
-    bvec3 c = bvec3(p.y >= vi.y, p.y < vj.y, e.x * w.y > e.y * w.x);
-    if (all(c) || all(not(c))) s = -s;
-  }
-  return s * sqrt(d);
-}
-
-void main() {
-  vec2 p = vec2(v_uv.x * u_aspect, v_uv.y);
-  vec3 scene = texture(u_scene, v_uv).rgb;
-  vec3 glow = texture(u_glow, v_uv).rgb;
-  vec3 wide = texture(u_wide, v_uv).rgb;
-  vec3 light = scene + glow * u_glowGain + wide * u_wideGain;
-
-  // Floor grid at y = 0: the pixel's ray from the raised eye through the glass, intersected with the floor.
-  vec2 ndc = v_uv * 2.0 - 1.0;
-  float dy = 0.5 + ndc.y * 0.5 - u_eyeY;
-  if (dy < -1e-4 && u_floor > 0.0) {
-    float t = -u_eyeY / dy;
-    float x = u_aspect * 0.5 + t * ndc.x * u_aspect * 0.5;
-    float z = -u_eye + t * u_eye;
-    if (z >= 0.0 && z <= u_depth && x >= 0.0 && x <= u_aspect) {
-      // Thin anti-aliased lines, six per unit, about 1.5 px wide at any distance; black between them.
-      vec2 cell = vec2(x, z) * 6.0;
-      vec2 g = abs(fract(cell) - 0.5), w = fwidth(cell);
-      vec2 l = smoothstep(0.5 - w * 1.5, 0.5 - w * 0.25, g);
-      float line = max(l.x, l.y);
-      float fade = (1.0 - z / u_depth) * 0.05 * u_floor;
-      light += vec3(0.55, 0.62, 0.75) * line * fade;
-    }
-  }
-
-  // Glass silhouette: a thin outline that brightens where light crosses it, and a faint interior lit by what passes through.
-  float d = 1e9;
-  for (int q = 0; q < ${MAX_POLYGONS}; q++) { if (q >= u_polys) break; d = min(d, sdPolygon(q * ${MAX_VERTICES}, u_polyCount[q], p)); }
-  float px = d * u_pxPerUnit;
-  float edge = exp(-px * px * .45);
-  float inside = 1.0 - smoothstep(-1.0, 1.0, px);
-  float local = dot(glow, vec3(.2126, .7152, .0722));
-  vec3 edgeCol = u_glassColor * (u_edgeBase + local * u_edgeGlow) * edge;
-  vec3 tint = inside * u_tint * (u_glassColor * .04 + glow * vec3(.25, .4, .7) + wide * vec3(.15, .2, .35));
-  light += edgeCol + tint;
-
-  // ACES-style filmic curve, then gamma and a touch of dither against banding in the dark.
-  vec3 x = light * u_exposure;
-  vec3 mapped = clamp((x * (2.51 * x + .03)) / (x * (2.43 * x + .59) + .14), 0.0, 1.0);
-  vec3 srgb = pow(mapped, vec3(1.0 / 2.2));
-  float n = fract(sin(dot(gl_FragCoord.xy + vec2(u_time * 7.0, u_time * 3.0), vec2(12.9898, 78.233))) * 43758.5453);
-  o = vec4(srgb + (n - .5) / 255.0, 1.0);
 }`;
 
 /** A light source: position in the volume (uniform units), beam openness, presence weight, the point in the plane it aims at, and the hand it belongs to (−1 for none). */
@@ -368,7 +279,7 @@ export interface PrismDiagnostics {
 export default defineSimulation({
   id: 'prism',
   title: 'Prism',
-  description: 'A glass prism standing in the volume; the hand carries a horizontal beam of white light around it at its own height and splits it into a spectrum that lands on the walls.',
+  description: 'Polished optical glass on a stone light table. Reflected studio lights reveal the faces; the table refracts through the solid. Carry white light around the prism to split a spectrum across the room.',
   params: {
     size: { kind: 'number', default: TRACE_DEFAULTS.size, min: .06, max: .45, step: .005, label: 'Prism size', description: 'Circumradius of the prism in the light plane, in uniform units (canvas height = 1).' },
     height: { kind: 'number', default: TRACE_DEFAULTS.height, min: .1, max: 1, step: .01, label: 'Prism height', description: 'Height of the glass above the floor in uniform units. A hand above it sends the beam over the glass.' },
@@ -379,7 +290,8 @@ export default defineSimulation({
     rays: { kind: 'number', default: TRACE_DEFAULTS.rays, min: 8, max: 160, step: 1, label: 'Rays', description: 'Parallel rays across the beam at medium quality (scaled ×0.55 low, ×1.25 high). Each ray splits into one ray per wavelength inside the glass. Thinned automatically if a frame would exceed the segment budget.' },
     bounces: { kind: 'number', default: TRACE_DEFAULTS.bounces, min: 1, max: 8, step: 1, label: 'Bounces', description: 'Surface interactions that may spawn a Fresnel reflection. Transmission is always followed.' },
     glow: { kind: 'number', default: .7, min: 0, max: 2, step: .01, label: 'Glow', description: 'Strength of the bloom around the rays.' },
-    floor: { kind: 'number', default: 1, min: 0, max: 2, step: .05, label: 'Floor', description: 'Brightness of the floor: the depth grid (fading in with presence) and the footprint the beam lays beneath itself.' },
+    roughness: { kind: 'number', default: .08, min: .02, max: .6, step: .01, label: 'Glass polish', description: 'Reflection softness: low is optical polish, high broadens the studio highlights.' },
+    floor: { kind: 'number', default: 1, min: 0, max: 2, step: .05, label: 'Floor', description: 'Brightness of the stone table and the light deposited on it.' },
     idle: { kind: 'number', default: .3, min: 0, max: 1, step: .01, label: 'Idle brightness', description: 'Brightness of the orbiting beam when nobody is present.' },
     twin: { kind: 'boolean', default: false, label: 'Twin prism', description: 'Add a second prism so the spectrum can be split again.' },
   },
@@ -404,19 +316,13 @@ export default defineSimulation({
     const noPolygons: Polygon[] = [];
     const beamPool: BeamSource[] = [0, 1].map(() => ({ x: 0, y: 0, dirX: 1, dirY: 0, width: .03, intensity: 0, rays: 1, gain: 1, clearance: { x: 0, y: 0, radius: 0 } }));
     const beamList: BeamSource[] = [beamPool[0]];
-    const polyUniform = new Float32Array(MAX_POLYGONS * MAX_VERTICES * 2);
-    const polyCounts = new Int32Array(MAX_POLYGONS);
-    const corners = new Float32Array(6 * 3);
-    const edgeData = new Float32Array(MAX_POLYGONS * EDGES_PER_PRISM * EDGE_STRIDE);
-    const faceData = new Float32Array(MAX_POLYGONS * FACE_VERTICES_PER_PRISM * FACE_STRIDE);
-    let edgeCount = 0, faceVertexCount = 0;
+    const glassPlanes = new Float32Array(MAX_POLYGONS * 3 * 4);
 
     // GPU resources.
     const format = pickFormat(ctx.capabilities, ['rgba16f', 'rgba8']);
     const lineProgram = new Program(gl, LINE_VS, LINE_FS, 'prism-lines');
     const splashProgram = new Program(gl, SPLASH_VS, SPLASH_FS, 'prism-splash');
     const skinProgram = new Program(gl, SKIN_VS, SPLASH_FS, 'prism-skin');
-    const faceProgram = new Program(gl, FACE_VS, FACE_FS, 'prism-faces');
     const downsample = quadProgram(gl, DOWNSAMPLE_FS, 'prism-down');
     const blur = quadProgram(gl, BLUR_FS, 'prism-blur');
     const composite = quadProgram(gl, COMPOSITE_FS, 'prism-composite');
@@ -453,18 +359,6 @@ export default defineSimulation({
       return { vbo, vao, count: 0, hitVbo, hitVao, hitCount: 0, planeY: IDLE_HEIGHT };
     }
     const slots: BeamSlot[] = [beamSlot(), beamSlot()];
-    const edgeVbo = buffer(edgeData.byteLength), edgeVao = vertexArray();
-    gl.bindVertexArray(edgeVao); gl.bindBuffer(gl.ARRAY_BUFFER, edgeVbo);
-    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 4, gl.FLOAT, false, EDGE_STRIDE * 4, 0); gl.vertexAttribDivisor(0, 1);
-    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 4, gl.FLOAT, false, EDGE_STRIDE * 4, 16); gl.vertexAttribDivisor(1, 1);
-    gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 2, gl.FLOAT, false, EDGE_STRIDE * 4, 32); gl.vertexAttribDivisor(2, 1);
-    gl.bindVertexArray(null); gl.bindBuffer(gl.ARRAY_BUFFER, null);
-    const faceVbo = buffer(faceData.byteLength), faceVao = vertexArray();
-    gl.bindVertexArray(faceVao); gl.bindBuffer(gl.ARRAY_BUFFER, faceVbo);
-    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, FACE_STRIDE * 4, 0);
-    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 1, gl.FLOAT, false, FACE_STRIDE * 4, 12);
-    gl.bindVertexArray(null); gl.bindBuffer(gl.ARRAY_BUFFER, null);
-
     let width = ctx.width, height = ctx.height, aspect = ctx.aspect;
     let camera = prismCamera(aspect, depth);
     let scene: Fbo | null = null, half: Fbo | null = null, quarterA: Fbo | null = null, quarterB: Fbo | null = null, wide: Fbo | null = null;
@@ -529,42 +423,15 @@ export default defineSimulation({
       beam.gain = beamGain(beam.width, sceneHeight, rays);
     }
 
-    /** Glass edges and faces for the composite's silhouette, the edge lines and the face fills. */
-    function buildGlass(twin: boolean, prismHeight: number) {
-      const count = twin ? 2 : 1;
-      edgeCount = 0; faceVertexCount = 0;
-      const eyeX = aspect / 2, eyeY = EYE_HEIGHT, eyeZ = -camera.eye;
-      for (let q = 0; q < MAX_POLYGONS; q++) {
-        if (q >= count) { polyCounts[q] = 0; continue; }
-        const poly = polygons[q];
-        prismCorners(poly.cx, poly.cy, poly.radius, q === 0 ? rotation : -rotation * .7 + .9, prismHeight, corners);
-        polyCounts[q] = prismSilhouette(camera, corners, polyUniform, q * MAX_VERTICES * 2);
-        // Nine edges: bottom triangle, top triangle, three uprights.
-        for (let i = 0; i < 3; i++) {
-          const j = (i + 1) % 3;
-          for (const [a, b] of [[i, j], [3 + i, 3 + j], [i, 3 + i]]) {
-            const o = edgeCount++ * EDGE_STRIDE;
-            edgeData[o] = corners[a * 3]; edgeData[o + 1] = corners[a * 3 + 2]; edgeData[o + 2] = corners[b * 3]; edgeData[o + 3] = corners[b * 3 + 2];
-            edgeData[o + 4] = GLASS.color[0]; edgeData[o + 5] = GLASS.color[1]; edgeData[o + 6] = GLASS.color[2]; edgeData[o + 7] = GLASS.edge;
-            edgeData[o + 8] = corners[a * 3 + 1]; edgeData[o + 9] = corners[b * 3 + 1];
-          }
+    /** The closed glass uses exactly the polygon planes traced by the beam solver. */
+    function buildGlass(twin: boolean) {
+      for (let q = 0; q < (twin ? 2 : 1); q++) {
+        const p = polygons[q];
+        for (let k = 0; k < 3; k++) {
+          const o = (q * 3 + k) * 4;
+          glassPlanes[o] = p.nx[k]; glassPlanes[o + 1] = 0; glassPlanes[o + 2] = p.ny[k];
+          glassPlanes[o + 3] = p.nx[k] * p.x[k] + p.ny[k] * p.y[k];
         }
-        // Faces: three side quads (outward normal from the polygon's edge normal), then the top and the bottom.
-        const pushVertex = (c: number, intensity: number) => { const o = faceVertexCount++ * FACE_STRIDE; faceData[o] = corners[c * 3]; faceData[o + 1] = corners[c * 3 + 1]; faceData[o + 2] = corners[c * 3 + 2]; faceData[o + 3] = intensity; };
-        const shade = (nx: number, ny: number, nz: number, px: number, py: number, pz: number) => {
-          let vx = eyeX - px, vy = eyeY - py, vz = eyeZ - pz;
-          const l = Math.sqrt(vx * vx + vy * vy + vz * vz) || 1; vx /= l; vy /= l; vz /= l;
-          return faceBrightness(nx, ny, nz, vx, vy, vz, GLASS.faceBase, GLASS.faceGlance);
-        };
-        for (let i = 0; i < 3; i++) {
-          const j = (i + 1) % 3;
-          const mx = (corners[i * 3] + corners[j * 3]) / 2, mz = (corners[i * 3 + 2] + corners[j * 3 + 2]) / 2;
-          const s = shade(poly.nx[i], 0, poly.ny[i], mx, prismHeight / 2, mz);
-          pushVertex(i, s); pushVertex(j, s); pushVertex(3 + j, s); pushVertex(i, s); pushVertex(3 + j, s); pushVertex(3 + i, s);
-        }
-        const top = shade(0, 1, 0, poly.cx, prismHeight, poly.cy), bottom = shade(0, -1, 0, poly.cx, 0, poly.cy);
-        pushVertex(3, top); pushVertex(4, top); pushVertex(5, top);
-        pushVertex(0, bottom); pushVertex(1, bottom); pushVertex(2, bottom);
       }
     }
 
@@ -627,7 +494,7 @@ export default defineSimulation({
       activePolygons.length = 0;
       activePolygons.push(setRegularPolygon(polygons[0], 3, centreA.x, centreA.z, radius, rotation));
       if (twin) activePolygons.push(setRegularPolygon(polygons[1], 3, centreB.x, centreB.z, radius * .85, -rotation * .7 + .9));
-      buildGlass(twin, params.height);
+      buildGlass(twin);
       const sceneHeight = scene ? scene.height : height;
       const rays = rayCount(params.rays, quality, rayBudget);
       const options = traceOptionsFor(quality, spectrum, params, aspect, depth, CAUCHY_B_GLASS);
@@ -720,11 +587,7 @@ export default defineSimulation({
         if (dirty) { traceScene(params); dirty = false; }
         if (!scene || !half || !quarterA || !quarterB || !wide) return;
 
-        // 1. Everything luminous, additively, into the half-float scene: the ghost solids, glass faces, beams and their
-        //    floor footprints, glass edges, wall splashes, skin splashes.
-        gl.bindBuffer(gl.ARRAY_BUFFER, edgeVbo); gl.bufferSubData(gl.ARRAY_BUFFER, 0, edgeData, 0, edgeCount * EDGE_STRIDE);
-        gl.bindBuffer(gl.ARRAY_BUFFER, faceVbo); gl.bufferSubData(gl.ARRAY_BUFFER, 0, faceData, 0, faceVertexCount * FACE_STRIDE);
-        gl.bindBuffer(gl.ARRAY_BUFFER, null);
+        // 1. Spectral beams, their deposits and ghost solids in the light buffer.
         scene.clear(0, 0, 0, 1);
         gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
         // The scan is the solid when present; the skeleton ghost only draws without one.
@@ -740,9 +603,6 @@ export default defineSimulation({
             .f2('u_surfaceTexel', 1 / Math.max(1, surfaceTexture.width), 1 / Math.max(1, surfaceTexture.height)).f1('u_surfaceAspect', aspect).f1('u_surfaceDepth', depth);
           drawQuad(gl);
         }
-        faceProgram.use().matrix4('u_matrix', camera.matrix).f3('u_color', GLASS.color[0], GLASS.color[1], GLASS.color[2]);
-        gl.bindVertexArray(faceVao);
-        if (faceVertexCount > 0) gl.drawArrays(gl.TRIANGLES, 0, faceVertexCount);
         lineProgram.use().matrix4('u_matrix', camera.matrix).f1('u_eye', camera.eye).f2('u_viewport', scene.width, scene.height).f1('u_halfWidth', LINE.halfWidth)
           .f1('u_core', LINE.core).f1('u_halo', LINE.halo).f1('u_haloGain', LINE.haloGain);
         for (const slot of slots) {
@@ -751,8 +611,6 @@ export default defineSimulation({
           gl.vertexAttrib2f(2, slot.planeY, slot.planeY); lineProgram.f1('u_gain', 1); gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, slot.count);
           if (params.floor > 0) { gl.vertexAttrib2f(2, 0, 0); lineProgram.f1('u_gain', FLOOR_LINE_GAIN * params.floor); gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, slot.count); }
         }
-        gl.bindVertexArray(edgeVao); lineProgram.f1('u_gain', 1);
-        if (edgeCount > 0) gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, edgeCount);
         splashProgram.use().matrix4('u_matrix', camera.matrix).f2('u_volume', aspect, depth).f1('u_radius', SPLASH.radius).f1('u_gain', SPLASH.gain / (SPLASH.radius * scene.height));
         for (const slot of slots) {
           if (slot.count === 0) continue;
@@ -779,15 +637,14 @@ export default defineSimulation({
         quarterB.bind(); blur.use().texture('u_source', quarterA.texture, 0).f2('u_dir', tx * 2.5, 0); drawQuad(gl);
         wide.bind(); blur.use().texture('u_source', quarterB.texture, 0).f2('u_dir', 0, ty * 2.5); drawQuad(gl);
 
-        // 3. Composite with the floor grid, the glass silhouette and the filmic curve.
+        // 3. Analytic glass refraction, studio reflections, stone floor and filmic output.
         bindScreen(gl, frame.width, frame.height);
         composite.use().texture('u_scene', scene.texture, 0).texture('u_glow', quarterA.texture, 1).texture('u_wide', wide.texture, 2)
-          .f1('u_aspect', aspect).f1('u_depth', depth).f1('u_eye', camera.eye).f1('u_eyeY', EYE_HEIGHT).f1('u_pxPerUnit', frame.height).f1('u_exposure', 1.0)
-          .f1('u_glowGain', params.glow * .9).f1('u_wideGain', params.glow * .6).f1('u_time', frame.time % 100)
-          .f1('u_floor', params.floor * (.3 + .7 * presence))
-          .f2v('u_poly', polyUniform).i1('u_polys', params.twin ? 2 : 1)
-          .f3('u_glassColor', GLASS.color[0], GLASS.color[1], GLASS.color[2]).f1('u_edgeBase', .03 + .03 * presence).f1('u_edgeGlow', 2.2).f1('u_tint', .6);
-        gl.uniform1iv(composite.location('u_polyCount'), polyCounts);
+          .f1('u_aspect', aspect).f1('u_depth', depth).f1('u_eye', camera.eye).f1('u_eyeY', EYE_HEIGHT)
+          .f1('u_glowGain', params.glow * .65).f1('u_wideGain', params.glow * .4)
+          .f1('u_floor', params.floor).f4v('u_planes', glassPlanes).i1('u_polys', params.twin ? 2 : 1)
+          .f1('u_height', params.height).f1('u_index', params.glass + params.dispersion * CAUCHY_B_GLASS / (.55 * .55))
+          .f1('u_roughness', params.roughness);
         drawQuad(gl);
       },
       signals() { return smooth; },
@@ -796,8 +653,7 @@ export default defineSimulation({
         for (const f of [scene, half, quarterA, quarterB, wide]) f?.dispose();
         scene = half = quarterA = quarterB = wide = null;
         for (const slot of slots) { gl.deleteBuffer(slot.vbo); gl.deleteVertexArray(slot.vao); gl.deleteBuffer(slot.hitVbo); gl.deleteVertexArray(slot.hitVao); }
-        gl.deleteBuffer(edgeVbo); gl.deleteVertexArray(edgeVao); gl.deleteBuffer(faceVbo); gl.deleteVertexArray(faceVao);
-        lineProgram.dispose(); splashProgram.dispose(); skinProgram.dispose(); faceProgram.dispose(); downsample.dispose(); blur.dispose(); composite.dispose(); ghost.dispose();
+        lineProgram.dispose(); splashProgram.dispose(); skinProgram.dispose(); downsample.dispose(); blur.dispose(); composite.dispose(); ghost.dispose();
         surfaceTexture.dispose();
         if (global.prismDiagnostics === diagnostics) delete global.prismDiagnostics;
       },
