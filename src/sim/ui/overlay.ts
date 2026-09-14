@@ -29,6 +29,7 @@ const fmt = (v: number, digits = 2) => Number.isFinite(v) ? v.toFixed(digits) : 
 const SOURCE_LABELS: Record<SourceId, string> = { pointer: 'Pointer (mouse / touch)', synthetic: 'Synthetic performer', webcam: 'Webcam hand tracking', leap: 'Leap Motion (local service)', depth: 'Depth camera bridge', replay: 'Replay recording' };
 
 export class Overlay {
+  private unsubscribe: () => void;
   private timer?: ReturnType<typeof setInterval>;
   private builtSim = ''; private builtSource: SourceId | '' = '';
   private paramsBox = el('div'); private sourceBox = el('div'); private signalsBox = el('div');
@@ -50,8 +51,10 @@ export class Overlay {
 
   constructor(private readonly root: HTMLElement, private readonly host: SimHost, private readonly video: HTMLVideoElement) {
     this.build();
-    host.onChange(() => this.syncStructure());
+    this.unsubscribe = host.onChange(() => this.syncStructure());
   }
+
+  dispose() { this.visible = false; this.unsubscribe(); }
 
   get visible() { return !this.root.hidden; }
   set visible(value: boolean) {

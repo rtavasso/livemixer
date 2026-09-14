@@ -6,6 +6,8 @@ import type { LoadedScene } from '../audio/assets';
 import { analyzeActivity } from '../audio/activity';
 import { button, element, escapeHtml, input, select } from './controls';
 
+export type PlayMode = 'space' | 'manual' | 'simulation';
+
 export class SpacePanel {
   readonly hand = new HandSpace();
   private leap: LeapAdapter;
@@ -21,7 +23,7 @@ export class SpacePanel {
     const workspace = document.querySelector<HTMLElement>('.workspace')!;
     workspace.id = 'manual-playing';
     const mode = document.createElement('div'); mode.className = 'play-mode';
-    mode.innerHTML = '<label>Play with <select id="play-mode" aria-label="Play with"><option value="space">Hand space</option><option value="manual">Manual controls</option></select></label><span class="subtle">The instrumental keeps playing when nobody is interacting.</span>';
+    mode.innerHTML = '<label>Play with <select id="play-mode" aria-label="Play with"><option value="simulation">Simulation</option><option value="space">Hand space</option><option value="manual">Manual controls</option></select></label><span class="subtle">The instrumental keeps playing when nobody is interacting.</span>';
     const panel = document.createElement('section'); panel.id = 'space-panel'; panel.className = 'panel space-panel'; panel.setAttribute('aria-label', 'Hand space');
     panel.innerHTML = `
       <div class="section-heading"><div><span class="eyebrow">REACH INTO THE MUSIC</span><h2>Shape the song</h2></div><label>Input <select id="space-input" aria-label="Hand space input"><option value="mouse">Mouse / touch preview</option><option value="leap">Leap Motion</option></select></label></div>
@@ -95,7 +97,6 @@ export class SpacePanel {
       element('space-pad-help').textContent = leap ? 'The dot follows your palm: height is vertical; depth is horizontal. Hold still to keep the sound.' : 'Move your pointer inside; move out to withdraw. On touch, drag and release. Or focus here: Space enters, arrows move, Escape withdraws.';
       element('space-pad').tabIndex = leap ? -1 : 0;
     };
-    select('play-mode').onchange = () => this.setEnabled(select('play-mode').value === 'space');
     const pad = element('space-pad');
     const move = (event: PointerEvent) => {
       if (this.isLeap || (event.pointerType !== 'mouse' && this.activePointer !== event.pointerId)) return;
@@ -131,9 +132,9 @@ export class SpacePanel {
   }
   get enabled() { return select('play-mode').value === 'space'; }
   private get isLeap() { return select('space-input').value === 'leap'; }
-  setEnabled(enabled: boolean) {
-    select('play-mode').value = enabled ? 'space' : 'manual';
-    element('space-panel').hidden = !enabled; element('manual-playing').hidden = enabled;
+  setEnabled(enabled: boolean, mode: PlayMode = enabled ? 'space' : 'manual') {
+    select('play-mode').value = mode;
+    element('space-panel').hidden = !enabled; element('manual-playing').hidden = mode !== 'manual';
     if (!enabled) { this.disconnect(); this.withdraw(); }
     this.lastSent = ''; this.modeChanged(enabled);
     this.change({ ...idleSpace(), enabled });

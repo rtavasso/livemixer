@@ -25,10 +25,12 @@ import { BroadcastTransport, WebSocketTransport, WindowTransport } from '../tele
 import type { HandTelemetry, TelemetryFrame, TelemetrySchema } from '../telemetry/types';
 import { FixedStepper, RateMeter } from './loop';
 import { findSimulation, SIMULATIONS, validateRegistry, type AnySimulation } from './registry';
-import { defaultMapping, SettingsStore, type Settings, type SolidChoice } from './settings';
+import { defaultMapping, settingsSchema, SettingsStore, type Settings, type SolidChoice } from './settings';
+import type { SimulationOutput } from '../core/output';
 
 export interface HostWarning { atMs: number; message: string }
 export interface HostPerf { fps: number; stepMs: number; renderMs: number; steps: number; droppedMs: number }
+export interface HostOptions { externalTelemetry?: boolean; fullscreenRoot?: HTMLElement }
 
 export interface HostState {
   simulation: AnySimulation;
@@ -57,6 +59,9 @@ export interface HostState {
 const RAW_SAMPLE_WINDOW_MS = 1000;
 
 export class SimHost {
+  private output: SimulationOutput | null = null;
+  /** Null while stopped, restarting, or recovering from a simulation/GL failure. */
+  get latestOutput(): SimulationOutput | null { return this.output; }
   readonly canvas: HTMLCanvasElement;
   readonly settings: SettingsStore;
   readonly bus: TelemetryBus;
@@ -78,6 +83,7 @@ export class SimHost {
   private source: InputSource | null = null;
   private sourceId: SourceId;
   private sourceGeneration = 0;
+  private replayFrames?: ReturnType<typeof parseRecording>;
   private gestureMemory: GestureMemory = emptyGestureMemory();
   private gestureSettings = DEFAULT_GESTURE_SETTINGS;
   private pendingEvents: GestureEvent[] = [];
@@ -99,7 +105,7 @@ export class SimHost {
   private lastOccupancyTelemetry: { width: number; height: number; data: string } | undefined;
   private lastOccupancyField: OccupancyField | null = null;
 
-  constructor(readonly root: HTMLElement, readonly video: HTMLVideoElement, settings: SettingsStore, private readonly now: () => number = () => performance.now()) {
+  constructor(readonly root: HTMLElement, readonly video: HTMLVideoElement, settings: SettingsStore, private readonly now: () => number = () => performance.now(), private readonly options: HostOptions = {}) {
     this.settings = settings;
     this.sessionOriginMs = this.now();
     const problems = validateRegistry();
@@ -149,6 +155,7 @@ export class SimHost {
   }
 
   private disposeInstance() {
+    this.output = null;
     const instance = this.instance;
     this.instance = null; this.simContext = null;
     if (instance) { try { instance.dispose(); } catch (error) { console.warn('[sim] dispose failed', error); } }
@@ -227,8 +234,28 @@ export class SimHost {
   /** Takes effect on the next step; the instance keeps running since simulations handle any mix of scan and capsules. */
   setSolid(solid: SolidChoice) { this.settings.update(s => { s.solid = solid; }); this.notify(); }
 
+  /** Atomically restore a validated performance configuration without replacing the host or its subscribers. */
+  restoreSettings(value: Settings) {
+    const settings = settingsSchema.parse(value);
+    if (!findSimulation(settings.sim)) throw new Error(`Unknown simulation "${settings.sim}".`);
+    const running = this.running; this.stop();
+    this.settings.value = settings;
+    this.sourceId = settings.source === 'replay' ? 'pointer' : settings.source;
+    this.tracker.mapping = this.mappingFor(this.sourceId); this.tracker.settings = this.trackerSettingsFor(this.sourceId); this.tracker.reset();
+    this.gestureSettings = gestureSettingsSchema.parse({ ...DEFAULT_GESTURE_SETTINGS, ...settings.gestures });
+    this.configureTelemetry(); this.selectSimulation(settings.sim);
+    if (running) this.start();
+  }
+
   async setSource(id: SourceId, options: { recording?: string } = {}): Promise<void> {
     if (!SOURCE_IDS.includes(id)) throw new Error(`Unknown source "${id}".`);
+    // Keep parsed replay data through pause/resume; the emitter is rebuilt for the new source generation.
+    if (id === 'replay') {
+      const frames = options.recording ? parseRecording(options.recording) : this.replayFrames;
+      if (!frames?.length) throw new Error('Choose a recording file to replay.');
+      this.replayFrames = frames;
+    } else this.replayFrames = undefined;
+    this.output = null;
     const generation = ++this.sourceGeneration;
     this.source?.stop(); this.source = null;
     this.sourceId = id;
@@ -244,8 +271,7 @@ export class SimHost {
       case 'depth': source = new DepthBridgeSource(this.settings.value.depth.url, emit, this.now); break;
       case 'leap': source = new LeapSource(this.settings.value.leap.url, this.settings.value.leap.box, emit, this.now); break;
       case 'replay': {
-        if (!options.recording) throw new Error('Choose a recording file to replay.');
-        source = new ReplaySource(parseRecording(options.recording), emit); break;
+        source = new ReplaySource(this.replayFrames!, emit); break;
       }
     }
     this.source = source; this.notify();
@@ -297,9 +323,11 @@ export class SimHost {
     const t = this.settings.value.telemetry;
     this.bus.rateHz = t.rateHz;
     this.bus.removeTransport('broadcast'); this.bus.removeTransport('window'); this.bus.removeTransport('websocket');
-    if (t.broadcast) this.bus.addTransport(new BroadcastTransport());
-    if (t.window) this.bus.addTransport(new WindowTransport());
-    if (t.websocketUrl) this.bus.addTransport(new WebSocketTransport(t.websocketUrl));
+    if (this.options.externalTelemetry !== false) {
+      if (t.broadcast) this.bus.addTransport(new BroadcastTransport());
+      if (t.window) this.bus.addTransport(new WindowTransport());
+      if (t.websocketUrl) this.bus.addTransport(new WebSocketTransport(t.websocketUrl));
+    }
   }
 
   startRecording() { this.recorder.clear(); this.recording = true; this.notify(); }
@@ -309,7 +337,7 @@ export class SimHost {
   toggleFullscreen() {
     // The whole document goes fullscreen so the overlay stays reachable for the operator.
     if (document.fullscreenElement) void document.exitFullscreen();
-    else void document.documentElement.requestFullscreen?.().catch(error => this.warn(`Fullscreen refused: ${String(error)}`));
+    else void (this.options.fullscreenRoot ?? document.documentElement).requestFullscreen?.().catch(error => this.warn(`Fullscreen refused: ${String(error)}`));
   }
 
   // ------------------------------------------------------------------ loop
@@ -321,8 +349,12 @@ export class SimHost {
     const tick = () => { if (!this.running) return; this.raf = requestAnimationFrame(tick); this.frame(); };
     this.raf = requestAnimationFrame(tick);
   }
-  stop() { this.running = false; cancelAnimationFrame(this.raf); this.source?.stop(); }
-  dispose() { this.stop(); this.disposeInstance(); if (this.retryTimer) clearTimeout(this.retryTimer); this.bus.close(); this.resizeObserver?.disconnect(); this.settings.flush(); }
+  stop() {
+    this.running = false; this.output = null; this.sourceGeneration++;
+    cancelAnimationFrame(this.raf); this.source?.stop();
+    if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = undefined; }
+  }
+  dispose() { this.stop(); this.disposeInstance(); this.bus.close(); this.resizeObserver?.disconnect(); this.settings.flush(); this.listeners.clear(); this.canvas.remove(); }
 
   private ingest(frame: InputFrame) {
     if (this.recording) this.recorder.add(frame);
@@ -382,6 +414,7 @@ export class SimHost {
       this.instance.render({ time: this.simTime + result.alpha * this.stepper.stepMs / 1000, alpha: result.alpha, width, height, aspect: width / Math.max(1, height), depth: this.settings.value.volumeDepth }, this.params as never);
       const clamped = clampSignals(this.definition.signals, this.instance.signals() as Record<string, number>);
       this.signals = clamped.values; this.signalViolations = clamped.violations;
+      this.output = { simId: this.definition.id, atMs: now, signals: { ...this.signals }, input: { presence: this.tracked.presence, activity: this.tracked.activity } };
     } catch (error) { this.warn(`render failed: ${error instanceof Error ? error.message : String(error)}`); this.disposeInstance(); return; }
     const renderEnd = this.now();
     this.perf = { fps: this.fps.value, stepMs: this.perf.stepMs + .1 * (stepEnd - stepStart - this.perf.stepMs), renderMs: this.perf.renderMs + .1 * (renderEnd - stepEnd - this.perf.renderMs), steps: result.steps, droppedMs: result.droppedMs };

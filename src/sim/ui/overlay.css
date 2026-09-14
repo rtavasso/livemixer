@@ -1,6 +1,6 @@
 .sim-body { margin: 0; background: #000; color: #dfe4e0; font: 12px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
 .sim-root { position: fixed; inset: 0; background: #000; }
-.sim-stage { display: block; width: 100vw; height: 100vh; background: #000; touch-action: none; }
+.sim-stage { display: block; width: 100%; height: 100%; background: #000; touch-action: none; }
 .sim-idle .sim-stage { cursor: none; }
 .sim-webcam { position: fixed; right: 12px; bottom: 12px; width: 200px; aspect-ratio: 4 / 3; transform: scaleX(-1); border-radius: 6px; opacity: .85; pointer-events: none; z-index: 3; }
 .sim-overlay { position: fixed; top: 12px; left: 12px; bottom: 12px; width: 360px; max-width: calc(100vw - 24px); overflow: auto; background: rgba(12, 14, 13, .86); backdrop-filter: blur(10px); border: 1px solid #2c342f; border-radius: 10px; padding: 14px 16px 18px; z-index: 4; box-sizing: border-box; }

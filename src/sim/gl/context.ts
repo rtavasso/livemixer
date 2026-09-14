@@ -21,6 +21,8 @@ export function createGl(canvas: HTMLCanvasElement): GlSetup {
 
 /** Resize the drawing buffer to the element size × dpr (capped). Returns true when it changed. */
 export function fitCanvas(canvas: HTMLCanvasElement, maxDpr: number): boolean {
+  // Switching mixer tabs hides the element. Keep the world dimensions while audio continues.
+  if (!canvas.clientWidth || !canvas.clientHeight) return false;
   const dpr = Math.min(maxDpr, window.devicePixelRatio || 1);
   const width = Math.max(1, Math.round(canvas.clientWidth * dpr)), height = Math.max(1, Math.round(canvas.clientHeight * dpr));
   if (canvas.width === width && canvas.height === height) return false;

@@ -64,7 +64,7 @@ export function mountPerformance() {
   chooser.after(timing);
   const speed = document.createElement('details'); speed.className = 'speed-control';
   speed.innerHTML = '<summary>Speed & pitch <output id="rate-summary">100%</output></summary><p class="subtle">Move all stems together. Slower sounds lower; faster sounds higher.</p><input id="playback-rate" aria-label="Speed and pitch" type="range" min="0.9" max="1.1" step="0.01" value="1"><div class="range-labels"><span>90% / lower</span><span>110% / higher</span></div><p id="rate-value" aria-live="polite">Original speed and pitch</p><button id="rate-reset">Reset to original</button>';
-  sound.append(speed);
+  timing.after(speed);
   button('next').textContent = 'Next passage';
   meters.append(element('boundary'), element('transition'));
   const passage = document.createElement('span'); passage.id = 'passage-feedback';
@@ -97,7 +97,7 @@ export function updatePerformance(session: PerformanceSession, scene: Scene, now
     if (preset) { const label = `${preset.label}: ${preset.summary}`; if (b.textContent !== label) b.textContent = label; b.setAttribute('aria-pressed', String(preset.ids.includes(requested))); }
   }
   const playingPreset = presets.find(p => p.ids.includes(s.currentRecipe));
-  element('preset-feedback').textContent = session.space.enabled ? 'Choose Manual controls in Play to use these saved combinations. Hand space controls the balance continuously.' : s.running ? `Playing: ${playingPreset?.label ?? 'saved mix'}. Changes follow the timing chosen in Play.` : 'Start audio in Play to hear these combinations.';
+  element('preset-feedback').textContent = session.space.enabled ? 'Choose Manual controls in Play to use these saved combinations. The active performance controls the balance continuously.' : s.running ? `Playing: ${playingPreset?.label ?? 'saved mix'}. Changes follow the timing chosen in Play.` : 'Start audio in Play to hear these combinations.';
   const voices = (id: typeof s.currentRecipe) => scene.recipes[id].vocals != null;
   const desired = s.recipeIntent ? s.desiredRecipe : s.committedRecipe?.recipe ?? s.currentRecipe;
   const next = s.committedRecipe?.recipe ?? (s.recipeIntent && desired !== s.currentRecipe ? desired : undefined);

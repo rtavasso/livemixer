@@ -16,7 +16,8 @@ import { diagnostics, renderStemMeters } from './ui/diagnostics';
 import { LibraryWorkspace } from './library/workspace';
 import { preparedCollection } from './library/prepared';
 import { mountPerformance, updatePerformance, vocalChoices } from './ui/performance';
-import { SpacePanel } from './ui/space';
+import { SpacePanel, type PlayMode } from './ui/space';
+import { SimulationPanel } from './ui/simulation';
 import { analyzeActivity } from './audio/activity';
 
 mount();
@@ -35,6 +36,23 @@ const camera = new CameraAdapter(element<HTMLVideoElement>('video'), frame => { 
 const spacePanel = new SpacePanel(state => dispatch({ type: 'space', state }), enabled => {
   if (enabled && session) { switchAdapter('slider'); dispatch({ type: 'mode', mode: 'timbre_only' }); dispatch({ type: 'hold', enabled: false }); }
 });
+const simulationPanel = new SimulationPanel();
+const launch = new URLSearchParams(location.search);
+const requestedMode = launch.get('play');
+let playMode: PlayMode = requestedMode === 'space' || requestedMode === 'manual' || requestedMode === 'simulation'
+  ? requestedMode : launch.get('fixtures') === '1' ? 'manual' : 'simulation';
+let lastSimulationState = '';
+function setPlayMode(mode: PlayMode) {
+  playMode = mode; lastSimulationState = '';
+  spacePanel.setEnabled(mode === 'space', mode);
+  if (mode === 'simulation') {
+    camera.stop();
+    if (session) { switchAdapter('slider'); dispatch({ type: 'mode', mode: 'timbre_only' }); dispatch({ type: 'hold', enabled: false }); }
+    dispatch({ type: 'space', state: simulationPanel.sample(performance.now(), session?.state.running ?? false) });
+  }
+  simulationPanel.setActive(mode === 'simulation');
+}
+select('play-mode').onchange = () => setPlayMode(select('play-mode').value as PlayMode);
 const library = new LibraryWorkspace(context, {
   beforeAudition: () => { if (session?.state.running) dispatch({ type: 'stop' }); stopPreview(); },
   loadPerformance: async (config, media, edge) => {
@@ -65,7 +83,7 @@ function newTrace() {
   if (session.source !== 'camera') { camera.stop(); element('camera-panel').hidden = true; }
   trace = new TraceRecorder(session.originMs, { configFingerprint: assets.fingerprint, inputMode: session.source, sampleRate: context.sampleRate, authoring, readiness: session.environment.scenes, edgeErrors: session.environment.edgeErrors });
   trace.add('clock-map', performance.now(), { audioTime: context.currentTime, generation: session.state.generation });
-  spacePanel.reset(); spacePanel.setEnabled(!engineering);
+  spacePanel.reset(); setPlayMode(playMode);
   if (!engineering) {
     dispatch({ type: 'timing', timing: 'beat' });
     dispatch({ type: 'mode', mode: 'timbre_only' });
@@ -102,6 +120,7 @@ function updateAvailability() {
   button('cancel-render').disabled = !rendering; button('report-export').disabled = !measurements; button('download-preview').disabled = !renderedPreview;
   button('replay-start').disabled = !importedTrace || running || loading || rendering;
   button('replay-verify').disabled = !importedTrace || loading || rendering;
+  simulationPanel.updateTransport();
 }
 function updateScene() {
   const id = session.state.running ? session.state.sceneId : authoring ? select('edit-scene').value || manifest.path[0] : manifest.path[0], loaded = assets.scenes[id];
@@ -142,7 +161,7 @@ function populate() {
 }
 async function load(inputManifest: unknown, mediaReader: ReadMedia, mode: boolean) {
   guardStopped(); const candidate = validateManifest(inputManifest), generation = ++loadGeneration;
-  loading = true; stopPreview(); camera.stop(); spacePanel.disconnect(); if (timer) clearInterval(timer); updateAvailability();
+  loading = true; simulationPanel.setSuspended(true); stopPreview(); camera.stop(); spacePanel.disconnect(); if (timer) clearInterval(timer); updateAvailability();
   try {
     const loaded = await loadAssets(context, candidate, mediaReader, message => setText('load-status', message));
     if (generation !== loadGeneration) return;
@@ -155,7 +174,7 @@ async function load(inputManifest: unknown, mediaReader: ReadMedia, mode: boolea
     element('camera-panel').hidden = true; replay = undefined; lastScene = ''; renderedPreview = undefined; measurements = undefined;
     newTrace(); populate(); library.syncPerformance(manifest); setText('load-status', 'Ready · all synchronized stems decoded'); showError();
   } catch (error) { setText('load-status', 'Load failed · previous collection retained if available'); throw error; }
-  finally { loading = false; if (session) timer = setInterval(tick, manifest.control.schedulerIntervalMs); updateAvailability(); }
+  finally { loading = false; simulationPanel.setSuspended(false); if (session) timer = setInterval(tick, manifest.control.schedulerIntervalMs); updateAvailability(); }
 }
 function dispatch(inputEvent: SessionInput, at = performance.now(), audio = context.currentTime) {
   if (!session) return;
@@ -186,8 +205,13 @@ function dispatch(inputEvent: SessionInput, at = performance.now(), audio = cont
 }
 function tick() {
   if (!session || loading) return;
-  spacePanel.tick(engine, session.state.running, session.source === 'replay' ? session.space : undefined);
+  // The legacy panel may emit controls using its own current timestamp. Capture the tick clock afterward.
+  if (playMode !== 'simulation' || session.source === 'replay') spacePanel.tick(engine, session.state.running, session.source === 'replay' ? session.space : undefined);
   const now = performance.now();
+  if (playMode === 'simulation' && session.source !== 'replay') {
+    const state = simulationPanel.sample(now, session.state.running), key = JSON.stringify(state);
+    if (key !== lastSimulationState) { lastSimulationState = key; dispatch({ type: 'space', state }, now); }
+  }
   if (session.source === 'slider') dispatch({ type: 'frame', frame: slider.sample(now) }, now);
   if (session.source === 'replay' && replay) {
     for (const event of replay.due(now)) dispatch(event.type === 'frame' ? { ...event, frame: { ...event.frame, receivedAtMs: now } } : event, now);
@@ -223,6 +247,7 @@ document.querySelectorAll<HTMLButtonElement>('[data-recipe]').forEach(b => b.onc
 input('openness').oninput = () => { const value = Number(input('openness').value); if (session?.source !== 'slider') switchAdapter('slider'); slider.value = value; input('openness').value = String(value); };
 function switchAdapter(source: Adapter) {
   if (!session) return;
+  if (source !== 'slider' && playMode === 'simulation') setPlayMode('manual');
   if (source !== 'camera') camera.stop();
   if (source !== 'replay') replay = undefined;
   if (source === 'slider') { slider.value = session.conditioned.smooth; input('openness').value = String(slider.value); }
@@ -337,7 +362,13 @@ context.onstatechange = () => {
   setText('context-state', `Audio ${context.state}`);
   if (session && context.state !== 'running' && session.state.running) { dispatch({ type: 'stop' }); showError('Audio context was suspended. Transport stopped; Start audio establishes a fresh clock mapping.'); }
 };
-window.addEventListener('pagehide', () => { spacePanel.dispose(); camera.stop(); library.stopAudition(); engine?.dispose(); stopPreview(); if (timer) clearInterval(timer); void context.close(); });
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && playMode === 'simulation') {
+    lastSimulationState = '';
+    dispatch({ type: 'space', state: simulationPanel.sample(performance.now(), session?.state.running ?? false) });
+  }
+});
+window.addEventListener('pagehide', () => { simulationPanel.dispose(); spacePanel.dispose(); camera.stop(); library.stopAudition(); engine?.dispose(); stopPreview(); if (timer) clearInterval(timer); void context.close(); });
 async function openInitialCollection() {
   let prepared = preparedCollection(location.search);
   const fixtures = new URLSearchParams(location.search).get('fixtures') === '1';
@@ -362,4 +393,9 @@ async function openInitialCollection() {
   }
   await open();
 }
+setPlayMode(playMode);
 void openInitialCollection().catch(showError);
+
+/** Inspection hook shared by integration tests and the performance diagnostics console. */
+declare global { interface Window { livemixerPerformance: { simulation: SimulationPanel; session: () => PerformanceSession | undefined; engine: () => AudioEngine | undefined } } }
+window.livemixerPerformance = { simulation: simulationPanel, session: () => session, engine: () => engine };

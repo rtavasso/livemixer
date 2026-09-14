@@ -1,18 +1,21 @@
 # Installation simulations
 
-`sim.html` is a second application in this repository: a full-screen physics
-simulation driven by a hand (or anything else) inside a physical bounding box
-watched by a depth camera. The simulation publishes its state so a separate
-audio project can turn it into a live mix.
+`sim.html` is the development studio for full-screen physics simulations driven
+by a hand (or anything else) inside a physical bounding box watched by a depth
+camera. The mixer mounts the same simulation player and maps its published
+signals into live music. Tune a **performance patch** in the studio's overlay,
+then choose **Play in mixer**. See [architecture and the patch workflow](ARCHITECTURE.md).
 
 ```
 depth camera ──► bridge process ──WebSocket──► browser: source ─► mapping ─► tracker ─► gestures
                                                                                    │
-                     audio project ◄──telemetry (signals, params, hands)◄── host ◄─┘─► simulation ─► canvas
+                     mixer ◄──signal mappings ◄── rendered output ◄── host ◄────┘─► simulation ─► canvas
 ```
 
-Everything in `src/sim/` is independent from the stem mixer in `src/`. The two
-share tooling only.
+Simulation implementations in `src/sim/` remain independent of the stem mixer.
+`src/integration/` connects the shared player's output to the audio graph.
+Diagnostic telemetry remains available to other consumers; in-process mixer
+control has its own output snapshot and is independent of telemetry rate.
 
 ## Running
 
@@ -170,7 +173,7 @@ White light and glass. A vertical glass prism stands in the middle of the volume
 ### Presence (`presence`)
 The reference simulation: a soft light gathers around a hand and travels with it through the volume (nearer the glass it is large and warm, deeper it is smaller, dimmer and cooler) over a faint perspective floor grid. Copy it to start something new.
 
-## Telemetry (to the audio project)
+## Telemetry (external consumers and diagnostics)
 
 `TelemetryBus` publishes two message kinds (`src/sim/telemetry/types.ts`):
 
@@ -179,7 +182,7 @@ The reference simulation: a soft light gathers around a hand and travels with it
 
 Inbound: `set-param`, `set-params`, `select-sim`, `get-schema`, `ping`. Transports: `BroadcastChannel('livemixer-sim')` (a second tab), WebSocket (the page connects to a server the audio process runs; reconnects forever), and `window.postMessage` when embedded. `window.livemixerSim.host.bus.subscribe(fn)` works from devtools.
 
-Two ready-made consumers exist to start the audio project from:
+Two ready-made diagnostic consumers are available:
 
 - **`telemetry.html`** (same origin, second tab): live signal bars, a smoothed copy of each signal as a mapper might keep it, hands, events, editable parameters that are sent back with `set-param`, and simulation switching. Source: `src/sim/monitor.ts`, deliberately dependency-free.
 - **`npm run telemetry:sink [port]`** (`scripts/telemetry-sink.ts`): a WebSocket server with no dependencies that prints the schema and a line per second of signals. Launch it, then open `sim.html?ws=ws://127.0.0.1:9000`. Any WebSocket library in any language works the same way; the page connects out and sends JSON text frames.

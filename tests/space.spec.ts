@@ -16,7 +16,7 @@ test('hand effects remain audible with completely silent vocals, gate vocals, an
 test('Sun responds throughout all three passages with its vocal buffers silent', async ({ page }, info) => {
   test.skip(!existsSync('public/scenes/love-supreme-sun/manifest.json'), 'Local user recordings are absent.');
   test.setTimeout(120000);
-  await page.goto('/'); await expect(page.locator('#start')).toBeEnabled();
+  await page.goto('/?play=space'); await expect(page.locator('#start')).toBeEnabled();
   await expect(page.locator('#play-mode')).toHaveValue('space'); await expect(page.locator('#manual-playing')).toBeHidden();
   const results = await page.evaluate(async () => { const path = '/tests/space-harness.ts'; return (await import(path)).sunSpace(); });
   await info.attach('sun-hand-space', { body: JSON.stringify(results, null, 2), contentType: 'application/json' });
@@ -65,10 +65,10 @@ test('Leap adapter handles fresh palms, short loss, stale frames, disconnect and
   await page.locator('#space-bound-top').fill('500'); await page.locator('#space-bounds-save').click(); await expect(page.locator('#space-bounds-status')).toContainText('Bounds saved');
   await page.reload(); await expect(page.locator('#space-bound-top')).toHaveValue('500');
 });
-test('real touch events enter, drag and withdraw without a stuck hand', async ({ browser }) => {
+test('real touch events enter, drag and withdraw without a stuck hand', async ({ browser, baseURL }) => {
   const context = await browser.newContext({ hasTouch: true, viewport: { width: 430, height: 900 } });
   const page = await context.newPage(), errors: string[] = []; page.on('pageerror', e => errors.push(e.message));
-  await page.goto('http://127.0.0.1:4178/?fixtures=1'); await expect(page.locator('#start')).toBeEnabled();
+  await page.goto(`${baseURL}/?fixtures=1`); await expect(page.locator('#start')).toBeEnabled();
   await page.locator('#play-mode').selectOption('space'); await page.locator('#start').click();
   const pad = page.locator('#space-pad'); await pad.scrollIntoViewIfNeeded(); const rect = (await pad.boundingBox())!;
   const cdp = await context.newCDPSession(page);
@@ -82,7 +82,7 @@ test('real touch events enter, drag and withdraw without a stuck hand', async ({
 });
 test('hand space preserves control through immediate passage/speed changes and round-trips its trace', async ({ page }) => {
   test.skip(!existsSync('public/scenes/love-supreme-sun/manifest.json'), 'Local user recordings are absent.');
-  await page.goto('/?tools=1'); await expect(page.locator('#start')).toBeEnabled(); await page.locator('#start').click();
+  await page.goto('/?tools=1&play=space'); await expect(page.locator('#start')).toBeEnabled(); await page.locator('#start').click();
   await page.locator('#space-height').fill('0.8'); await page.locator('#space-depth').fill('0.9');
   await expect(page.locator('#gain-vocals')).toContainText('% hand mix');
   await page.locator('#response-timing').selectOption('immediate'); await page.locator('.speed-control summary').click();
