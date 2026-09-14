@@ -4,6 +4,7 @@
  * --mixer loads the synthetic music fixtures and starts audio; --fullscreen
  * expands its player. Browser output is muted, but the audio graph runs.
  * --headless is a correctness run only; software GPUs are never labelled hardware.
+ * --no-screenshot skips capture (useful when macOS stalls a fullscreen capture).
  * This measures delivered rAF cadence and CPU submission, not GPU execution time.
  */
 import { chromium } from '@playwright/test';
@@ -47,16 +48,26 @@ try {
       const host = window.livemixerSim?.host ?? window.livemixerPerformance.simulation.player!.host;
       const intervals: number[] = [], step: number[] = [], submit: number[] = [];
       let previous = 0, start = 0, droppedMs = 0;
+      let previousOutput = host.latestOutput?.atMs, simulationFrames = 0, maxSimulationGapMs = 0;
       const signals: Record<string, [number, number]> = {};
       await new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error('No visible animation frames during benchmark.')), duration + 15_000);
         const tick = (now: number) => {
           if (document.visibilityState !== 'visible') { clearTimeout(timeout); reject(new Error('Benchmark tab became hidden.')); return; }
-          if (!start) start = now;
+          const firstFrame = !start;
+          if (firstFrame) { start = now; previousOutput = host.latestOutput?.atMs; }
           if (previous) intervals.push(now - previous);
           previous = now;
           const s = host.state();
-          step.push(s.perf.stepMs); submit.push(s.perf.renderMs); droppedMs += s.perf.droppedMs;
+          step.push(s.perf.stepMs); submit.push(s.perf.renderMs);
+          // The mixer can suspend its player while the window keeps receiving
+          // animation frames. Count each published output and its dropped time
+          // once; stale perf snapshots must not multiply a single stall.
+          const outputAt = host.latestOutput?.atMs;
+          if (!firstFrame && outputAt !== undefined && outputAt !== previousOutput) {
+            if (previousOutput !== undefined) maxSimulationGapMs = Math.max(maxSimulationGapMs, outputAt - previousOutput);
+            previousOutput = outputAt; simulationFrames++; droppedMs += s.perf.droppedMs;
+          }
           for (const [k, v] of Object.entries(s.signals)) {
             const range = signals[k] ?? [v, v]; range[0] = Math.min(range[0], v); range[1] = Math.max(range[1], v); signals[k] = range;
           }
@@ -76,17 +87,20 @@ try {
       }
       return { sim: s.simulation.id, renderer: s.gpu, resolution: [s.width, s.height], elapsedMs: elapsed, frames: intervals.length,
         fps: intervals.length / elapsed * 1000, frameMs: { p50: percentile(intervals, .5), p95: percentile(intervals, .95), p99: percentile(intervals, .99) },
+        simulationFrames, simulationFps: simulationFrames / elapsed * 1000, maxSimulationGapMs,
         cpuMs: { stepP95: percentile(step, .95), submitP95: percentile(submit, .95) }, droppedMs,
         audio, signals, warnings: s.warnings.map(w => w.message), violations: s.signalViolations };
     }, seconds * 1000);
     const hardware = !/swiftshader|llvmpipe|software|lavapipe/i.test(sample.renderer) && !headless;
     const report = { ...sample, hardware, mixer, quality, viewport: [width, height], browser: browser.version(), timestamp: new Date().toISOString() };
     reports.push(report);
-    await page.screenshot({ path: join(out, `${sim}.png`), scale: 'css' });
+    // Preserve completed measurements even if browser image capture fails.
     await writeFile(join(out, 'results.json'), JSON.stringify({ reports, errors }, null, 2) + '\n');
     console.log(JSON.stringify(report));
     if (!hardware) console.log('Software/headless result: do not use this as evidence of Intel GPU performance.');
     if (sample.sim !== sim || sample.warnings.length || sample.violations.length || errors.length) throw new Error('Simulation reported an error; see results.json.');
+    if (!sample.simulationFrames) throw new Error('Simulation did not publish during the sample; see results.json.');
     if (mixer && (!sample.audio?.running || sample.audio.state !== 'running' || sample.audio.rms <= .0001)) throw new Error('Mixer audio did not run; see results.json.');
+    if (!args.has('no-screenshot')) await page.screenshot({ path: join(out, `${sim}.png`), scale: 'css', timeout: 10_000 });
   }
 } finally { await browser.close(); }

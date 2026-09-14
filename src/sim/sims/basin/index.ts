@@ -1,11 +1,11 @@
 /**
- * Basin — clear water in glazed porcelain, seen from above, holding drops of
+ * Basin — clear water in glazed porcelain, holding drops of
  * ink that the hand can stir.
  *
- * The bowl sits on the floor of the volume and the view is top-down, so the
- * water plane is the volume's horizontal plane: screen x is world x and screen
- * y is world z (the glass edge at the bottom of the screen, the far edge of the
- * table at the top). The hand's HEIGHT (sim y) decides whether it is in the
+ * The bowl sits on the floor of the volume. The water is the horizontal
+ * x/depth plane, projected through a perspective camera (`view.ts`). Changing
+ * the camera never changes physical input coordinates or mixer signals.
+ * The hand's HEIGHT (sim y) decides whether it is in the
  * water: the surface sits at the `surface` parameter. A hand above it only
  * casts a shadow on the water; a fingertip touching it stirs gently; a plunged
  * hand stirs hard; and a fast crossing of the surface splashes a fresh bead.
@@ -44,6 +44,7 @@ import {
 } from './model';
 import * as glsl from './shaders';
 import { WAVE_FS, WAVE_GRID } from './waves';
+import { DEFAULT_ELEVATION } from './view';
 
 const PACKED_ZERO = 128 / 255;
 const INITIAL_DROPS = 4;
@@ -70,7 +71,8 @@ export default defineSimulation({
     light: { kind: 'number', default: 1, min: 0, max: 2, step: .01, label: 'Highlight', description: 'Strength of the window reflection, glints and waterline rings on the water surface.' },
     caustics: { kind: 'number', default: .7, min: 0, max: 2, step: .01, label: 'Caustics', description: 'Brightness of the refracted light playing on the bowl floor.' },
     ripples: { kind: 'number', default: .65, min: 0, max: 1.5, step: .01, label: 'Ripples', description: 'Surface response to drops and moving hands. Waves travel, reflect off the rim, and settle independently of the ink.' },
-    glaze: { kind: 'color', default: '#789895', label: 'Bowl glaze', description: 'Ceramic colour beneath the clear water. Pale glazes reveal pigment; dark glazes emphasize reflections.' },
+    glaze: { kind: 'color', default: '#a6a394', label: 'Bowl glaze', description: 'Ceramic colour beneath the clear water. Pale glazes reveal pigment; dark glazes emphasize reflections.' },
+    elevation: { kind: 'number', default: DEFAULT_ELEVATION, min: 35, max: 90, step: 1, unit: '°', label: 'Camera elevation', description: 'Angle above the table: 40° shows the bowl profile and water depth; 90° looks straight down. Physics and mixer signals are unchanged.' },
   },
   signals: {
     energy: { min: 0, max: 1, description: 'Mean water speed inside the bowl, normalised.', smoothing: .15 },
@@ -90,6 +92,7 @@ export default defineSimulation({
     const dyeN = N * 2; // the dye lives on a finer grid so filaments survive advection
     const iterations = JACOBI_BY_QUALITY[ctx.quality];
     const texel = 1 / N, dyeTexel = 1 / dyeN;
+    const correctedDye = ctx.quality !== 'low';
 
     // Programs.
     const pAdvect = quadProgram(gl, glsl.advectVelocity(packed), 'basin.advect');
@@ -98,11 +101,13 @@ export default defineSimulation({
     const pDivergence = quadProgram(gl, glsl.divergence(packed), 'basin.divergence');
     const pJacobi = quadProgram(gl, glsl.jacobi(packed), 'basin.jacobi');
     const pGradient = quadProgram(gl, glsl.gradientSubtract(packed), 'basin.gradient');
-    const pDye = quadProgram(gl, glsl.advectDye(packed), 'basin.dye');
+    const pDye = quadProgram(gl, glsl.advectDye(packed, correctedDye), 'basin.dye');
+    const pPredict = correctedDye ? quadProgram(gl, glsl.predictDye(packed), 'basin.dye-predict') : null;
     const pProbe = quadProgram(gl, glsl.probe(packed), 'basin.probe');
     const pComposite = quadProgram(gl, glsl.composite(packed), 'basin.composite');
     const pWave = quadProgram(gl, WAVE_FS, 'basin.waves');
     const programs = [pAdvect, pCurl, pVorticity, pDivergence, pJacobi, pGradient, pDye, pProbe, pComposite, pWave];
+    if (pPredict) programs.push(pPredict);
     const waveN = WAVE_GRID[ctx.quality];
     const wave = new PingPong(gl, waveN, waveN, 'rgba8', 'linear');
     for (const f of [wave.read, wave.write]) f.clear(128 / 255, 0, 128 / 255, 0);
@@ -117,6 +122,7 @@ export default defineSimulation({
     // Targets. The sim grid is fixed; only the composite depends on the canvas.
     const velocity = new PingPong(gl, N, N, format, 'linear');
     const dye = new PingPong(gl, dyeN, dyeN, format, 'linear');
+    const dyePrediction = correctedDye ? new Fbo(gl, dyeN, dyeN, format, 'linear') : null;
     const pressure = new PingPong(gl, N, N, format, 'linear');
     const divergence = new Fbo(gl, N, N, format, 'linear');
     const curl = new Fbo(gl, N, N, format, 'linear');
@@ -282,7 +288,12 @@ export default defineSimulation({
         common(pGradient, bowl).texture('u_pressure', pressure.read.texture, 0).texture('u_velocity', velocity.read.texture, 1);
         run(velocity.write); velocity.swap();
         // 7. Advect the dye and drop ink.
+        if (pPredict && dyePrediction) {
+          common(pPredict, bowl).texture('u_dye', dye.read.texture, 0).texture('u_velocity', velocity.read.texture, 1).f1('u_dt', dt);
+          run(dyePrediction);
+        }
         common(pDye, bowl).f2('u_texel', dyeTexel, dyeTexel).texture('u_dye', dye.read.texture, 0).texture('u_velocity', velocity.read.texture, 1)
+          .texture('u_prediction', dyePrediction?.texture ?? dye.read.texture, 2)
           .f1('u_dt', dt).f1('u_fade', dissipation(params.fade, dt, packed, step, PACKED_FADE_STRIDE))
           .f1('u_fadeFloor', dissipationFloor(packed, step, PACKED_FADE_STRIDE, 1))
           .i1('u_dropCount', dropCount).f4v('u_drops', dropData).f3v('u_dropColor', dropColor);
@@ -296,6 +307,7 @@ export default defineSimulation({
       render(frame, params) {
         const bowl = params.bowl;
         const glaze = hexToRgb(params.glaze);
+        const elevation = params.elevation * Math.PI / 180;
         // Pack every hand's capsules back to back; each hand's record says where its run starts.
         let first = 0, shadowCount = 0;
         for (let i = 0; i < shadows.length && i < glsl.MAX_HANDS; i++) {
@@ -314,6 +326,7 @@ export default defineSimulation({
           .f1('u_light', params.light).f1('u_caustics', params.caustics).f1('u_presence', presence)
           .texture('u_wave', wave.read.texture, 4).f2('u_waveTexel', 1 / waveN, 1 / waveN)
           .f3('u_glaze', glaze[0] ** 2.2, glaze[1] ** 2.2, glaze[2] ** 2.2)
+          .f2('u_viewAngle', Math.sin(elevation), Math.cos(elevation))
           .i1('u_shadowCount', shadowCount).f4v('u_shadowHands', shadowHands).f4v('u_shadowMeta', shadowMeta).f4v('u_capSeg', capSeg).f4v('u_capMeta', capMeta)
           .f4('u_scan', scan.bx, scan.by, scan.bound, scanOpacity);
         scanUniforms(pComposite, 3, scan.minY, scan.total ? Math.max(0, scan.maxY - scan.minY) + 1 / (scanTexture.height || 64) : 0, scanWet * scanOpacity);
@@ -369,7 +382,7 @@ export default defineSimulation({
         shadows.length = 0; pending.length = 0;
         for (const p of programs) p.dispose();
         scanTexture.dispose();
-        velocity.dispose(); dye.dispose(); pressure.dispose(); divergence.dispose(); curl.dispose(); probe.dispose(); wave.dispose();
+        velocity.dispose(); dye.dispose(); dyePrediction?.dispose(); pressure.dispose(); divergence.dispose(); curl.dispose(); probe.dispose(); wave.dispose();
       },
     };
   },

@@ -1,6 +1,93 @@
 import { expect, test } from '@playwright/test';
 test.use({ deviceScaleFactor: 2 });
 
+test('corrected GPU ink transport retains detail without introducing pigment extrema', async ({ page }) => {
+  await page.goto('/sim.html?sim=presence&source=pointer&overlay=0&quality=low');
+  await page.waitForFunction(() => !!window.livemixerSim?.host);
+  const results = await page.evaluate(async () => {
+    window.livemixerSim.host.stop();
+    const [{ advectDye, predictDye }, { Fbo, PingPong }, { quadProgram, drawQuad }, { PACKED_VELOCITY_SCALE }] = await Promise.all([
+      import('../src/sim/sims/basin/shaders'), import('../src/sim/gl/fbo'), import('../src/sim/gl/quad'), import('../src/sim/sims/basin/model'),
+    ]);
+    const gl = document.createElement('canvas').getContext('webgl2')!;
+    if (!gl.getExtension('EXT_color_buffer_float')) throw new Error('Test requires floating targets as well as the RGBA8 fallback.');
+    const n = 96, dt = 1 / 60, steps = 50, requestedVelocity = 30 / n;
+    try {
+      return (['rgba16f', 'rgba8'] as const).map(format => {
+        const packed = format === 'rgba8', zero = 128 / 255;
+        const encodedVelocity = packed ? Math.round((zero + requestedVelocity / PACKED_VELOCITY_SCALE) * 255) / 255 : requestedVelocity;
+        const velocity = packed ? (encodedVelocity - zero) * PACKED_VELOCITY_SCALE : requestedVelocity;
+        const flow = new Fbo(gl, n, n, format);
+        const prediction = new Fbo(gl, n, n, format);
+        const field = new PingPong(gl, n, n, format);
+        const predict = quadProgram(gl, predictDye(packed), 'test.ink-predict');
+        flow.clear(encodedVelocity, packed ? zero : 0, 0, 1);
+        const run = (corrected: boolean) => {
+          const shader = quadProgram(gl, advectDye(packed, corrected), 'test.ink-transport');
+          try {
+            field.clear(); field.read.bind();
+            gl.enable(gl.SCISSOR_TEST); gl.scissor(24, 46, 3, 3);
+            gl.clearColor(1, 1, 1, 1); gl.clear(gl.COLOR_BUFFER_BIT); gl.disable(gl.SCISSOR_TEST);
+            for (let i = 0; i < steps; i++) {
+              if (corrected) {
+                prediction.bind();
+                predict.use().texture('u_dye', field.read.texture, 0).texture('u_velocity', flow.texture, 1).f1('u_dt', dt).f1('u_bowl', .72);
+                drawQuad(gl);
+              }
+              field.write.bind();
+              shader.use().texture('u_dye', field.read.texture, 0).texture('u_velocity', flow.texture, 1)
+                .texture('u_prediction', prediction.texture, 2).f2('u_texel', 1 / n, 1 / n)
+                .f1('u_dt', dt).f1('u_bowl', .72).f1('u_fade', 1).f1('u_fadeFloor', 0).i1('u_dropCount', 0);
+              drawQuad(gl); field.swap();
+            }
+            field.read.bind();
+            const pixels = packed ? new Uint8Array(n * n * 4) : new Float32Array(n * n * 4);
+            gl.readPixels(0, 0, n, n, gl.RGBA, packed ? gl.UNSIGNED_BYTE : gl.FLOAT, pixels);
+            let min = Infinity, peak = 0, mass = 0, moment = 0, second = 0;
+            for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+              const value = pixels[(y * n + x) * 4] / (packed ? 255 : 1);
+              min = Math.min(min, value); peak = Math.max(peak, value);
+              mass += value; moment += value * x; second += value * x * x;
+            }
+            const centre = moment / mass;
+            return { min, peak, centre, variance: second / mass - centre * centre, glError: gl.getError() };
+          } finally { shader.dispose(); }
+        };
+        try { return { format, expectedCentre: 25 + velocity * dt * steps * n, basic: run(false), corrected: run(true) }; }
+        finally { predict.dispose(); flow.dispose(); prediction.dispose(); field.dispose(); }
+      });
+    } finally { gl.getExtension('WEBGL_lose_context')?.loseContext(); }
+  });
+  for (const { format, basic, corrected, expectedCentre } of results) {
+    expect(corrected.peak).toBeGreaterThan(basic.peak * 1.4);
+    // RGBA8 retains one-quantum tails after interpolation. It still improves
+    // contrast and spread; the float path can retain much narrower filaments.
+    expect(corrected.variance).toBeLessThan(basic.variance * (format === 'rgba8' ? 1 : .65));
+    expect(Math.abs(corrected.centre - expectedCentre)).toBeLessThan(2);
+    for (const state of [basic, corrected]) {
+      expect(state.glError).toBe(0); expect(state.min).toBeGreaterThanOrEqual(0); expect(state.peak).toBeLessThanOrEqual(1);
+    }
+  }
+});
+
+for (const packed of [false, true]) test(`Basin camera changes preserve the running fluid (${packed ? 'RGBA8' : 'float'})`, async ({ page }) => {
+  await page.goto(`/sim.html?sim=basin&source=synthetic&overlay=0&quality=medium&forceRgba8=${packed ? 1 : 0}`);
+  await page.waitForFunction(() => !!window.livemixerSim?.host.latestOutput);
+  await page.waitForFunction(() => window.livemixerSim.host.state().signals.ink > .01);
+  for (const elevation of [35, 40, 90]) {
+    const change = await page.evaluate(angle => {
+      const h = window.livemixerSim.host, before = h.latestOutput;
+      h.setParam('elevation', angle);
+      return { preserved: h.latestOutput === before, angle: h.currentParams.elevation };
+    }, elevation);
+    expect(change).toEqual({ preserved: true, angle: elevation });
+    await page.waitForTimeout(300);
+    const s = await page.evaluate(() => { const h = window.livemixerSim.host, s = h.state(); return { warnings: s.warnings.map(w => w.message), violations: s.signalViolations, ink: s.signals.ink, glError: h.gl.getError() }; });
+    expect(s.warnings.filter(w => !/8-bit precision|reduced precision/.test(w))).toEqual([]);
+    expect(s.violations).toEqual([]); expect(s.glError).toBe(0); expect(s.ink).toBeGreaterThan(.005);
+  }
+});
+
 test('the GPU wave field rests, propagates a dip, and dissipates without saturating', async ({ page }) => {
   test.setTimeout(120_000);
   await page.goto('/sim.html?sim=presence&source=pointer&overlay=0&quality=low');

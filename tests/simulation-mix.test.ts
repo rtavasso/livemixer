@@ -26,7 +26,7 @@ describe('portable performance patches', () => {
   });
   it('loads earlier material patches with defaults while preserving authored controls and routes', () => {
     for (const [sim, added, authored, value] of [
-      ['basin', ['ripples', 'glaze'], 'viscosity', .45],
+      ['basin', ['ripples', 'glaze', 'elevation'], 'viscosity', .45],
       ['veil', ['fabric', 'sheen'], 'opacity', .2],
       ['prism', ['roughness'], 'dispersion', 1],
     ] as const) {

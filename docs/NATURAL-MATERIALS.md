@@ -8,7 +8,7 @@ so opposing fold movements cannot cancel into an incorrectly silent signal.
 
 | Study | Material and motion | New controls |
 | --- | --- | --- |
-| Basin | Absorbing ink under clear water, travelling ripples, refracted glaze, window reflections, rounded porcelain rim and stone table | Ripples, bowl glaze |
+| Basin | Absorbing ink under clear water, travelling ripples, refracted glaze, window reflections, curved porcelain bowl and stone table | Ripples, bowl glaze, camera elevation |
 | Veil | Woven linen with independent fibre colour, translucent folds, soft sheen, layered hems and stitching in daylight | Fabric colour, fibre sheen |
 | Prism | Closed optical glass, entry/exit refraction, thickness absorption, polished studio reflections and a stone light table | Glass polish |
 
@@ -17,6 +17,16 @@ Start Vite and open `/sim.html?sim=basin&source=synthetic&quality=medium&overlay
 includes a depth surface; pointer, webcam, skeleton and depth bridge inputs use
 the same simulation contracts. Save a performance patch and choose **Play in
 mixer** to use the scene's signals in music.
+
+Basin opens at a 40° camera elevation so the front wall and water depth are
+visible. **H → Camera elevation** ranges from 35° to a 90° overhead view.
+The perspective camera intersects a curved ceramic exterior, a rolled lip and
+an interior floor refracted through water. The default glaze is warm ivory.
+Water mirrors a window with sharp, derivative-filtered edges, while ceramic
+keeps broader reflections. Four subpixel samples around the rim and exterior
+silhouette smooth geometric edges without blurring the ink across the image.
+The physical x/depth input plane and mixer signal coordinates stay fixed when
+the camera moves.
 
 ## Rendering budget
 
@@ -36,6 +46,12 @@ This is a fixed ceiling, not adaptive frame-rate scaling or a 60 fps guarantee.
 Physics resolution and the fixed 60 Hz clock do not change during a resize.
 
 The wave field adds two RGBA8 textures: 128 KiB together at medium quality.
+Medium and high also use a bounded MacCormack correction for dye transport,
+which preserves thin ink trails. A forward prediction adds one dye pass and
+one texture (2 MiB at medium with RGBA16F; 1 MiB on its RGBA8 fallback).
+The correction clamps to the four donor texels before fading and injecting
+ink once. Low retains the cheaper single advection pass. Flow, dye and wave
+resolutions stay the same.
 Cloth gains no constraints or extra pass. Glass replaces its additive face and
 edge buffers with analytic intersections in the existing composite pass.
 Materials use procedural lighting and textures without downloads or libraries.
@@ -47,7 +63,8 @@ is inactive, as before.
 Measured on this MacBook on 2026-09-14, Chrome for Testing 153.0.8010.12 using
 ANGLE Metal on Intel Iris Plus 655, medium quality at 1280 × 800. Each sample ran
 for 20 seconds after eight seconds of warmup, with one synthetic performer and
-a depth surface, in the studio:
+a depth surface, in the studio. These initial browser-cadence measurements
+precede the Basin camera and ink refinements below:
 
 | Scene | Average fps | Frame p95 | Frame p99 | CPU step p95 | CPU submit p95 |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -70,6 +87,21 @@ to 0.397 instead of remaining zero. Audio was running with a nonzero output
 meter in all three. Those local reports are in `shots/benchmark-mixer/` and
 `shots/benchmark-veil-final/`; no long-duration thermal claim is implied.
 
+The final Basin camera/ink refinement was measured again on the same GPU,
+with the same warmup and 20-second sampling window. These runs count actual
+published simulation frames as well as browser animation frames:
+
+| Basin view | Drawing buffer | Simulation fps | Frame p95 / p99 | Longest simulation gap | Dropped simulation time |
+| --- | --- | ---: | --- | ---: | ---: |
+| Studio | 1280 × 800 | 58.7 | 17.6 / 19.9 ms | 129.6 ms | 76.7 ms |
+| Fullscreen mixer with audio | 1405 × 728 | 56.9 | 17.7 / 49.8 ms | 133.1 ms | 134.0 ms |
+
+There were no rendering warnings or signal-range violations, and mixer audio
+was running with a nonzero meter. These samples show occasional stalls rather
+than an uninterrupted 60 fps. Reports are in `shots/basin-depth/verified-studio/`
+and `shots/basin-depth/verified-mixer/`; the final visual capture is in
+`shots/basin-depth/final-studio/basin.png`.
+
 ```sh
 PORT=4190 npm run dev
 npm run benchmark:sim -- --port 4190 --seconds 20
@@ -81,7 +113,11 @@ The benchmark uses headed Chromium, eight seconds of warmup, then samples
 delivered animation-frame intervals with a synthetic performer. It writes
 `shots/benchmark/results.json` and screenshots. Reports include the actual GPU
 renderer, browser version, drawing-buffer size, average fps, frame interval
-percentiles, CPU step/submission time, dropped simulation time and signal ranges.
+percentiles, CPU step/submission time, dropped simulation time and signal ranges. It also
+counts distinct published simulation frames and their longest gap, so an active
+browser loop cannot conceal a paused player. Dropped time is counted once per
+new output. `--no-screenshot` skips image capture; measurements are saved before
+capture so a browser screenshot failure cannot discard a completed sample.
 Run one benchmark at a time; keep its tab visible and avoid other GPU work.
 `--headless` is available for correctness checks, but those runs and detected
 software renderers are explicitly excluded from hardware evidence.
@@ -92,6 +128,14 @@ For an installation, also measure the real camera and music library after the
 laptop has warmed up. A short synthetic run does not establish thermal endurance
 or webcam inference performance.
 
+## Validation
+
+The Basin refinement passed 57 focused unit checks and 13 browser checks,
+including GPU ink transport on floating and RGBA8 targets, camera changes at
+35°, 40° and 90° without a fluid reset, wave propagation, Retina pixel budgets,
+and the mixer workflows. The existing replay UI test timed out once clicking
+Setup and passed in an isolated retry. The production build also passed.
+
 ## Physical models and limits
 
 Basin combines the existing incompressible 2D ink flow with a separate damped
@@ -100,8 +144,11 @@ Zero-mean impulses dip the surface and raise a surrounding ring, Neumann walls
 reflect waves, and damping settles them. Signed height and velocity use two bytes
 each with exact zero and filterable decoding, including on GPUs without floating
 render targets. This models a shallow contained surface, not breaking waves,
-spray, or a three-dimensional liquid. Floor caustics are bounded curvature/noise
-approximations; water colour uses Beer–Lambert absorption.
+spray, or a three-dimensional liquid. Floor caustics are a bounded wave-curvature
+approximation; water colour uses Beer–Lambert absorption. Pigment is a 2D field
+sampled at the refracted bowl floor, not volumetric dye. Its MacCormack limiter
+prevents new extrema but is not exactly mass conserving; RGBA8 retains visible
+rounding limits despite the improved transport.
 
 Veil keeps the deterministic cloth solver and geometric hand/scan contact.
 Optical thickness increases with viewing angle and in folded-over hems. A
@@ -118,6 +165,7 @@ and do not recursively trace another object. Reflection roughness broadens studi
 lights; it does not simulate frosted transmission. These are bounded real-time
 approximations, not path-traced photorealism.
 
-Material references: [Filament's cloth model](https://google.github.io/filament/Filament.html#materialsystem/clothmodel)
-and [GPU Gems: water simulation](https://developer.nvidia.com/gpugems/gpugems/part-i-natural-effects/chapter-1-effective-water-simulation-physical-models).
+Material references: [Filament's cloth model](https://google.github.io/filament/Filament.html#materialsystem/clothmodel),
+[GPU Gems: water simulation](https://developer.nvidia.com/gpugems/gpugems/part-i-natural-effects/chapter-1-effective-water-simulation-physical-models),
+and [GPU Gems 3: MacCormack fluid transport](https://developer.nvidia.com/gpugems/gpugems3/part-v-physics-simulation/chapter-30-real-time-simulation-and-rendering-3d-fluids).
 The implementation uses repo-native GLSL and the existing solver contracts.

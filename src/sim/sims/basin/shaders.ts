@@ -16,6 +16,7 @@
 import { GLSL_HEADER } from '../../gl/program';
 import { MATERIAL_GLSL } from '../../gl/material';
 import { WAVE_STORAGE_GLSL } from './waves';
+import { BASIN_VIEW_GLSL } from './view';
 import { surfaceGlsl } from '../../gl/surface';
 import {
   CAUSTIC_LACUNARITY, CAUSTIC_PERIOD, LIGHT_SHIFT, MAX_FOOTPRINTS, MAX_SHADOW_CAPSULES, PACKED_VELOCITY_SCALE, PENUMBRA_BASE, PENUMBRA_PER_HEIGHT,
@@ -202,9 +203,21 @@ void main() {
   o = packV(v * softMask(uv));
 }`;
 
-/** Advect the dye, dissipate, and add this step's ink drops. */
-export const advectDye = (packed: boolean) => `${prelude(packed)}
+/** Forward prediction for bounded MacCormack dye transport. */
+export const predictDye = (packed: boolean) => `${prelude(packed)}
 uniform sampler2D u_dye, u_velocity;
+uniform float u_dt;
+void main() {
+  vec2 v = readV(u_velocity, v_uv);
+  o = vec4(texture(u_dye, v_uv - v * u_dt).rgb * hardMask(v_uv), 1.0);
+}`;
+
+/** Advect dye, optionally correct numerical diffusion, then fade/inject once.
+ * The local donor bounds suppress new extrema and negative pigment.
+ */
+export const advectDye = (packed: boolean, corrected = false) => `${prelude(packed)}
+${corrected ? '#define CORRECT_DYE 1' : ''}
+uniform sampler2D u_dye, u_velocity, u_prediction;
 uniform float u_dt, u_fade, u_fadeFloor;
 uniform int u_dropCount;
 uniform vec4 u_drops[${MAX_DROPS}];      // x, y, radius, amount
@@ -212,7 +225,17 @@ uniform vec3 u_dropColor[${MAX_DROPS}];
 void main() {
   vec2 uv = v_uv;
   vec2 v = readV(u_velocity, uv);
-  vec3 dye = texture(u_dye, uv - v * u_dt).rgb;
+  vec2 donor = uv - v * u_dt;
+  vec3 dye = texture(u_dye, donor).rgb;
+#ifdef CORRECT_DYE
+  vec3 predicted = texture(u_prediction, uv).rgb;
+  vec3 reversed = texture(u_prediction, uv + v * u_dt).rgb;
+  vec3 estimate = predicted + 0.5 * (texture(u_dye, uv).rgb - reversed);
+  vec2 corner = (floor(donor / u_texel - 0.5) + 0.5) * u_texel;
+  vec3 a = texture(u_dye, corner).rgb, b = texture(u_dye, corner + vec2(u_texel.x, 0)).rgb;
+  vec3 c = texture(u_dye, corner + vec2(0, u_texel.y)).rgb, d = texture(u_dye, corner + u_texel).rgb;
+  dye = clamp(estimate, min(min(a, b), min(c, d)), max(max(a, b), max(c, d)));
+#endif
 #ifdef PACKED
   // Same as the velocity: 8-bit dye never fades by a sub-quantum factor, so fade by at least u_fadeFloor.
   dye -= min(dye, max(dye * (1.0 - u_fade), vec3(u_fadeFloor)));
@@ -225,7 +248,7 @@ void main() {
     vec2 d = uv - dr.xy;
     float q = dot(d, d) / (dr.z * dr.z);
     // A bead: a flat-topped disc with a crisp edge and a faint skirt, like a drop that just landed.
-    float g = exp(-q * q * 1.2) * 0.7 + exp(-q * 1.2) * 0.3;
+    float g = exp(-q * q * q * 1.7) * 0.88 + exp(-q * 2.0) * 0.12;
     dye += u_dropColor[i] * dr.w * g;
   }
   o = vec4(min(dye, vec3(4.0)) * hardMask(uv), 1.0);
@@ -272,6 +295,7 @@ uniform vec2 u_pixel, u_dyeTexel, u_waveTexel;
 uniform vec3 u_glaze;
 ${MATERIAL_GLSL}
 ${WAVE_STORAGE_GLSL}
+${BASIN_VIEW_GLSL}
 uniform float u_aspect, u_domain, u_light, u_caustics, u_presence;
 // Caustic scroll offsets in lattice units, each in [0, HASH_PERIOD): layer a in xy, layer b in zw;
 // u_caustT for the first value-noise octave, u_caustT2 for the second (see model.ts causticOffsets).
@@ -319,19 +343,87 @@ float scanWaterline(vec2 gp) {
   return sc.y * smoothstep(-e, e, dz) * (1.0 - smoothstep(THICK - e, THICK + e, dz));
 }
 
-void main() {
-  vec2 u = vec2(v_uv.x * u_aspect, v_uv.y);
-  vec2 g = (u - vec2(u_aspect * 0.5, 0.5)) / u_domain + 0.5;
+vec4 finishBasin(vec3 color) {
+  vec2 q = v_uv - 0.5;
+  return vec4(filmicOutput(color * (1.0 - 0.22 * dot(q, q)), gl_FragCoord.xy), 1.0);
+}
+// A clean water surface mirrors the window with pixel-width edges. The rough
+// ceramic uses the broad studio environment; sharing its blur made water hazy.
+vec3 waterEnvironment(vec3 r) {
+  vec2 p = r.xy / max(r.z, 0.1);
+  vec2 aa = max(fwidth(p) * 1.15, vec2(0.0008));
+  vec2 q = abs(p - vec2(-0.28, 1.12));
+  vec2 pane = 1.0 - smoothstep(vec2(0.22, 0.25) - aa, vec2(0.22, 0.25) + aa, q);
+  vec2 bar = smoothstep(vec2(0.008) - aa, vec2(0.008) + aa, q);
+  float window = pane.x * pane.y * mix(0.06, 1.0, bar.x * bar.y);
+  return vec3(0.055, 0.07, 0.085) + vec3(6.2, 6.6, 7.0) * window * smoothstep(0.0, 0.1, r.z);
+}
+bool basinEdge;
+vec4 shadeBasin(vec2 uv) {
+  vec2 screen = (uv - 0.5) * vec2(u_aspect, 1.0) / u_domain;
+  vec3 eye, ray; basinCamera(screen, eye, ray);
+  vec3 V = -ray;
+  float R = u_bowl, scale = R / 0.42;
+  float px = u_pixel.y / u_domain;
+  vec3 Ld = normalize(vec3(-0.48, 0.40, 0.78));
+  vec2 L2 = normalize(Ld.xy);
+  float rimHeight = 0.009 * scale, rimRadius = R + 0.012 * scale, rimTube = 0.013 * scale;
+
+  // Intersect the table, the outside of a turned bowl, and its rolled lip.
+  // These are actual surfaces with depth ordering, not rings shaded on a flat disc.
+  float tableT = (-0.225 * scale - eye.z) / ray.z;
+  vec3 tablePoint = eye + ray * tableT;
+  vec2 grainUV = tablePoint.xy * 160.0;
+  float grainKeep = 1.0 - smoothstep(0.35, 0.9, max(fwidth(grainUV).x, fwidth(grainUV).y));
+  float stone = (materialNoise(grainUV) - 0.5) * grainKeep;
+  vec2 shadowPoint = tablePoint.xy - vec2(0.04, -0.04) * scale;
+  float shadow = 1.0 - 0.60 * exp(-dot(shadowPoint, shadowPoint) / (R * R * 0.62));
+  shadow *= 1.0 - 0.28 * exp(-dot(tablePoint.xy, tablePoint.xy) / (R * R * 0.12));
+  vec3 opaque = vec3(0.035, 0.032, 0.028) * (1.0 + stone * 0.14) * shadow;
+  float opaqueT = tableT;
+  vec3 outerCentre = vec3(0, 0, 0.025 * scale);
+  float outerZ = 0.25 * scale;
+  float outerXY = (R + 0.025 * scale) / sqrt(1.0 - pow((rimHeight - outerCentre.z) / outerZ, 2.0));
+  vec3 outerRadii = vec3(outerXY, outerXY, outerZ);
+  vec3 localEye = (eye - outerCentre) / outerRadii, localRay = ray / outerRadii;
+  float closestT = max(0.0, -dot(localEye, localRay) / dot(localRay, localRay));
+  float silhouette = length(localEye + localRay * closestT) - 1.0;
+  basinEdge = abs(silhouette) < px * 5.0 / scale;
+  vec2 roots = ellipsoidRoots(eye, ray, outerCentre, outerRadii);
+  float bodyT = roots.x;
+  if ((eye + ray * bodyT).z > rimHeight) bodyT = roots.y;
+  vec3 bodyPoint = eye + ray * bodyT;
+  if (bodyT > 0.0 && bodyT < opaqueT && bodyPoint.z <= rimHeight) {
+    vec3 N = ellipsoidNormal(bodyPoint, outerCentre, outerRadii);
+    float diffuse = 0.20 + 0.80 * max(dot(N, Ld), 0.0);
+    vec3 ceramic = mix(vec3(0.48, 0.47, 0.42), u_glaze, 0.12);
+    opaque = ceramic * diffuse + studioEnvironment(reflect(ray, N), 0.12) * 0.025 * u_light;
+    opaqueT = bodyT;
+  }
+  float lipBounds = rimHit(eye, ray, rimRadius, rimTube + px, rimHeight, px * 0.25);
+  basinEdge = basinEdge || lipBounds < 1e4;
+  float lipT = lipBounds < 1e4 ? rimHit(eye, ray, rimRadius, rimTube, rimHeight, px * 0.12) : 1e5;
+  if (lipT < opaqueT) {
+    vec3 N = rimNormal(eye + ray * lipT, rimRadius, rimHeight);
+    opaque = vec3(0.48, 0.47, 0.42) * (0.24 + 0.76 * max(dot(N, Ld), 0.0));
+    opaque += studioEnvironment(reflect(ray, N), 0.08) * 0.03 * u_light;
+    opaqueT = lipT;
+  }
+
+  // Project the same x/depth water field through the camera. Two height
+  // corrections give ripple parallax without a dense displaced mesh.
+  float waterT = -eye.z / ray.z;
+  vec3 waterPoint = eye + ray * waterT;
+  for (int i = 0; i < 2; i++) {
+    float height = waveHeight(u_wave, waterPoint.xy + 0.5);
+    waterT = (height - eye.z) / ray.z;
+    waterPoint = eye + ray * waterT;
+  }
+  vec2 g = waterPoint.xy + 0.5;
   vec2 rel = g - 0.5;
   float d = length(rel);
   vec2 dir = rel / max(d, 1e-5);
-  float R = u_bowl;
-  float px = u_pixel.y / u_domain;
-  float inside = 1.0 - smoothstep(R - px, R + px, d);
-
-  // A camera above the bowl; a window up and to the left whose reflection lands inside the bowl.
-  vec3 Ld = normalize(vec3(-0.16, 0.21, 0.96));
-  vec2 L2 = normalize(Ld.xy);
+  if (d >= R || opaqueT < waterT) return finishBasin(opaque);
 
   // Hands over the water: the union of each hand's capsules as a shadow that sharpens, darkens and
   // slides in under the hand as it comes down (the window is up and to the left, so a raised part's
@@ -418,58 +510,54 @@ void main() {
   float hL = waveHeight(u_wave, g - vec2(e.x, 0)), hR = waveHeight(u_wave, g + vec2(e.x, 0));
   float hB = waveHeight(u_wave, g - vec2(0, e.y)), hT = waveHeight(u_wave, g + vec2(0, e.y));
   vec2 slope = vec2(hR - hL, hT - hB) / (2.0 * e);
-  vec2 v = readV(u_velocity, g);
   vec3 n = normalize(vec3(-slope, 1.0));
   float men = smoothstep(R - 0.018, R, d);
   n = normalize(mix(n, vec3(dir * 0.65, 0.65), men));
   n = normalize(mix(n, vec3(ringTilt * 0.7, 0.6), min(ringBand * 0.65, 1.0)));
-  vec3 V = normalize(vec3(-rel * 1.2, 1.0));
   vec3 rr = reflect(-V, n);
   float fres = 0.0204 + 0.9796 * pow(1.0 - max(dot(n, V), 0.0), 5.0);
-  vec3 reflected = studioEnvironment(rr, 0.035) * fres * u_light;
+  vec3 reflected = waterEnvironment(rr) * fres * u_light;
 
   // Snell refraction through a shallow water layer. Floor and ink share the
   // displaced coordinate so highlights slide over pigment, rather than sticking to it.
   vec3 transmitted = refract(-V, n, 1.0 / 1.333);
-  float waterDepth = 0.065 + 0.055 * (1.0 - smoothstep(R * 0.5, R, d));
-  vec2 floorUV = g + transmitted.xy / max(abs(transmitted.z), 0.1) * waterDepth;
-  vec2 floorRel = floorUV - 0.5;
-  floorUV = 0.5 + floorRel * min(1.0, (R - 0.008) / max(length(floorRel), 0.001));
+  vec3 innerCentre = vec3(0, 0, 0.12 * scale);
+  float innerZ = 0.235 * scale;
+  float innerXY = R / sqrt(1.0 - pow(innerCentre.z / innerZ, 2.0));
+  vec3 innerRadii = vec3(innerXY, innerXY, innerZ);
+  vec3 underOrigin = waterPoint + transmitted * 0.0001;
+  float floorT = ellipsoidRoots(underOrigin, transmitted, innerCentre, innerRadii).y;
+  vec3 floorPoint = underOrigin + transmitted * floorT;
+  vec3 floorNormal = -ellipsoidNormal(floorPoint, innerCentre, innerRadii);
+  vec2 floorUV = floorPoint.xy + 0.5;
   vec3 dye = max(texture(u_dye, floorUV).rgb, vec3(0.0));
   float density = lum(dye);
   // Beer-Lambert absorption: complementary channels absorb, thick pigment darkens.
   vec3 absorption = (vec3(dye.r + dye.g + dye.b) - dye) * 3.2 + density * 0.45;
   vec3 transmission = exp(-absorption);
   float grain = materialNoise(floorUV * 210.0) - 0.5;
-  float wall = smoothstep(R - 0.055, R, d);
-  vec3 ceramic = u_glaze * (1.0 + grain * 0.045);
-  ceramic *= mix(1.0, 0.18, wall);
-  // Broad refracted illumination plus wave curvature focusing, bounded to avoid fireflies.
-  float focus = clamp(1.0 - (hL + hR + hB + hT - 4.0 * h) / (e.x * e.x) * 0.045, 0.45, 2.0);
-  float ca = causticLayer(floorUV * 11.0 + v * 0.15, u_caustT.xy, u_caustT2.xy);
-  ceramic *= 0.75 + u_caustics * (0.18 * focus + 0.08 * ca);
+  vec3 ceramic = u_glaze * (1.0 + grain * 0.035);
+  float diffuse = 0.30 + 0.70 * max(dot(floorNormal, Ld), 0.0);
+  // A curved, directional-lit interior makes depth legible through still water.
+  ceramic *= diffuse * (0.78 + 0.22 * max(floorNormal.z, 0.0));
+  float focus = clamp(1.0 - (hL + hR + hB + hT - 4.0 * h) / (e.x * e.x) * 0.045, 0.5, 1.8);
+  ceramic *= 0.9 + u_caustics * focus * 0.14;
   vec3 water = ceramic * transmission * vec3(0.91, 0.97, 0.99) * shade;
   vec3 bowlCol = water * (1.0 - fres) + reflected;
   bowlCol += vec3(0.85, 0.92, 1.0) * ringLit * 0.13 * u_light;
 
-  // Rounded glazed porcelain rim, with a dark inner bevel and soft contact shadow.
-  float lipDist = d - R;
-  float lipWidth = min(0.023, (0.5 - R) * 0.7);
-  float lipT = clamp(lipDist / lipWidth, 0.0, 1.0);
-  vec3 lipN = normalize(vec3(dir * (lipT * 2.0 - 1.0), sin(lipT * 3.14159) + 0.18));
-  float lipMask = 1.0 - smoothstep(lipWidth - px, lipWidth + px, lipDist);
-  float lipDiffuse = 0.35 + 0.65 * max(0.0, dot(lipN, Ld));
-  vec3 lipColor = vec3(0.51, 0.53, 0.48) * lipDiffuse;
-  lipColor += studioEnvironment(reflect(-V, lipN), 0.14) * 0.035 * u_light;
-  lipColor *= 0.7 + 0.3 * smoothstep(0.0, 0.004, lipDist);
-  vec2 stoneUV = u * 65.0;
-  float stone = materialNoise(stoneUV) * 0.6 + materialNoise(stoneUV * 3.7) * 0.4;
-  float ao = 1.0 - 0.65 * exp(-max(lipDist - lipWidth, 0.0) / 0.026);
-  vec3 table = vec3(0.042, 0.038, 0.033) * (0.8 + 0.4 * stone) * ao;
-  vec3 outside = mix(table, lipColor, lipMask) * mix(1.0, shade, 0.6);
-
-  vec3 col = mix(outside, bowlCol, inside);
-  vec2 q = v_uv - 0.5; q.x *= u_aspect;
-  col *= 1.0 - 0.45 * smoothstep(0.35, 0.95, length(q));
-  o = vec4(filmicOutput(col, gl_FragCoord.xy), 1.0);
+  return finishBasin(bowlCol);
+}
+void main() {
+  vec2 q = u_pixel * 0.25;
+  vec4 color = shadeBasin(v_uv - q);
+  // Spend extra samples only on porcelain edges. Interior ink stays sharp;
+  // this is subpixel geometric coverage, with no image-wide blur or history.
+  if (basinEdge) {
+    color += shadeBasin(v_uv + vec2(q.x, -q.y));
+    color += shadeBasin(v_uv + vec2(-q.x, q.y));
+    color += shadeBasin(v_uv + q);
+    color *= 0.25;
+  }
+  o = color;
 }`;
