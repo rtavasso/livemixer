@@ -9,7 +9,9 @@ public/models/**
 !public/models/.gitkeep
 *.local.json
 *.jsonl
+!bridge/fixtures/*.jsonl
 .env*
 __pycache__/
 *.pyc
 .claude/worktrees/
+shots/

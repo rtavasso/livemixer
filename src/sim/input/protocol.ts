@@ -1,0 +1,227 @@
+/**
+ * Wire protocol between a native depth-camera bridge process and the browser.
+ *
+ * The bridge watches a physical bounding box in front of the camera, finds
+ * matter inside it (a hand, an arm, a whole person), and streams compact JSON
+ * text frames over a WebSocket. Everything is normalized to the box, so the
+ * browser never needs camera intrinsics: `pos` is [u, v, w] in [0, 1] where
+ * u/v follow the camera image (right, down) and w is depth INTO the box
+ * (0 = nearest plane, 1 = farthest plane).
+ *
+ * Conventions the schema cannot express:
+ *  - Every `pos`, `extent` and `points` coordinate is expected in [0, 1]; the
+ *    bridge clamps, and the browser's axis mapping clamps again, so a small
+ *    overshoot is harmless rather than fatal. `skeleton` joints are the
+ *    exception: they are sent unclamped (a forearm leaves the box) and the
+ *    browser keeps them that way so bones are never crushed against a wall.
+ *  - A `skeleton` (bridges that track hands, `--source leap`) is projected into
+ *    the SAME normalized box as the depth scan, so the two coincide; its widths
+ *    are diameters as fractions of the box width at that depth.
+ *  - The occupancy grid spans the SAME box as `pos` (the bridge's region of
+ *    interest and depth range), not the whole camera image, so the browser
+ *    can invert one set of axis maps for both.
+ *  - `seq` only has to increase; a single global counter shared by all
+ *    clients is fine. The client resets its expectation on every connection.
+ *  - `hello.box` is informational: `z` is `[near, far]` in metres, `x`/`y`
+ *    the metric extents of the region at the near plane if known.
+ *  - Bridges in Python must serialise with `allow_nan=False`; a NaN in
+ *    `stats` is invalid JSON and the whole frame would be dropped.
+ *
+ * See bridge/README.md for the reference implementation and docs/SIMULATIONS.md
+ * for the full description. The schema here is the single source of truth and
+ * the Python bridge has a fixture test against the same sample messages.
+ */
+import { z } from 'zod';
+import { skeletonCapsules, skeletonPoints, type Skeleton } from './skeleton';
+import type { DepthSurface, HandObservation, InputFrame, OccupancyGrid, VoxelGrid } from './types';
+
+export const PROTOCOL_VERSION = 1;
+
+const unit = z.number().finite();
+const vec = z.tuple([unit, unit, unit]);
+/** A diameter as a fraction of the box width. Zero is tolerated (a line) rather than dropping the whole frame. */
+const width = unit.min(0);
+
+export const bridgeHelloSchema = z.object({
+  type: z.literal('hello'),
+  version: z.literal(PROTOCOL_VERSION),
+  /** Bridge implementation name, e.g. "realsense", "kinect", "synthetic". */
+  source: z.string().min(1),
+  /** The physical box in camera metres: [min, max] per axis. Informational. */
+  box: z.object({ x: z.tuple([unit, unit]), y: z.tuple([unit, unit]), z: z.tuple([unit, unit]) }),
+  /** Nominal capture rate. */
+  fps: z.number().positive().optional(),
+  /** Occupancy grid size when the bridge sends one. */
+  occupancy: z.object({ width: z.number().int().min(1).max(256), height: z.number().int().min(1).max(256) }).optional(),
+  /** Voxel grid size when the bridge sends a 3D foreground field: nx across, ny down, nz deep into the box. */
+  voxels: z.object({ nx: z.number().int().min(1).max(128), ny: z.number().int().min(1).max(128), nz: z.number().int().min(1).max(128) }).optional(),
+  /** Depth surface size when the bridge sends the foreground scan. */
+  surface: z.object({ width: z.number().int().min(1).max(512), height: z.number().int().min(1).max(512) }).optional(),
+  /** True when the bridge tracks hands and can attach a `skeleton` to them. */
+  skeleton: z.boolean().optional(),
+  /**
+   * How the bridge oriented its box. `image` (the default when absent): u/v follow the camera image and
+   * w is depth from the camera. `upright`: the camera lies on the desk looking up, and the bridge has
+   * already re-oriented and de-perspectived its output (metric box) so that u runs along the device's
+   * long axis, v runs DOWN from the top of the box (1 − height above the device) and w grows toward the
+   * display; the browser's default depth mapping then puts height on sim y and reach on sim z.
+   */
+  frame: z.enum(['image', 'upright']).optional(),
+}).strict();
+
+/**
+ * A tracked hand skeleton in the box frame (same normalization as `pos`, joints NOT clamped).
+ * Widths are diameters in normalized u units. Fingers run thumb → pinky, joints wrist → tip.
+ */
+export const bridgeSkeletonSchema = z.object({
+  type: z.enum(['left', 'right', 'unknown']),
+  palm: vec,
+  wrist: vec,
+  /** Already trimmed by the bridge to a stub (≈70 mm) past the wrist. */
+  elbow: vec.optional(),
+  palmWidth: width.optional(),
+  armWidth: width.optional(),
+  fingers: z.array(z.object({
+    /** [carpal base, knuckle, proximal joint, distal joint, tip] */
+    joints: z.tuple([vec, vec, vec, vec, vec]),
+    width,
+    extended: z.boolean(),
+  }).strict()).length(5),
+}).strict();
+
+export const bridgeHandSchema = z.object({
+  id: z.number().int().nonnegative(),
+  pos: vec,
+  conf: unit.min(0).max(1).default(1),
+  /** [[minU, minV, minW], [maxU, maxV, maxW]] */
+  extent: z.tuple([vec, vec]).optional(),
+  /** Bridges that fit a hand model can send these; blob trackers omit them. */
+  openness: unit.min(0).max(1).optional(),
+  pinch: unit.min(0).max(1).optional(),
+  /** Optional sample points on the blob surface, same normalization as pos. */
+  points: z.array(vec).max(256).optional(),
+  /** The tracked skeleton, when the bridge fits one; blob hands (tracking lost) omit it. */
+  skeleton: bridgeSkeletonSchema.optional(),
+}).strict();
+
+export const bridgeFrameSchema = z.object({
+  type: z.literal('frame'),
+  /** Strictly increasing; a global counter is fine (see the conventions above). */
+  seq: z.number().int().nonnegative(),
+  /** Bridge monotonic clock in seconds. Any origin; the client estimates the offset. */
+  t: unit,
+  hands: z.array(bridgeHandSchema).max(16),
+  /** Base64 of width*height bytes, row-major over the box (not the whole image), row 0 = top. */
+  occupancy: z.string().optional(),
+  /**
+   * Base64 of nx*ny*nz bytes: the foreground (everything inside the depth range) as voxel fill
+   * fractions, x fastest, then y (top row first, like the image), then z (nearest plane first).
+   */
+  voxels: z.string().optional(),
+  /**
+   * Base64 of width*height bytes: the foreground depth surface, row-major over the box, row 0 =
+   * top. 0 = nothing seen in the cell; otherwise 1 + round(254 · w), w = nearest foreground depth
+   * (0 = near plane, 1 = far plane).
+   */
+  surface: z.string().optional(),
+  stats: z.record(z.string(), unit).optional(),
+}).strict();
+
+export const bridgeStatusSchema = z.object({ type: z.literal('status'), level: z.enum(['info', 'warning', 'error']).default('info'), message: z.string() }).strict();
+
+export const bridgeMessageSchema = z.discriminatedUnion('type', [bridgeHelloSchema, bridgeFrameSchema, bridgeStatusSchema]);
+export type BridgeHello = z.infer<typeof bridgeHelloSchema>;
+export type BridgeFrame = z.infer<typeof bridgeFrameSchema>;
+export type BridgeHand = z.infer<typeof bridgeHandSchema>;
+export type BridgeSkeleton = z.infer<typeof bridgeSkeletonSchema>;
+export type BridgeMessage = z.infer<typeof bridgeMessageSchema>;
+
+export function parseBridgeMessage(text: string): BridgeMessage {
+  let raw: unknown;
+  try { raw = JSON.parse(text); } catch { throw new Error('Bridge sent invalid JSON.'); }
+  const result = bridgeMessageSchema.safeParse(raw);
+  if (!result.success) throw new Error(`Bridge message rejected: ${result.error.issues.map(i => `${i.path.join('.') || 'message'}: ${i.message}`).join('; ')}`);
+  return result.data;
+}
+
+export function decodeOccupancy(base64: string, width: number, height: number): OccupancyGrid {
+  const binary = atob(base64);
+  if (binary.length !== width * height) throw new Error(`Occupancy payload has ${binary.length} bytes; expected ${width * height}.`);
+  const data = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) data[i] = binary.charCodeAt(i);
+  return { width, height, data };
+}
+
+export function encodeOccupancy(grid: OccupancyGrid): string {
+  let s = '';
+  for (let i = 0; i < grid.data.length; i++) s += String.fromCharCode(grid.data[i]);
+  return btoa(s);
+}
+
+export function decodeSurface(base64: string, width: number, height: number): DepthSurface {
+  const binary = atob(base64);
+  if (binary.length !== width * height) throw new Error(`Surface payload has ${binary.length} bytes; expected ${width * height}.`);
+  const data = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) data[i] = binary.charCodeAt(i);
+  return { width, height, data };
+}
+
+/** Byte → normalized depth w, or null for an empty cell. Inverse of the bridge's 1 + round(254·w). */
+export const surfaceByteToDepth = (value: number): number | null => value === 0 ? null : (value - 1) / 254;
+
+export function decodeVoxels(base64: string, nx: number, ny: number, nz: number): VoxelGrid {
+  const binary = atob(base64);
+  if (binary.length !== nx * ny * nz) throw new Error(`Voxel payload has ${binary.length} bytes; expected ${nx * ny * nz}.`);
+  const data = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) data[i] = binary.charCodeAt(i);
+  return { nx, ny, nz, data };
+}
+
+const v3 = (t: [number, number, number]) => ({ x: t[0], y: t[1], z: t[2] });
+
+/** The wire skeleton as the generic one (tuples → vectors; the frame and units already agree). */
+export function bridgeSkeleton(s: BridgeSkeleton): Skeleton {
+  return {
+    palm: v3(s.palm), wrist: v3(s.wrist), elbow: s.elbow ? v3(s.elbow) : undefined, palmWidth: s.palmWidth, armWidth: s.armWidth,
+    fingers: s.fingers.map(f => ({ joints: [v3(f.joints[0]), v3(f.joints[1]), v3(f.joints[2]), v3(f.joints[3]), v3(f.joints[4])], width: f.width, extended: f.extended })),
+  };
+}
+
+/** Convert a validated bridge frame into the generic input contract. */
+export function bridgeFrameToInput(frame: BridgeFrame, observedAtMs: number, receivedAtMs: number, hello: BridgeHello | null): InputFrame {
+  const hands: HandObservation[] = frame.hands.map(h => {
+    const skeleton = h.skeleton ? bridgeSkeleton(h.skeleton) : null;
+    const capsules = skeleton ? skeletonCapsules(skeleton) : [];
+    return {
+      id: h.id, position: v3(h.pos), confidence: h.conf,
+      extent: h.extent ? { min: v3(h.extent[0]), max: v3(h.extent[1]) } : undefined,
+      openness: h.openness, pinch: h.pinch,
+      // A tracking bridge may leave `points` to the browser: the palm and fingertips are in the skeleton.
+      points: h.points?.map(v3) ?? (skeleton ? skeletonPoints(skeleton) : undefined),
+      capsules: capsules.length ? capsules : undefined,
+    };
+  });
+  const occupancy = frame.occupancy && hello?.occupancy ? decodeOccupancy(frame.occupancy, hello.occupancy.width, hello.occupancy.height) : undefined;
+  const voxels = frame.voxels && hello?.voxels ? decodeVoxels(frame.voxels, hello.voxels.nx, hello.voxels.ny, hello.voxels.nz) : undefined;
+  const surface = frame.surface && hello?.surface ? decodeSurface(frame.surface, hello.surface.width, hello.surface.height) : undefined;
+  return { source: 'depth', sequence: frame.seq, observedAtMs, receivedAtMs, hands, occupancy, voxels, surface, stats: frame.stats };
+}
+
+/**
+ * Estimates the constant offset between the bridge clock and the page clock
+ * with a sliding minimum of (received - sent). The minimum over a window
+ * approximates the fixed transport delay; jitter above it is treated as lateness.
+ */
+export class ClockMapper {
+  private samples: { offset: number; atMs: number }[] = [];
+  constructor(private readonly windowMs = 5000) {}
+  observe(bridgeSeconds: number, receivedAtMs: number): number {
+    const offset = receivedAtMs - bridgeSeconds * 1000;
+    this.samples.push({ offset, atMs: receivedAtMs });
+    while (this.samples.length && receivedAtMs - this.samples[0].atMs > this.windowMs) this.samples.shift();
+    let min = Infinity;
+    for (const s of this.samples) min = Math.min(min, s.offset);
+    return bridgeSeconds * 1000 + min;
+  }
+  reset() { this.samples = []; }
+}

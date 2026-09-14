@@ -1,0 +1,56 @@
+.sim-body { margin: 0; background: #000; color: #dfe4e0; font: 12px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
+.sim-root { position: fixed; inset: 0; background: #000; }
+.sim-stage { display: block; width: 100vw; height: 100vh; background: #000; touch-action: none; }
+.sim-idle .sim-stage { cursor: none; }
+.sim-webcam { position: fixed; right: 12px; bottom: 12px; width: 200px; aspect-ratio: 4 / 3; transform: scaleX(-1); border-radius: 6px; opacity: .85; pointer-events: none; z-index: 3; }
+.sim-overlay { position: fixed; top: 12px; left: 12px; bottom: 12px; width: 360px; max-width: calc(100vw - 24px); overflow: auto; background: rgba(12, 14, 13, .86); backdrop-filter: blur(10px); border: 1px solid #2c342f; border-radius: 10px; padding: 14px 16px 18px; z-index: 4; box-sizing: border-box; }
+.sim-overlay[hidden] { display: none; }
+.sim-overlay * { box-sizing: border-box; }
+.sim-overlay h1 { font-size: 15px; margin: 0 0 2px; letter-spacing: -.2px; }
+.sim-overlay h2 { font-size: 11px; margin: 0; letter-spacing: .12em; text-transform: uppercase; color: #9aa79e; font-weight: 600; }
+.sim-overlay p { margin: 4px 0 8px; color: #b6c0b9; }
+.sim-overlay .hint { color: #7f8a83; font-size: 11px; }
+.sim-overlay details { border-top: 1px solid #2c342f; padding: 10px 0 6px; }
+.sim-overlay summary { cursor: pointer; list-style: none; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.sim-overlay summary::-webkit-details-marker { display: none; }
+.sim-overlay summary .badge { font-variant-numeric: tabular-nums; color: #b9ec80; font-size: 11px; }
+.sim-overlay select, .sim-overlay input[type=text], .sim-overlay input[type=number] { font: inherit; background: #121b15; color: #e5e9e4; border: 1px solid #3a463d; border-radius: 4px; padding: 5px 6px; min-width: 0; width: 100%; }
+.sim-overlay input[type=range] { width: 100%; accent-color: #b9ec80; margin: 0; }
+.sim-overlay input[type=checkbox] { accent-color: #b9ec80; }
+.sim-overlay input[type=color] { width: 40px; height: 24px; padding: 0; border: 1px solid #3a463d; background: none; border-radius: 4px; }
+.sim-overlay button, .sim-overlay .file-button { font: inherit; font-size: 11px; font-weight: 600; background: #263229; color: #e5e9e4; border: 1px solid #4a5a4c; border-radius: 5px; padding: 5px 9px; cursor: pointer; white-space: nowrap; }
+.sim-overlay button:hover { background: #33452f; }
+.sim-overlay button.primary { background: #b9ec80; color: #182510; border-color: #b9ec80; }
+.sim-overlay button:disabled { opacity: .4; cursor: default; }
+.sim-overlay .file-button { position: relative; overflow: hidden; display: inline-block; }
+.sim-overlay .file-button input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.sim-overlay .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; flex-wrap: wrap; }
+.sim-overlay .row > label { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; color: #c8d1cb; }
+.sim-overlay .row.inline > label { flex-direction: row; align-items: center; gap: 6px; }
+.sim-overlay .param { display: grid; grid-template-columns: 110px 1fr 58px; gap: 8px; align-items: center; margin: 5px 0; }
+.sim-overlay .param .name { color: #c8d1cb; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sim-overlay .param output { font-variant-numeric: tabular-nums; text-align: right; color: #b9ec80; }
+.sim-overlay .param.wide { grid-template-columns: 110px 1fr; }
+.sim-overlay .signal { display: grid; grid-template-columns: 96px 1fr 52px; gap: 8px; align-items: center; margin: 4px 0; font-variant-numeric: tabular-nums; }
+.sim-overlay .signal .bar { height: 6px; background: #1a2320; border-radius: 3px; overflow: hidden; }
+.sim-overlay .signal .bar span { display: block; height: 100%; background: #b9ec80; width: 0; transition: width 60ms linear; }
+.sim-overlay .signal output { text-align: right; color: #dfe4e0; }
+.sim-overlay .signal.violation .bar span { background: #e0a060; }
+.sim-overlay table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; margin: 4px 0; }
+.sim-overlay td, .sim-overlay th { padding: 2px 4px; text-align: right; border-bottom: 1px solid #1f2723; font-weight: 500; }
+.sim-overlay th:first-child, .sim-overlay td:first-child { text-align: left; }
+.sim-overlay .minimap { width: 100%; aspect-ratio: 16 / 9; background: #070908; border: 1px solid #2c342f; border-radius: 6px; display: block; }
+.sim-overlay .topmap { aspect-ratio: 32 / 7; margin-top: 4px; }
+.sim-overlay .status { color: #b6c0b9; margin: 4px 0; white-space: pre-wrap; }
+.sim-overlay .status.error { color: #ffb48a; }
+.sim-overlay .status.ok { color: #b9ec80; }
+.sim-overlay .events { display: flex; flex-wrap: wrap; gap: 4px; min-height: 20px; }
+.sim-overlay .events span { border: 1px solid #3a463d; border-radius: 10px; padding: 1px 7px; font-size: 10px; color: #c8d1cb; }
+.sim-overlay .warnings { max-height: 120px; overflow: auto; font-size: 11px; color: #e0c090; }
+.sim-overlay .warnings div { border-bottom: 1px solid #1f2723; padding: 3px 0; }
+.sim-overlay pre { font: 10px/1.35 ui-monospace, Menlo, Consolas, monospace; background: #0b0e0c; border: 1px solid #1f2723; border-radius: 5px; padding: 8px; max-height: 220px; overflow: auto; margin: 6px 0 0; white-space: pre-wrap; word-break: break-all; }
+.sim-overlay .axis { display: grid; grid-template-columns: 22px 56px 1fr 1fr 60px; gap: 6px; align-items: center; margin: 4px 0; }
+.sim-overlay .axis .lbl { color: #9aa79e; }
+.sim-overlay kbd { font: inherit; font-size: 10px; border: 1px solid #3a463d; border-radius: 3px; padding: 0 4px; color: #c8d1cb; }
+.sim-overlay .head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 8px; }
+.sim-overlay .fps { font-variant-numeric: tabular-nums; color: #9aa79e; font-size: 11px; text-align: right; white-space: nowrap; }
