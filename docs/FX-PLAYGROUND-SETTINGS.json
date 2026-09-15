@@ -1,0 +1,1864 @@
+[
+  {
+    "name": "DRUM FX",
+    "devices": [
+      {
+        "name": "Stutter - Beat Cycle",
+        "class_name": "BeatRepeat",
+        "params": [
+          {
+            "name": "Device On",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "Chance",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.00 %"
+          },
+          {
+            "name": "Interval",
+            "min": 0,
+            "max": 7,
+            "value": 2,
+            "display": "1/8"
+          },
+          {
+            "name": "Offset",
+            "min": 0,
+            "max": 15,
+            "value": 0,
+            "display": "0"
+          },
+          {
+            "name": "Grid",
+            "min": 0,
+            "max": 15,
+            "value": 7,
+            "display": "1/16"
+          },
+          {
+            "name": "Block Triplets",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "Variation",
+            "min": 0,
+            "max": 10,
+            "value": 0,
+            "display": "0"
+          },
+          {
+            "name": "Variation Type",
+            "min": 0,
+            "max": 4,
+            "value": 0,
+            "display": "Trigger"
+          },
+          {
+            "name": "Gate",
+            "min": 0,
+            "max": 18,
+            "value": 0,
+            "display": "1/16"
+          },
+          {
+            "name": "Decay",
+            "min": 0,
+            "max": 1,
+            "value": 0.2199999988079071,
+            "display": "22.0 %"
+          },
+          {
+            "name": "Pitch Decay",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.00 %"
+          },
+          {
+            "name": "Pitch",
+            "min": 0,
+            "max": 12,
+            "value": 0,
+            "display": "0 st"
+          },
+          {
+            "name": "Mix Type",
+            "min": 0,
+            "max": 2,
+            "value": 1,
+            "display": "Ins"
+          },
+          {
+            "name": "Volume",
+            "min": 0,
+            "max": 1,
+            "value": 0.8112250566482544,
+            "display": "-1.5 dB"
+          },
+          {
+            "name": "Filter On",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "Filter Freq",
+            "min": 0,
+            "max": 1,
+            "value": 0.5089499354362488,
+            "display": "1.00 kHz"
+          },
+          {
+            "name": "Filter Width",
+            "min": 0.5,
+            "max": 9,
+            "value": 4,
+            "display": "4"
+          },
+          {
+            "name": "Repeat",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          }
+        ]
+      },
+      {
+        "name": "LiveMixer Quick Stutter",
+        "class_name": "MxDeviceAudioEffect",
+        "params": [
+          {
+            "name": "Device On",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "Amount",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "01 Kick",
+    "devices": []
+  },
+  {
+    "name": "02 Snare",
+    "devices": []
+  },
+  {
+    "name": "03 Other Drums",
+    "devices": []
+  },
+  {
+    "name": "04 Bass",
+    "devices": []
+  },
+  {
+    "name": "TEXTURE FX",
+    "devices": [
+      {
+        "name": "Velvet Dive - texture filter",
+        "class_name": "AutoFilter2",
+        "params": [
+          {
+            "name": "Device On",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "Frequency",
+            "min": 0,
+            "max": 1,
+            "value": 0.8996566534042358,
+            "display": "10.0 kHz"
+          },
+          {
+            "name": "Resonance",
+            "min": 0,
+            "max": 1,
+            "value": 0.44999998807907104,
+            "display": "45 %"
+          },
+          {
+            "name": "Filter Morph",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.0 %"
+          },
+          {
+            "name": "Filter Type",
+            "min": 0,
+            "max": 9,
+            "value": 5,
+            "display": "DJ"
+          },
+          {
+            "name": "Filter Slope",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "24dB"
+          },
+          {
+            "name": "Morph Slope",
+            "min": 0,
+            "max": 3,
+            "value": 2,
+            "display": "24dB"
+          },
+          {
+            "name": "Circuit",
+            "min": 0,
+            "max": 3,
+            "value": 0,
+            "display": "SVF"
+          },
+          {
+            "name": "Drive",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.0 %"
+          },
+          {
+            "name": "Control",
+            "min": 0,
+            "max": 1,
+            "value": 0.5,
+            "display": "0.0 %"
+          },
+          {
+            "name": "Pitch",
+            "min": -36,
+            "max": 36,
+            "value": 0,
+            "display": "0 st"
+          },
+          {
+            "name": "Formant",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.0 %"
+          },
+          {
+            "name": "LFO Amount",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.0 %"
+          },
+          {
+            "name": "LFO Wave",
+            "min": 0,
+            "max": 7,
+            "value": 0,
+            "display": "Sine"
+          },
+          {
+            "name": "LFO T Mode",
+            "min": 0,
+            "max": 5,
+            "value": 0,
+            "display": "Rate"
+          },
+          {
+            "name": "LFO Freq",
+            "min": 0,
+            "max": 1,
+            "value": 0.35995158553123474,
+            "display": "1.00 Hz"
+          },
+          {
+            "name": "LFO Time",
+            "min": 0,
+            "max": 1,
+            "value": 0.1973896026611328,
+            "display": "1.00 s"
+          },
+          {
+            "name": "LFO Rate",
+            "min": 0,
+            "max": 21,
+            "value": 4,
+            "display": "2"
+          },
+          {
+            "name": "LFO 16th",
+            "min": 1,
+            "max": 64,
+            "value": 16,
+            "display": "16  / 16"
+          },
+          {
+            "name": "LFO Phase",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.0\u00b0"
+          },
+          {
+            "name": "LFO Offset",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.0\u00b0"
+          },
+          {
+            "name": "LFO S Mode",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Phase"
+          },
+          {
+            "name": "LFO Spin",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.0 %"
+          },
+          {
+            "name": "LFO Morph",
+            "min": 0,
+            "max": 1,
+            "value": 0.5,
+            "display": "0.0 %"
+          },
+          {
+            "name": "LFO Smoothing",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.0 %"
+          },
+          {
+            "name": "LFO Q Mode",
+            "min": 0,
+            "max": 2,
+            "value": 0,
+            "display": "None"
+          },
+          {
+            "name": "LFO Steps",
+            "min": 2,
+            "max": 64,
+            "value": 8,
+            "display": "8 "
+          },
+          {
+            "name": "LFO S&H",
+            "min": -6,
+            "max": 0,
+            "value": -4,
+            "display": "1 / 16"
+          },
+          {
+            "name": "Env Amount",
+            "min": 0,
+            "max": 1,
+            "value": 0.5,
+            "display": "0.0 %"
+          },
+          {
+            "name": "Env Attack",
+            "min": 0,
+            "max": 1,
+            "value": 0.25084149837493896,
+            "display": "1.00 ms"
+          },
+          {
+            "name": "Env Hold On",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "Env Release",
+            "min": 0,
+            "max": 1,
+            "value": 0.47415632009506226,
+            "display": "250 ms"
+          },
+          {
+            "name": "Env S&H On",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "Env S&H",
+            "min": -6,
+            "max": 0,
+            "value": -4,
+            "display": "1 / 16"
+          },
+          {
+            "name": "Output",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "0.0 dB"
+          },
+          {
+            "name": "Soft Clip On",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "Dry/Wet",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "100 %"
+          },
+          {
+            "name": "S/C EQ On",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "S/C EQ Type",
+            "min": 0,
+            "max": 5,
+            "value": 5,
+            "display": "High pass"
+          },
+          {
+            "name": "S/C EQ Freq",
+            "min": 0,
+            "max": 1,
+            "value": 0.3052678406238556,
+            "display": "200 Hz"
+          },
+          {
+            "name": "S/C EQ Q",
+            "min": 0,
+            "max": 1,
+            "value": 0.40856707096099854,
+            "display": "0.71 "
+          },
+          {
+            "name": "S/C EQ Gain",
+            "min": 0,
+            "max": 1,
+            "value": 0.5,
+            "display": "0.0 dB"
+          },
+          {
+            "name": "S/C On",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "S/C Gain",
+            "min": 0,
+            "max": 1,
+            "value": 0.4000000059604645,
+            "display": "0.00 dB"
+          },
+          {
+            "name": "S/C Mix",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "100 %"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "05 Guitar",
+    "devices": []
+  },
+  {
+    "name": "06 Piano",
+    "devices": []
+  },
+  {
+    "name": "07 Melodies",
+    "devices": []
+  },
+  {
+    "name": "VOCALS",
+    "devices": [
+      {
+        "name": "Vocal Presence - CC20",
+        "class_name": "StereoGain",
+        "params": [
+          {
+            "name": "Device On",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "Left Inv",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "Right Inv",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "Channel Mode",
+            "min": 0,
+            "max": 3,
+            "value": 1,
+            "display": "Stereo"
+          },
+          {
+            "name": "Stereo Width",
+            "min": 0,
+            "max": 2,
+            "value": 1,
+            "display": "100 %"
+          },
+          {
+            "name": "Mono",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "Bass Mono",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "Bass Freq",
+            "min": 0,
+            "max": 1,
+            "value": 0.3802112340927124,
+            "display": "120 Hz"
+          },
+          {
+            "name": "Balance",
+            "min": -1,
+            "max": 1,
+            "value": 0,
+            "display": "C"
+          },
+          {
+            "name": "Output",
+            "min": -1,
+            "max": 1,
+            "value": 0,
+            "display": "0.00 dB"
+          },
+          {
+            "name": "Mute",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "DC Filter",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "08 Lead Vocals",
+    "devices": []
+  },
+  {
+    "name": "09 Background Vocals",
+    "devices": []
+  },
+  {
+    "name": "A-DUB THROW",
+    "devices": [
+      {
+        "name": "Dub Throw - dotted eighth",
+        "class_name": "Echo",
+        "params": [
+          {
+            "name": "Device On",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "L Sync",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "L Time",
+            "min": 0,
+            "max": 1,
+            "value": 0.4453125,
+            "display": "170 ms"
+          },
+          {
+            "name": "L Synced",
+            "min": -6,
+            "max": 0,
+            "value": -3,
+            "display": "1/8"
+          },
+          {
+            "name": "L 16th",
+            "min": 1,
+            "max": 16,
+            "value": 1,
+            "display": "1 "
+          },
+          {
+            "name": "L Sync Mode",
+            "min": 0,
+            "max": 3,
+            "value": 2,
+            "display": "Dotted"
+          },
+          {
+            "name": "L Offset",
+            "min": 0,
+            "max": 1,
+            "value": 0.5,
+            "display": "0.0 %"
+          },
+          {
+            "name": "R Time",
+            "min": 0,
+            "max": 1,
+            "value": 0.1984127163887024,
+            "display": "12.4 ms"
+          },
+          {
+            "name": "R Sync",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "R Synced",
+            "min": -6,
+            "max": 0,
+            "value": -3,
+            "display": "1/8"
+          },
+          {
+            "name": "R 16th",
+            "min": 1,
+            "max": 16,
+            "value": 4,
+            "display": "4 "
+          },
+          {
+            "name": "R Sync Mode",
+            "min": 0,
+            "max": 3,
+            "value": 2,
+            "display": "Dotted"
+          },
+          {
+            "name": "R Offset",
+            "min": 0,
+            "max": 1,
+            "value": 0.5,
+            "display": "0.0 %"
+          },
+          {
+            "name": "Link",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "Repitch",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "Repitch Smoothing Time",
+            "min": 0,
+            "max": 1,
+            "value": 0.7559748291969299,
+            "display": "400 ms"
+          },
+          {
+            "name": "Feedback",
+            "min": 0,
+            "max": 1,
+            "value": 0.26333320140838623,
+            "display": "39 %"
+          },
+          {
+            "name": "FB Invert",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "Channel Mode",
+            "min": 0,
+            "max": 2,
+            "value": 1,
+            "display": "Ping Pong"
+          },
+          {
+            "name": "Input Gain",
+            "min": 0,
+            "max": 1,
+            "value": 0.5,
+            "display": "0.0 dB"
+          },
+          {
+            "name": "Output",
+            "min": 0,
+            "max": 1,
+            "value": 0.5,
+            "display": "0.0 dB"
+          },
+          {
+            "name": "Clip Dry",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "Gate On",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "Gate Thr",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "0.0 dB"
+          },
+          {
+            "name": "Gate Release",
+            "min": 0,
+            "max": 1,
+            "value": 0.602835476398468,
+            "display": "50.0 ms"
+          },
+          {
+            "name": "Duck On",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "Duck Thr",
+            "min": 0,
+            "max": 1,
+            "value": 0.591666579246521,
+            "display": "-25 dB"
+          },
+          {
+            "name": "Duck Release",
+            "min": 0,
+            "max": 1,
+            "value": 0.5548642873764038,
+            "display": "219 ms"
+          },
+          {
+            "name": "Filter On",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "HP Freq",
+            "min": 0,
+            "max": 1,
+            "value": 0.4141392111778259,
+            "display": "350 Hz"
+          },
+          {
+            "name": "HP Res",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.00 "
+          },
+          {
+            "name": "LP Freq",
+            "min": 0,
+            "max": 1,
+            "value": 0.7773109674453735,
+            "display": "4.29 kHz"
+          },
+          {
+            "name": "LP Res",
+            "min": 0,
+            "max": 1,
+            "value": 0.2857142984867096,
+            "display": "0.09 "
+          },
+          {
+            "name": "Mod Wave",
+            "min": 0,
+            "max": 5,
+            "value": 0,
+            "display": "Sine"
+          },
+          {
+            "name": "Mod Freq",
+            "min": 0,
+            "max": 1,
+            "value": 0.703133761882782,
+            "display": "3.41 Hz"
+          },
+          {
+            "name": "Mod Sync",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "Mod Rate",
+            "min": 0,
+            "max": 21,
+            "value": 9,
+            "display": "3/8"
+          },
+          {
+            "name": "Mod Phase",
+            "min": 0,
+            "max": 1,
+            "value": 0.5,
+            "display": "90\u00b0"
+          },
+          {
+            "name": "Env Mix",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.0 %"
+          },
+          {
+            "name": "Dly < Mod",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.0 %"
+          },
+          {
+            "name": "Flt < Mod",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.0 %"
+          },
+          {
+            "name": "Mod 4x",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "Reverb Level",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.0 %"
+          },
+          {
+            "name": "Reverb Decay",
+            "min": 0,
+            "max": 1,
+            "value": 0.296875,
+            "display": "30 %"
+          },
+          {
+            "name": "Reverb Loc",
+            "min": 0,
+            "max": 2,
+            "value": 0,
+            "display": "Pre"
+          },
+          {
+            "name": "Noise On",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "Noise Amt",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.0 %"
+          },
+          {
+            "name": "Noise Mrph",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.0 %"
+          },
+          {
+            "name": "Wobble On",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "Wobble Amt",
+            "min": 0,
+            "max": 1,
+            "value": 0.07999999821186066,
+            "display": "8.0 %"
+          },
+          {
+            "name": "Wobble Mrph",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.0 %"
+          },
+          {
+            "name": "Stereo Width",
+            "min": 0,
+            "max": 1,
+            "value": 0.5,
+            "display": "100 %"
+          },
+          {
+            "name": "Dry Wet",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "100 %"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "B-HALO BLOOM",
+    "devices": [
+      {
+        "name": "Halo Bloom - octave space",
+        "class_name": "Hybrid",
+        "params": [
+          {
+            "name": "Device On",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "Predelay Sync",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "Predelay",
+            "min": 0,
+            "max": 1,
+            "value": 0.24087846279144287,
+            "display": "35.0 ms"
+          },
+          {
+            "name": "Predelay 16th",
+            "min": 0,
+            "max": 16,
+            "value": 1,
+            "display": "1  / 16"
+          },
+          {
+            "name": "Predelay FB",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.0 %"
+          },
+          {
+            "name": "Predel. FB 16th",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.0 %"
+          },
+          {
+            "name": "Algo Type",
+            "min": 0,
+            "max": 4,
+            "value": 2,
+            "display": "Shimmer"
+          },
+          {
+            "name": "Algo Delay",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.00 ms"
+          },
+          {
+            "name": "Freeze",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "Freeze In",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "Decay",
+            "min": 0,
+            "max": 1,
+            "value": 0.5965989828109741,
+            "display": "4.80 s"
+          },
+          {
+            "name": "Size",
+            "min": 0,
+            "max": 1,
+            "value": 0.75,
+            "display": "75 %"
+          },
+          {
+            "name": "Damping",
+            "min": 0,
+            "max": 1,
+            "value": 0.6000000238418579,
+            "display": "60 %"
+          },
+          {
+            "name": "Diffusion",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "100 %"
+          },
+          {
+            "name": "Modulation",
+            "min": 0,
+            "max": 1,
+            "value": 0.25,
+            "display": "25 %"
+          },
+          {
+            "name": "DH Shape",
+            "min": 0,
+            "max": 1,
+            "value": 0.7301587462425232,
+            "display": "73.0 "
+          },
+          {
+            "name": "DH BassMult",
+            "min": 0,
+            "max": 1,
+            "value": 0.658730149269104,
+            "display": "155 %"
+          },
+          {
+            "name": "DH Bass X",
+            "min": 0,
+            "max": 1,
+            "value": 0.674953043460846,
+            "display": "440 Hz"
+          },
+          {
+            "name": "Sh Shimmer",
+            "min": 0,
+            "max": 1,
+            "value": 0.18000000715255737,
+            "display": "18 %"
+          },
+          {
+            "name": "Sh Pitch Shift",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "12.00 st"
+          },
+          {
+            "name": "Ti Tide",
+            "min": 0,
+            "max": 1,
+            "value": 0.7460317611694336,
+            "display": "75 %"
+          },
+          {
+            "name": "Ti Rate",
+            "min": 0,
+            "max": 29,
+            "value": 10,
+            "display": "1/16"
+          },
+          {
+            "name": "Ti Waveform",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "100 %"
+          },
+          {
+            "name": "Ti Phase",
+            "min": 0,
+            "max": 1,
+            "value": 0.5,
+            "display": "90\u00b0"
+          },
+          {
+            "name": "Qz Low Damp",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "100 %"
+          },
+          {
+            "name": "Qz Distance",
+            "min": 0,
+            "max": 1,
+            "value": 0.460317462682724,
+            "display": "46 %"
+          },
+          {
+            "name": "Pr High Mult",
+            "min": 0,
+            "max": 1,
+            "value": 0.3095238208770752,
+            "display": "34 %"
+          },
+          {
+            "name": "Pr Low Mult",
+            "min": 0,
+            "max": 1,
+            "value": 0.2142857313156128,
+            "display": "23 %"
+          },
+          {
+            "name": "Pr X Over",
+            "min": 0,
+            "max": 1,
+            "value": 0.32539671659469604,
+            "display": "939 Hz"
+          },
+          {
+            "name": "Pr Sixth",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.00 "
+          },
+          {
+            "name": "Pr Seventh",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.00 "
+          },
+          {
+            "name": "EQ On",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "EQ Pre Algo",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "EQ Lo Type",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Cut"
+          },
+          {
+            "name": "EQ Lo Freq",
+            "min": 0,
+            "max": 1,
+            "value": 0.39178910851478577,
+            "display": "300 Hz"
+          },
+          {
+            "name": "EQ Lo Gain",
+            "min": 0,
+            "max": 1,
+            "value": 0.18518519401550293,
+            "display": "-7.6 dB"
+          },
+          {
+            "name": "EQ Lo Slope",
+            "min": 0,
+            "max": 9,
+            "value": 4,
+            "display": "36 dB"
+          },
+          {
+            "name": "EQ Peak 1 Freq",
+            "min": 0,
+            "max": 1,
+            "value": 0.4375000596046448,
+            "display": "411 Hz"
+          },
+          {
+            "name": "EQ Peak 1 Gain",
+            "min": 0,
+            "max": 1,
+            "value": 0.3037036955356598,
+            "display": "-4.7 dB"
+          },
+          {
+            "name": "EQ Peak 1 Q",
+            "min": 0,
+            "max": 1,
+            "value": 0.15566839277744293,
+            "display": "0.71 "
+          },
+          {
+            "name": "EQ Peak 2 Freq",
+            "min": 0,
+            "max": 1,
+            "value": 0.6169354915618896,
+            "display": "1.42 kHz"
+          },
+          {
+            "name": "EQ Peak 2 Gain",
+            "min": 0,
+            "max": 1,
+            "value": 0.4148147702217102,
+            "display": "-2.1 dB"
+          },
+          {
+            "name": "EQ Peak 2 Q",
+            "min": 0,
+            "max": 1,
+            "value": 0.15566839277744293,
+            "display": "0.71 "
+          },
+          {
+            "name": "EQ Hi Type",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Cut"
+          },
+          {
+            "name": "EQ Hi Freq",
+            "min": 0,
+            "max": 1,
+            "value": 0.8479193449020386,
+            "display": "7.00 kHz"
+          },
+          {
+            "name": "EQ Hi Gain",
+            "min": 0,
+            "max": 1,
+            "value": 0.21481481194496155,
+            "display": "-6.9 dB"
+          },
+          {
+            "name": "EQ Hi Slope",
+            "min": 0,
+            "max": 9,
+            "value": 4,
+            "display": "36 dB"
+          },
+          {
+            "name": "Send Gain",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "0.0 dB"
+          },
+          {
+            "name": "Routing",
+            "min": 0,
+            "max": 3,
+            "value": 2,
+            "display": "Algorithm"
+          },
+          {
+            "name": "Blend",
+            "min": 0,
+            "max": 1,
+            "value": 0.60317462682724,
+            "display": "40/60"
+          },
+          {
+            "name": "Vintage",
+            "min": 0,
+            "max": 4,
+            "value": 1,
+            "display": "Subtle"
+          },
+          {
+            "name": "Width",
+            "min": 0,
+            "max": 1,
+            "value": 0.6474999189376831,
+            "display": "129 %"
+          },
+          {
+            "name": "Bass Mono",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "Dry/Wet",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "100 %"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "Main",
+    "devices": [
+      {
+        "name": "Space - CC21",
+        "class_name": "Reverb",
+        "params": [
+          {
+            "name": "Device On",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "Predelay",
+            "min": 0,
+            "max": 1,
+            "value": 0.5935819745063782,
+            "display": "20.0 ms"
+          },
+          {
+            "name": "In Lo Cut On",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "In Hi Cut On",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "Input Freq",
+            "min": 0,
+            "max": 1,
+            "value": 0.2734300494194031,
+            "display": "250 Hz"
+          },
+          {
+            "name": "Input Width",
+            "min": 0,
+            "max": 1,
+            "value": 0.6294117569923401,
+            "display": "5.85 "
+          },
+          {
+            "name": "ER Spin On",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "ER Spin Rate",
+            "min": 0,
+            "max": 1,
+            "value": 0.48569256067276,
+            "display": "0.30 Hz"
+          },
+          {
+            "name": "ER Spin Amount",
+            "min": 0,
+            "max": 1,
+            "value": 0.6544755101203918,
+            "display": "17.50 "
+          },
+          {
+            "name": "ER Shape",
+            "min": 0,
+            "max": 1,
+            "value": 0.5,
+            "display": "0.50 "
+          },
+          {
+            "name": "Diff. Hi On",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "Diff. Hi Type",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Shelf"
+          },
+          {
+            "name": "Diff. Hi Freq",
+            "min": 0,
+            "max": 1,
+            "value": 0.8102341890335083,
+            "display": "4.50 kHz"
+          },
+          {
+            "name": "HiShelf Gain",
+            "min": 0,
+            "max": 1,
+            "value": 0.625,
+            "display": "0.70 "
+          },
+          {
+            "name": "Diff. Lo On",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "Diff. Lo Freq",
+            "min": 0,
+            "max": 1,
+            "value": 0.227199524641037,
+            "display": "90.0 Hz"
+          },
+          {
+            "name": "LowShelf Gain",
+            "min": 0,
+            "max": 1,
+            "value": 0.6875,
+            "display": "0.75 "
+          },
+          {
+            "name": "Chorus On",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "Chorus Rate",
+            "min": 0,
+            "max": 1,
+            "value": 0.10369296371936798,
+            "display": "0.02 Hz"
+          },
+          {
+            "name": "Chorus Amount",
+            "min": 0,
+            "max": 1,
+            "value": 0.002506265649572015,
+            "display": "0.02 "
+          },
+          {
+            "name": "Decay Time",
+            "min": 0,
+            "max": 1,
+            "value": 0.4356594681739807,
+            "display": "2.40 s"
+          },
+          {
+            "name": "Diffusion",
+            "min": 0,
+            "max": 1,
+            "value": 0.6246089935302734,
+            "display": "60 %"
+          },
+          {
+            "name": "Scale",
+            "min": 0,
+            "max": 1,
+            "value": 0.3684210479259491,
+            "display": "40 %"
+          },
+          {
+            "name": "Freeze On",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "Flat On",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "Cut On",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "Room Size",
+            "min": 0,
+            "max": 1,
+            "value": 0.7915151119232178,
+            "display": "100.00 "
+          },
+          {
+            "name": "Size Smoothing",
+            "min": 0,
+            "max": 2,
+            "value": 2,
+            "display": "Fast"
+          },
+          {
+            "name": "Stereo Image",
+            "min": 0,
+            "max": 1,
+            "value": 0.8333333134651184,
+            "display": "100.00 "
+          },
+          {
+            "name": "Density",
+            "min": 0,
+            "max": 3,
+            "value": 1,
+            "display": "Low"
+          },
+          {
+            "name": "Reflect Level",
+            "min": 0,
+            "max": 1,
+            "value": 0.49356332421302795,
+            "display": "0.0 dB"
+          },
+          {
+            "name": "Diffuse Level",
+            "min": 0,
+            "max": 1,
+            "value": 0.49356332421302795,
+            "display": "0.0 dB"
+          },
+          {
+            "name": "Dry/Wet",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.0 %"
+          }
+        ]
+      },
+      {
+        "name": "Mix Gain - CC23",
+        "class_name": "StereoGain",
+        "params": [
+          {
+            "name": "Device On",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "Left Inv",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "Right Inv",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "Channel Mode",
+            "min": 0,
+            "max": 3,
+            "value": 1,
+            "display": "Stereo"
+          },
+          {
+            "name": "Stereo Width",
+            "min": 0,
+            "max": 2,
+            "value": 1,
+            "display": "100 %"
+          },
+          {
+            "name": "Mono",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "Bass Mono",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "Bass Freq",
+            "min": 0,
+            "max": 1,
+            "value": 0.3802112340927124,
+            "display": "120 Hz"
+          },
+          {
+            "name": "Balance",
+            "min": -1,
+            "max": 1,
+            "value": 0,
+            "display": "C"
+          },
+          {
+            "name": "Output",
+            "min": -1,
+            "max": 1,
+            "value": 0,
+            "display": "0.00 dB"
+          },
+          {
+            "name": "Mute",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "DC Filter",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          }
+        ]
+      },
+      {
+        "name": "Limiter",
+        "class_name": "Limiter",
+        "params": [
+          {
+            "name": "Device On",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "Input Gain",
+            "min": 0,
+            "max": 1,
+            "value": 0.5,
+            "display": "0.0 dB"
+          },
+          {
+            "name": "Ceiling",
+            "min": 0,
+            "max": 1,
+            "value": 0.9025300145149231,
+            "display": "-1.0 dB"
+          },
+          {
+            "name": "Release",
+            "min": 0,
+            "max": 1,
+            "value": 0.7303106188774109,
+            "display": "100 ms"
+          },
+          {
+            "name": "Auto",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "Link",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "100 %"
+          },
+          {
+            "name": "M/S Link",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0.0 %"
+          },
+          {
+            "name": "Lookahead",
+            "min": 0,
+            "max": 2,
+            "value": 0,
+            "display": "1.5 ms"
+          },
+          {
+            "name": "Routing",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "L/R"
+          },
+          {
+            "name": "Mode",
+            "min": 0,
+            "max": 2,
+            "value": 2,
+            "display": "True Peak"
+          },
+          {
+            "name": "Maximize On",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "Off"
+          },
+          {
+            "name": "Threshold",
+            "min": 0,
+            "max": 1,
+            "value": 0.9701444506645203,
+            "display": "-0.3 dB"
+          },
+          {
+            "name": "Output",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "0.0 dB"
+          }
+        ]
+      },
+      {
+        "name": "LiveMixer FX Playground",
+        "class_name": "MxDeviceAudioEffect",
+        "params": [
+          {
+            "name": "Device On",
+            "min": 0,
+            "max": 1,
+            "value": 1,
+            "display": "On"
+          },
+          {
+            "name": "Audition",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "val1"
+          },
+          {
+            "name": "Dive",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0"
+          },
+          {
+            "name": "Dub",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0"
+          },
+          {
+            "name": "Flicker",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0"
+          },
+          {
+            "name": "Halo",
+            "min": 0,
+            "max": 1,
+            "value": 0,
+            "display": "0"
+          }
+        ]
+      }
+    ]
+  }
+]

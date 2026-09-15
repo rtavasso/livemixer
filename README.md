@@ -34,6 +34,8 @@ With no prepared collection, the app asks you to load music. It never silently s
 
 ## Prepared local songs
 
+To acquire songs from a Spotify playlist and automate Fadr uploads, Pro splitting, ZIP downloads, and extraction, see [the Fadr batch workflow](docs/FADR.md).
+
 This workspace has a [LOVE SUPREME - Sun draft](http://127.0.0.1:4178/?collection=love-supreme-sun): three 8-bar passages starting at 41.816, 85.070, and 106.697 seconds, plus the full song in the prepared library. They repeat as a three-passage path when advanced manually. Start audio for the instrumental bed; reach into Hand space to transform the accompaniment and introduce available vocals. In Manual controls, **Bring in vocals** follows the selected Change timing. These are draft selections awaiting listening review.
 
 A prepared collection opens directly with `http://127.0.0.1:4178/?collection=COLLECTION_ID` in Authoring mode. In **Build mix**, **Open full song & waveforms** opens its full-length WAV stems, analysis, and saved passages for editing. It does not start audio and becomes disabled after loading to preserve library edits. **Setup > Open or restore a saved mix > Restore saved passages** instead reloads the saved playing collection. The regular URL opens the collection named by ignored `public/scenes/default.local.json`, written by the preparation command.

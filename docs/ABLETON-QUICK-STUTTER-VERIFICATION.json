@@ -1,0 +1,483 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "case": "quick-max-104",
+      "passed": true,
+      "sample_rate": 44100,
+      "amount": 1,
+      "sixteenth_notes": 4,
+      "events": [
+        {
+          "seconds": 0.774331,
+          "on": true,
+          "phase": 2.721088458201848e-05,
+          "beat": 480.9961242675781
+        },
+        {
+          "seconds": 1.351247,
+          "on": false,
+          "phase": 1.511715800006641e-05,
+          "beat": 481.997314453125
+        },
+        {
+          "seconds": 3.658934,
+          "on": true,
+          "phase": 6.0468632909760345e-06,
+          "beat": 485.9969482421875
+        },
+        {
+          "seconds": 4.235873,
+          "on": false,
+          "phase": 3.325774741824716e-05,
+          "beat": 486.99560546875
+        },
+        {
+          "seconds": 6.54356,
+          "on": true,
+          "phase": 2.4187453163904138e-05,
+          "beat": 490.9952392578125
+        },
+        {
+          "seconds": 7.120476,
+          "on": false,
+          "phase": 1.2093726581952069e-05,
+          "beat": 491.99639892578125
+        }
+      ],
+      "durations": [
+        {
+          "on": true,
+          "beats": 0.999987906273418,
+          "seconds": 0.5769160997732427
+        },
+        {
+          "on": false,
+          "beats": 3.999990929705291,
+          "seconds": 2.307687074829932
+        },
+        {
+          "on": true,
+          "beats": 1.0000272108841273,
+          "seconds": 0.5769387755102041
+        },
+        {
+          "on": false,
+          "beats": 3.9999909297057457,
+          "seconds": 2.307687074829932
+        },
+        {
+          "on": true,
+          "beats": 0.999987906273418,
+          "seconds": 0.5769160997732427
+        }
+      ],
+      "repeat_audio_correlations": [
+        0.9926027774245809,
+        0.999999954424593,
+        0.993593943988149
+      ]
+    },
+    {
+      "case": "quick-max-74",
+      "passed": true,
+      "sample_rate": 44100,
+      "amount": 1,
+      "sixteenth_notes": 4,
+      "events": [
+        {
+          "seconds": 1.019819,
+          "on": true,
+          "phase": 6.80272114550462e-06,
+          "beat": 32.9969596862793
+        },
+        {
+          "seconds": 1.830635,
+          "on": false,
+          "phase": 1.360544229100924e-05,
+          "beat": 33.99749755859375
+        },
+        {
+          "seconds": 5.073878,
+          "on": true,
+          "phase": 1.2849583981733304e-05,
+          "beat": 37.997859954833984
+        },
+        {
+          "seconds": 5.884694,
+          "on": false,
+          "phase": 1.9652305127237923e-05,
+          "beat": 38.99660873413086
+        },
+        {
+          "seconds": 9.127937,
+          "on": true,
+          "phase": 1.889644772745669e-05,
+          "beat": 42.996971130371094
+        },
+        {
+          "seconds": 9.938753,
+          "on": false,
+          "phase": 2.5699167963466607e-05,
+          "beat": 43.99750900268555
+        }
+      ],
+      "durations": [
+        {
+          "on": true,
+          "beats": 1.0000068027211455,
+          "seconds": 0.8108163265306122
+        },
+        {
+          "on": false,
+          "beats": 3.9999992441416907,
+          "seconds": 3.2432426303854873
+        },
+        {
+          "on": true,
+          "beats": 1.0000068027211455,
+          "seconds": 0.8108163265306122
+        },
+        {
+          "on": false,
+          "beats": 3.9999992441426,
+          "seconds": 3.2432426303854873
+        },
+        {
+          "on": true,
+          "beats": 1.000006802720236,
+          "seconds": 0.8108163265306122
+        }
+      ],
+      "repeat_audio_correlations": [
+        0.9594679576716776,
+        1.0,
+        1.0
+      ]
+    },
+    {
+      "case": "quick-half-104",
+      "passed": true,
+      "sample_rate": 44100,
+      "amount": 0.5,
+      "sixteenth_notes": 2,
+      "events": [
+        {
+          "seconds": 0.774331,
+          "on": true,
+          "phase": 2.721088458201848e-05,
+          "beat": 500.9961242675781
+        },
+        {
+          "seconds": 1.062789,
+          "on": false,
+          "phase": 0.5000211596488953,
+          "beat": 501.4967346191406
+        },
+        {
+          "seconds": 3.658934,
+          "on": true,
+          "phase": 6.0468632909760345e-06,
+          "beat": 505.9969482421875
+        },
+        {
+          "seconds": 3.947392,
+          "on": false,
+          "phase": 0.5,
+          "beat": 506.4949951171875
+        },
+        {
+          "seconds": 6.54356,
+          "on": true,
+          "phase": 2.4187453163904138e-05,
+          "beat": 510.9952392578125
+        },
+        {
+          "seconds": 6.832018,
+          "on": false,
+          "phase": 0.5000181198120117,
+          "beat": 511.4958190917969
+        }
+      ],
+      "durations": [
+        {
+          "on": true,
+          "beats": 0.49999394876431325,
+          "seconds": 0.2884580498866213
+        },
+        {
+          "on": false,
+          "beats": 4.499984887214396,
+          "seconds": 2.5961451247165535
+        },
+        {
+          "on": true,
+          "beats": 0.499993953136709,
+          "seconds": 0.2884580498866213
+        },
+        {
+          "on": false,
+          "beats": 4.500024187453164,
+          "seconds": 2.596167800453515
+        },
+        {
+          "on": true,
+          "beats": 0.4999939323588478,
+          "seconds": 0.2884580498866213
+        }
+      ],
+      "repeat_audio_correlations": []
+    },
+    {
+      "case": "quick-quarter-104",
+      "passed": true,
+      "sample_rate": 44100,
+      "amount": 0.25,
+      "sixteenth_notes": 1,
+      "events": [
+        {
+          "seconds": 0.774331,
+          "on": true,
+          "phase": 2.721088458201848e-05,
+          "beat": 520.9961547851562
+        },
+        {
+          "seconds": 0.918549,
+          "on": false,
+          "phase": 0.25000452995300293,
+          "beat": 521.2451782226562
+        },
+        {
+          "seconds": 3.658934,
+          "on": true,
+          "phase": 6.0468632909760345e-06,
+          "beat": 525.9969482421875
+        },
+        {
+          "seconds": 3.803175,
+          "on": false,
+          "phase": 0.25002267956733704,
+          "beat": 526.2459716796875
+        },
+        {
+          "seconds": 6.54356,
+          "on": true,
+          "phase": 2.4187453163904138e-05,
+          "beat": 530.9952392578125
+        },
+        {
+          "seconds": 6.687778,
+          "on": false,
+          "phase": 0.2500015199184418,
+          "beat": 531.2467651367188
+        }
+      ],
+      "durations": [
+        {
+          "on": true,
+          "beats": 0.2499773190684209,
+          "seconds": 0.14421768707482993
+        },
+        {
+          "on": false,
+          "beats": 4.750001516910288,
+          "seconds": 2.7403854875283447
+        },
+        {
+          "on": true,
+          "beats": 0.25001663270404606,
+          "seconds": 0.1442403628117914
+        },
+        {
+          "on": false,
+          "beats": 4.750001507885827,
+          "seconds": 2.7403854875283447
+        },
+        {
+          "on": true,
+          "beats": 0.24997733246527787,
+          "seconds": 0.14421768707482993
+        }
+      ],
+      "repeat_audio_correlations": []
+    },
+    {
+      "case": "quick-three-quarter-104",
+      "passed": true,
+      "sample_rate": 44100,
+      "amount": 0.75,
+      "sixteenth_notes": 3,
+      "events": [
+        {
+          "seconds": 0.774331,
+          "on": true,
+          "phase": 2.721088458201848e-05,
+          "beat": 540.9961547851562
+        },
+        {
+          "seconds": 1.207029,
+          "on": false,
+          "phase": 0.7500377893447876,
+          "beat": 541.7457275390625
+        },
+        {
+          "seconds": 3.658934,
+          "on": true,
+          "phase": 6.0468632909760345e-06,
+          "beat": 545.9969482421875
+        },
+        {
+          "seconds": 4.091633,
+          "on": false,
+          "phase": 0.7500166296958923,
+          "beat": 546.74658203125
+        },
+        {
+          "seconds": 6.54356,
+          "on": true,
+          "phase": 2.4187453163904138e-05,
+          "beat": 550.9952392578125
+        },
+        {
+          "seconds": 6.976259,
+          "on": false,
+          "phase": 0.750034749507904,
+          "beat": 551.7473754882812
+        }
+      ],
+      "durations": [
+        {
+          "on": true,
+          "beats": 0.7500105784602056,
+          "seconds": 0.4326984126984127
+        },
+        {
+          "on": false,
+          "beats": 4.249968257518503,
+          "seconds": 2.451904761904762
+        },
+        {
+          "on": true,
+          "beats": 0.7500105828326014,
+          "seconds": 0.4326984126984127
+        },
+        {
+          "on": false,
+          "beats": 4.250007557757272,
+          "seconds": 2.4519274376417233
+        },
+        {
+          "on": true,
+          "beats": 0.7500105620547401,
+          "seconds": 0.4326984126984127
+        }
+      ],
+      "repeat_audio_correlations": []
+    },
+    {
+      "case": "quick-boundary",
+      "passed": true,
+      "sample_rate": 44100,
+      "amount": 1,
+      "sixteenth_notes": 4,
+      "events": [
+        {
+          "seconds": 1.019819,
+          "on": true,
+          "phase": 6.80272114550462e-06,
+          "beat": 305.9969482421875
+        },
+        {
+          "seconds": 1.830635,
+          "on": false,
+          "phase": 1.360544229100924e-05,
+          "beat": 306.99749755859375
+        },
+        {
+          "seconds": 4.949161,
+          "on": true,
+          "phase": 3.023431600013282e-05,
+          "beat": 311.9968566894531
+        },
+        {
+          "seconds": 5.526077,
+          "on": false,
+          "phase": 1.8140590327675454e-05,
+          "beat": 312.9954833984375
+        },
+        {
+          "seconds": 7.833764,
+          "on": true,
+          "phase": 9.070295163837727e-06,
+          "beat": 316.9951477050781
+        },
+        {
+          "seconds": 8.410703,
+          "on": false,
+          "phase": 3.628118065535091e-05,
+          "beat": 317.9963073730469
+        },
+        {
+          "seconds": 10.71839,
+          "on": true,
+          "phase": 2.721088458201848e-05,
+          "beat": 321.9959411621094
+        },
+        {
+          "seconds": 11.295306,
+          "on": false,
+          "phase": 1.511715800006641e-05,
+          "beat": 322.9971008300781
+        }
+      ],
+      "durations": [
+        {
+          "on": true,
+          "beats": 1.0000068027211455,
+          "seconds": 0.8108163265306122
+        },
+        {
+          "on": false,
+          "beats": 5.000016628873709,
+          "seconds": 3.118526077097506
+        },
+        {
+          "on": true,
+          "beats": 0.9999879062743275,
+          "seconds": 0.5769160997732427
+        },
+        {
+          "on": false,
+          "beats": 3.999990929704836,
+          "seconds": 2.307687074829932
+        },
+        {
+          "on": true,
+          "beats": 1.0000272108854915,
+          "seconds": 0.5769387755102041
+        },
+        {
+          "on": false,
+          "beats": 3.9999909297039267,
+          "seconds": 2.307687074829932
+        },
+        {
+          "on": true,
+          "beats": 0.999987906273418,
+          "seconds": 0.5769160997732427
+        }
+      ],
+      "repeat_audio_correlations": []
+    }
+  ],
+  "summary": {
+    "native_audio_cases_passed": 6,
+    "unit_tests_passed": 7,
+    "production_build_passed": true,
+    "midi_cc22_reassigned_and_verified": true
+  },
+  "set": "/Users/rtavasso/Music/LiveMixer/Back To Us Project/LiveMixer - Two Song Trial.als",
+  "device_sha256": "ef5b76bfff918a0dc53e81e16480db8147fd5f2d709334faf0f8d5b7c3f70b4f",
+  "behavior": "1\u20134 sixteenth-note slices, on quarter-note starts, at least four dry beats. Maximum one quarter-note beat.",
+  "previous_set": "LiveMixer - Before Quick Stutters.als"
+}

@@ -1,0 +1,71 @@
+// Quarter-note phase comes from plugphasor~, not a browser or wall clock.
+Param amount(0);
+Param abort(0);
+History previousPhase(0);
+History previousPosition(0);
+History wasPlaying(0);
+History phaseReady(0);
+History gate(0);
+History onLeft(0);
+History offLeft(0);
+History song(-1);
+// The build script inserts b1..b31 parameters and the segment expression.
+// BOUNDARY_PARAMETERS
+
+playing = in3 > 0;
+// Live can hold the previous phase while stopped, then jump on startup.
+// Discard the first movement after transport starts; subsequent wraps are beats.
+tick = playing && wasPlaying && phaseReady && (in1 < previousPhase - 0.5);
+// Four sixteenth-note slices per quarter note. Bursts still start on beats.
+sliceTick = playing && wasPlaying && phaseReady && (floor(in1 * 4) != floor(previousPhase * 4));
+beat = floor(in2 + 0.5);
+segment = 0; // BOUNDARY_EXPRESSION
+jump = playing && wasPlaying && abs(in2 - previousPosition) > 0.25;
+
+if (!playing) {
+    gate = 0;
+    onLeft = 0;
+    offLeft = 0;
+    song = -1;
+} else if (jump || abort > 0) {
+    gate = 0;
+    onLeft = 0;
+    // An emergency may happen between beats. Five boundaries guarantee at
+    // least four complete dry beats, even if input resumes immediately.
+    offLeft = 5;
+    song = segment;
+} else if (sliceTick) {
+    if (tick && song >= 0 && segment != song) {
+        // A song boundary discards the old capture and grants four dry beats.
+        gate = 0;
+        onLeft = 0;
+        offLeft = 4;
+    } else {
+        if (gate > 0) {
+            onLeft = onLeft - 0.25;
+            if (onLeft <= 0) {
+                gate = 0;
+                offLeft = 4;
+            }
+        } else {
+            if (offLeft > 0) { offLeft = offLeft - 0.25; }
+            if (tick && offLeft <= 0 && amount > 0) {
+                // Amount chooses 1–4 sixteenth notes, at most one beat.
+                // Wait for a quarter-note boundary after at least four dry beats.
+                onLeft = clamp(floor(clamp(amount, 0, 1) * 4 + 0.5), 1, 4) * 0.25;
+                gate = 1;
+            }
+        }
+    }
+    if (tick) { song = segment; }
+}
+
+if (!playing) { phaseReady = 0; }
+else if (in1 != previousPhase) { phaseReady = 1; }
+previousPhase = in1;
+previousPosition = in2;
+wasPlaying = playing;
+out1 = gate;
+out2 = onLeft;
+out3 = offLeft;
+out4 = in2;

@@ -1,0 +1,1524 @@
+{
+  "verified_at": "2026-09-14T17:02:34.442592-07:00",
+  "application": "Ableton Live 12.4.5 Trial",
+  "passed": true,
+  "summary": {
+    "native_audio_cases_passed": 14,
+    "unit_tests_passed": 7,
+    "production_build_passed": true,
+    "browser_integration_passed": true,
+    "saved_set_reopened_successfully": true
+  },
+  "method": "Recorded actual Live output and native Max signal channels at 44.1 kHz; events were measured against Live quarter-note phase and transport beat position. The arrangement XML was read only for verification; clips and devices were configured through Live GUI and Live API.",
+  "timing_limit": "The Gen gate follows the host beat phase at audio rate. live.remote~ has its documented audio-buffer parameter latency; this does not claim zero-latency sample-accurate audible effect changes.",
+  "primary_suite": {
+    "note": "Passed before the final change that extends emergency-release cooldown to guarantee at least four full dry beats when released between beats. Normal cycle logic was unchanged by that final change.",
+    "cases": [
+      {
+        "case": "max-74",
+        "mode": "normal",
+        "sample_rate": 44100,
+        "subtype": "FLOAT",
+        "events": [
+          {
+            "seconds": 1.008209,
+            "on": true,
+            "phase": 6.80272114550462e-06,
+            "beat": 16.996957778930664,
+            "on_left": 4.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 4.251451,
+            "on": false,
+            "phase": 6.0468632909760345e-06,
+            "beat": 20.99732208251953,
+            "on_left": 0.0,
+            "off_left": 4.0
+          },
+          {
+            "seconds": 7.494694,
+            "on": true,
+            "phase": 5.291005436447449e-06,
+            "beat": 24.997684478759766,
+            "on_left": 4.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 10.737937,
+            "on": false,
+            "phase": 4.535147581918864e-06,
+            "beat": 28.998046875,
+            "on_left": 0.0,
+            "off_left": 4.0
+          },
+          {
+            "seconds": 13.981179,
+            "on": true,
+            "phase": 3.7792895000166027e-06,
+            "beat": 32.996620178222656,
+            "on_left": 4.0,
+            "off_left": 0.0
+          }
+        ],
+        "durations": [
+          {
+            "on": true,
+            "beats": 4,
+            "seconds": 3.243243
+          },
+          {
+            "on": false,
+            "beats": 4,
+            "seconds": 3.243243
+          },
+          {
+            "on": true,
+            "beats": 4,
+            "seconds": 3.243243
+          },
+          {
+            "on": false,
+            "beats": 4,
+            "seconds": 3.243243
+          }
+        ],
+        "repeat_audio_correlations": [
+          0.9669796617227062,
+          0.9454788791904444
+        ],
+        "passed": true
+      },
+      {
+        "case": "half-74",
+        "mode": "normal",
+        "sample_rate": 44100,
+        "subtype": "FLOAT",
+        "events": [
+          {
+            "seconds": 1.008209,
+            "on": true,
+            "phase": 6.80272114550462e-06,
+            "beat": 48.9969596862793,
+            "on_left": 2.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 2.629841,
+            "on": false,
+            "phase": 2.0408162527019158e-05,
+            "beat": 50.9980354309082,
+            "on_left": 0.0,
+            "off_left": 4.0
+          },
+          {
+            "seconds": 5.873084,
+            "on": true,
+            "phase": 1.9652305127237923e-05,
+            "beat": 54.99660873413086,
+            "on_left": 2.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 7.494694,
+            "on": false,
+            "phase": 5.291005436447449e-06,
+            "beat": 56.997684478759766,
+            "on_left": 0.0,
+            "off_left": 4.0
+          },
+          {
+            "seconds": 10.737937,
+            "on": true,
+            "phase": 4.535147581918864e-06,
+            "beat": 60.998046875,
+            "on_left": 2.0,
+            "off_left": 0.0
+          }
+        ],
+        "durations": [
+          {
+            "on": true,
+            "beats": 2,
+            "seconds": 1.621633
+          },
+          {
+            "on": false,
+            "beats": 4,
+            "seconds": 3.243243
+          },
+          {
+            "on": true,
+            "beats": 2,
+            "seconds": 1.62161
+          },
+          {
+            "on": false,
+            "beats": 4,
+            "seconds": 3.243243
+          }
+        ],
+        "repeat_audio_correlations": [],
+        "passed": true
+      },
+      {
+        "case": "quarter-104",
+        "mode": "normal",
+        "sample_rate": 44100,
+        "subtype": "FLOAT",
+        "events": [
+          {
+            "seconds": 0.785941,
+            "on": true,
+            "phase": 2.721088458201848e-05,
+            "beat": 420.9961242675781,
+            "on_left": 1.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 1.362857,
+            "on": false,
+            "phase": 1.511715800006641e-05,
+            "beat": 421.997314453125,
+            "on_left": 0.0,
+            "off_left": 4.0
+          },
+          {
+            "seconds": 3.670544,
+            "on": true,
+            "phase": 6.0468632909760345e-06,
+            "beat": 425.9969482421875,
+            "on_left": 1.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 4.247483,
+            "on": false,
+            "phase": 3.325774741824716e-05,
+            "beat": 426.99560546875,
+            "on_left": 0.0,
+            "off_left": 4.0
+          },
+          {
+            "seconds": 6.55517,
+            "on": true,
+            "phase": 2.4187453163904138e-05,
+            "beat": 430.9952392578125,
+            "on_left": 1.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 7.132086,
+            "on": false,
+            "phase": 1.2093726581952069e-05,
+            "beat": 431.99639892578125,
+            "on_left": 0.0,
+            "off_left": 4.0
+          }
+        ],
+        "durations": [
+          {
+            "on": true,
+            "beats": 1,
+            "seconds": 0.576916
+          },
+          {
+            "on": false,
+            "beats": 4,
+            "seconds": 2.307687
+          },
+          {
+            "on": true,
+            "beats": 1,
+            "seconds": 0.576939
+          },
+          {
+            "on": false,
+            "beats": 4,
+            "seconds": 2.307687
+          },
+          {
+            "on": true,
+            "beats": 1,
+            "seconds": 0.576916
+          }
+        ],
+        "repeat_audio_correlations": [],
+        "passed": true
+      },
+      {
+        "case": "three-quarter-104",
+        "mode": "normal",
+        "sample_rate": 44100,
+        "subtype": "FLOAT",
+        "events": [
+          {
+            "seconds": 0.774331,
+            "on": true,
+            "phase": 2.721088458201848e-05,
+            "beat": 448.9961242675781,
+            "on_left": 3.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 2.505102,
+            "on": false,
+            "phase": 3.023431600013282e-05,
+            "beat": 451.99713134765625,
+            "on_left": 0.0,
+            "off_left": 4.0
+          },
+          {
+            "seconds": 4.812789,
+            "on": true,
+            "phase": 2.1164021745789796e-05,
+            "beat": 455.99676513671875,
+            "on_left": 3.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 6.54356,
+            "on": false,
+            "phase": 2.4187453163904138e-05,
+            "beat": 458.9952392578125,
+            "on_left": 0.0,
+            "off_left": 4.0
+          },
+          {
+            "seconds": 8.851247,
+            "on": true,
+            "phase": 1.511715800006641e-05,
+            "beat": 462.99737548828125,
+            "on_left": 3.0,
+            "off_left": 0.0
+          }
+        ],
+        "durations": [
+          {
+            "on": true,
+            "beats": 3,
+            "seconds": 1.730771
+          },
+          {
+            "on": false,
+            "beats": 4,
+            "seconds": 2.307687
+          },
+          {
+            "on": true,
+            "beats": 3,
+            "seconds": 1.730771
+          },
+          {
+            "on": false,
+            "beats": 4,
+            "seconds": 2.307687
+          }
+        ],
+        "repeat_audio_correlations": [
+          0.9999999999687859,
+          0.9999999998911618
+        ],
+        "passed": true
+      },
+      {
+        "case": "max-104",
+        "mode": "normal",
+        "sample_rate": 44100,
+        "subtype": "FLOAT",
+        "events": [
+          {
+            "seconds": 0.774331,
+            "on": true,
+            "phase": 2.721088458201848e-05,
+            "beat": 480.9961242675781,
+            "on_left": 4.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 3.082018,
+            "on": false,
+            "phase": 1.8140590327675454e-05,
+            "beat": 484.9957580566406,
+            "on_left": 0.0,
+            "off_left": 4.0
+          },
+          {
+            "seconds": 5.389705,
+            "on": true,
+            "phase": 9.070295163837727e-06,
+            "beat": 488.99542236328125,
+            "on_left": 4.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 7.697392,
+            "on": false,
+            "phase": 8.881784197001252e-15,
+            "beat": 492.99505615234375,
+            "on_left": 0.0,
+            "off_left": 4.0
+          },
+          {
+            "seconds": 10.005102,
+            "on": true,
+            "phase": 3.023431600013282e-05,
+            "beat": 496.9971923828125,
+            "on_left": 4.0,
+            "off_left": 0.0
+          }
+        ],
+        "durations": [
+          {
+            "on": true,
+            "beats": 4,
+            "seconds": 2.307687
+          },
+          {
+            "on": false,
+            "beats": 4,
+            "seconds": 2.307687
+          },
+          {
+            "on": true,
+            "beats": 4,
+            "seconds": 2.307687
+          },
+          {
+            "on": false,
+            "beats": 4,
+            "seconds": 2.30771
+          }
+        ],
+        "repeat_audio_correlations": [
+          0.9934873226528048,
+          0.9803028542432478
+        ],
+        "passed": true
+      },
+      {
+        "case": "half-104",
+        "mode": "normal",
+        "sample_rate": 44100,
+        "subtype": "FLOAT",
+        "events": [
+          {
+            "seconds": 0.785941,
+            "on": true,
+            "phase": 2.721088458201848e-05,
+            "beat": 520.9961547851562,
+            "on_left": 2.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 1.939773,
+            "on": false,
+            "phase": 3.0234316454880172e-06,
+            "beat": 522.9959716796875,
+            "on_left": 0.0,
+            "off_left": 4.0
+          },
+          {
+            "seconds": 4.247483,
+            "on": true,
+            "phase": 3.325774741824716e-05,
+            "beat": 526.99560546875,
+            "on_left": 2.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 5.401315,
+            "on": false,
+            "phase": 9.070295163837727e-06,
+            "beat": 528.9954223632812,
+            "on_left": 0.0,
+            "off_left": 4.0
+          },
+          {
+            "seconds": 7.709025,
+            "on": true,
+            "phase": 3.930461025447585e-05,
+            "beat": 532.9950561523438,
+            "on_left": 2.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 8.862857,
+            "on": false,
+            "phase": 1.511715800006641e-05,
+            "beat": 534.9973754882812,
+            "on_left": 0.0,
+            "off_left": 4.0
+          }
+        ],
+        "durations": [
+          {
+            "on": true,
+            "beats": 2,
+            "seconds": 1.153832
+          },
+          {
+            "on": false,
+            "beats": 4,
+            "seconds": 2.30771
+          },
+          {
+            "on": true,
+            "beats": 2,
+            "seconds": 1.153832
+          },
+          {
+            "on": false,
+            "beats": 4,
+            "seconds": 2.30771
+          },
+          {
+            "on": true,
+            "beats": 2,
+            "seconds": 1.153832
+          }
+        ],
+        "repeat_audio_correlations": [],
+        "passed": true
+      },
+      {
+        "case": "song-boundary",
+        "mode": "boundary",
+        "sample_rate": 44100,
+        "subtype": "FLOAT",
+        "events": [
+          {
+            "seconds": 1.019819,
+            "on": true,
+            "phase": 6.80272114550462e-06,
+            "beat": 305.9969482421875,
+            "on_left": 4.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 2.641451,
+            "on": false,
+            "phase": 2.0408162527019158e-05,
+            "beat": 307.998046875,
+            "on_left": 0.0,
+            "off_left": 4.0
+          },
+          {
+            "seconds": 4.949161,
+            "on": true,
+            "phase": 3.023431600013282e-05,
+            "beat": 311.9968566894531,
+            "on_left": 4.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 7.256848,
+            "on": false,
+            "phase": 2.1164021745789796e-05,
+            "beat": 315.9964904785156,
+            "on_left": 0.0,
+            "off_left": 4.0
+          },
+          {
+            "seconds": 9.564535,
+            "on": true,
+            "phase": 1.2093726581952069e-05,
+            "beat": 319.9961242675781,
+            "on_left": 4.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 11.872222,
+            "on": false,
+            "phase": 3.0234316454880172e-06,
+            "beat": 323.9957580566406,
+            "on_left": 0.0,
+            "off_left": 4.0
+          }
+        ],
+        "durations": [
+          {
+            "on": true,
+            "beats": 2,
+            "seconds": 1.621633
+          },
+          {
+            "on": false,
+            "beats": 4,
+            "seconds": 2.30771
+          },
+          {
+            "on": true,
+            "beats": 4,
+            "seconds": 2.307687
+          },
+          {
+            "on": false,
+            "beats": 4,
+            "seconds": 2.307687
+          },
+          {
+            "on": true,
+            "beats": 4,
+            "seconds": 2.307687
+          }
+        ],
+        "repeat_audio_correlations": [
+          0.9939404553274443,
+          0.9947145937216632
+        ],
+        "passed": true
+      },
+      {
+        "case": "latched-change",
+        "mode": "latch",
+        "sample_rate": 44100,
+        "subtype": "FLOAT",
+        "events": [
+          {
+            "seconds": 1.008209,
+            "on": true,
+            "phase": 6.80272114550462e-06,
+            "beat": 80.99695587158203,
+            "on_left": 2.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 2.629841,
+            "on": false,
+            "phase": 2.0408162527019158e-05,
+            "beat": 82.99803161621094,
+            "on_left": 0.0,
+            "off_left": 4.0
+          },
+          {
+            "seconds": 5.873084,
+            "on": true,
+            "phase": 1.9652305127237923e-05,
+            "beat": 86.9966049194336,
+            "on_left": 4.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 9.116327,
+            "on": false,
+            "phase": 1.889644772745669e-05,
+            "beat": 90.9969711303711,
+            "on_left": 0.0,
+            "off_left": 4.0
+          },
+          {
+            "seconds": 12.359569,
+            "on": true,
+            "phase": 1.8140590327675454e-05,
+            "beat": 94.99732971191406,
+            "on_left": 4.0,
+            "off_left": 0.0
+          }
+        ],
+        "durations": [
+          {
+            "on": true,
+            "beats": 2,
+            "seconds": 1.621633
+          },
+          {
+            "on": false,
+            "beats": 4,
+            "seconds": 3.243243
+          },
+          {
+            "on": true,
+            "beats": 4,
+            "seconds": 3.243243
+          },
+          {
+            "on": false,
+            "beats": 4,
+            "seconds": 3.243243
+          }
+        ],
+        "repeat_audio_correlations": [
+          0.9461051618709292
+        ],
+        "passed": true
+      },
+      {
+        "case": "disconnect",
+        "mode": "disconnect",
+        "sample_rate": 44100,
+        "subtype": "FLOAT",
+        "events": [
+          {
+            "seconds": 0.774331,
+            "on": true,
+            "phase": 2.721088458201848e-05,
+            "beat": 550.9961547851562,
+            "on_left": 4.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 2.335079,
+            "on": false,
+            "phase": 0.7053242921829224,
+            "beat": 553.7028198242188,
+            "on_left": 0.0,
+            "off_left": 4.0
+          }
+        ],
+        "durations": [
+          {
+            "on": true,
+            "beats": 2,
+            "seconds": 1.560748
+          }
+        ],
+        "repeat_audio_correlations": [
+          0.9999999999937879
+        ],
+        "passed": true
+      },
+      {
+        "case": "transport-stop",
+        "mode": "stop",
+        "sample_rate": 44100,
+        "subtype": "FLOAT",
+        "events": [
+          {
+            "seconds": 0.785941,
+            "on": true,
+            "phase": 2.721088458201848e-05,
+            "beat": 580.9961547851562,
+            "on_left": 4.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 1.41644,
+            "on": false,
+            "phase": 0.09289190918207169,
+            "beat": 582.0928955078125,
+            "on_left": 0.0,
+            "off_left": 0.0
+          }
+        ],
+        "durations": [
+          {
+            "on": true,
+            "beats": 1,
+            "seconds": 0.630499
+          }
+        ],
+        "repeat_audio_correlations": [],
+        "passed": true
+      },
+      {
+        "case": "mid-burst-tempo-change",
+        "mode": "tempo",
+        "sample_rate": 44100,
+        "subtype": "FLOAT",
+        "events": [
+          {
+            "seconds": 0.774331,
+            "on": true,
+            "phase": 2.721088458201848e-05,
+            "beat": 600.9961547851562,
+            "on_left": 4.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 2.966644,
+            "on": false,
+            "phase": 7.558579000033205e-06,
+            "beat": 604.9962768554688,
+            "on_left": 0.0,
+            "off_left": 4.0
+          },
+          {
+            "seconds": 4.812812,
+            "on": true,
+            "phase": 3.779289545491338e-05,
+            "beat": 608.9959106445312,
+            "on_left": 4.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 6.658957,
+            "on": false,
+            "phase": 1.889644772745669e-05,
+            "beat": 612.9955444335938,
+            "on_left": 0.0,
+            "off_left": 4.0
+          },
+          {
+            "seconds": 8.505102,
+            "on": true,
+            "phase": 1.0969003483296547e-13,
+            "beat": 616.9951782226562,
+            "on_left": 4.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 10.35127,
+            "on": false,
+            "phase": 3.023431600013282e-05,
+            "beat": 620.9948120117188,
+            "on_left": 0.0,
+            "off_left": 4.0
+          }
+        ],
+        "durations": [
+          {
+            "on": true,
+            "beats": 4,
+            "seconds": 2.192313
+          },
+          {
+            "on": false,
+            "beats": 4,
+            "seconds": 1.846168
+          },
+          {
+            "on": true,
+            "beats": 4,
+            "seconds": 1.846145
+          },
+          {
+            "on": false,
+            "beats": 4,
+            "seconds": 1.846145
+          },
+          {
+            "on": true,
+            "beats": 4,
+            "seconds": 1.846168
+          }
+        ],
+        "repeat_audio_correlations": [
+          0.9882011971712452,
+          1.0,
+          1.0
+        ],
+        "passed": true
+      }
+    ]
+  },
+  "final_device_suite": {
+    "note": "Retested maximum amount at 104 BPM, the 74-to-104 song boundary, and emergency release with immediate resumed input after the final cooldown change.",
+    "cases": [
+      {
+        "case": "final-max-104",
+        "mode": "normal",
+        "sample_rate": 44100,
+        "subtype": "FLOAT",
+        "events": [
+          {
+            "seconds": 0.774331,
+            "on": true,
+            "phase": 2.721088458201848e-05,
+            "beat": 480.9961242675781,
+            "on_left": 4.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 3.082018,
+            "on": false,
+            "phase": 1.8140590327675454e-05,
+            "beat": 484.9957580566406,
+            "on_left": 0.0,
+            "off_left": 4.0
+          },
+          {
+            "seconds": 5.389705,
+            "on": true,
+            "phase": 9.070295163837727e-06,
+            "beat": 488.99542236328125,
+            "on_left": 4.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 7.697392,
+            "on": false,
+            "phase": 8.881784197001252e-15,
+            "beat": 492.99505615234375,
+            "on_left": 0.0,
+            "off_left": 4.0
+          },
+          {
+            "seconds": 10.005102,
+            "on": true,
+            "phase": 3.023431600013282e-05,
+            "beat": 496.9971923828125,
+            "on_left": 4.0,
+            "off_left": 0.0
+          }
+        ],
+        "durations": [
+          {
+            "on": true,
+            "beats": 4,
+            "seconds": 2.307687
+          },
+          {
+            "on": false,
+            "beats": 4,
+            "seconds": 2.307687
+          },
+          {
+            "on": true,
+            "beats": 4,
+            "seconds": 2.307687
+          },
+          {
+            "on": false,
+            "beats": 4,
+            "seconds": 2.30771
+          }
+        ],
+        "repeat_audio_correlations": [
+          0.9934873226528048,
+          0.9803028542432478
+        ],
+        "passed": true
+      },
+      {
+        "case": "final-boundary",
+        "mode": "boundary",
+        "sample_rate": 44100,
+        "subtype": "FLOAT",
+        "events": [
+          {
+            "seconds": 1.019819,
+            "on": true,
+            "phase": 6.80272114550462e-06,
+            "beat": 305.9969482421875,
+            "on_left": 4.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 2.641451,
+            "on": false,
+            "phase": 2.0408162527019158e-05,
+            "beat": 307.998046875,
+            "on_left": 0.0,
+            "off_left": 4.0
+          },
+          {
+            "seconds": 4.949161,
+            "on": true,
+            "phase": 3.023431600013282e-05,
+            "beat": 311.9968566894531,
+            "on_left": 4.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 7.256848,
+            "on": false,
+            "phase": 2.1164021745789796e-05,
+            "beat": 315.9964904785156,
+            "on_left": 0.0,
+            "off_left": 4.0
+          },
+          {
+            "seconds": 9.564535,
+            "on": true,
+            "phase": 1.2093726581952069e-05,
+            "beat": 319.9961242675781,
+            "on_left": 4.0,
+            "off_left": 0.0
+          },
+          {
+            "seconds": 11.872222,
+            "on": false,
+            "phase": 3.0234316454880172e-06,
+            "beat": 323.9957580566406,
+            "on_left": 0.0,
+            "off_left": 4.0
+          }
+        ],
+        "durations": [
+          {
+            "on": true,
+            "beats": 2,
+            "seconds": 1.621633
+          },
+          {
+            "on": false,
+            "beats": 4,
+            "seconds": 2.30771
+          },
+          {
+            "on": true,
+            "beats": 4,
+            "seconds": 2.307687
+          },
+          {
+            "on": false,
+            "beats": 4,
+            "seconds": 2.307687
+          },
+          {
+            "on": true,
+            "beats": 4,
+            "seconds": 2.307687
+          }
+        ],
+        "repeat_audio_correlations": [
+          0.9939404553274443,
+          0.9947145937216632
+        ],
+        "passed": true
+      },
+      {
+        "case": "emergency-release-and-immediate-reconnect",
+        "passed": true,
+        "dry_beats": 4.90521240234375,
+        "events": [
+          {
+            "seconds": 0.7743310657596372,
+            "on": true,
+            "beat": 640.9961547851562,
+            "phase": 2.721088458201848e-05
+          },
+          {
+            "seconds": 1.404829931972789,
+            "on": false,
+            "beat": 642.0903930664062,
+            "phase": 0.09289190918207169
+          },
+          {
+            "seconds": 4.235873015873016,
+            "on": true,
+            "beat": 646.99560546875,
+            "phase": 3.325774741824716e-05
+          },
+          {
+            "seconds": 6.543560090702948,
+            "on": false,
+            "beat": 650.9952392578125,
+            "phase": 2.4187453163904138e-05
+          },
+          {
+            "seconds": 8.85124716553288,
+            "on": true,
+            "beat": 654.9973754882812,
+            "phase": 1.511715800006641e-05
+          }
+        ]
+      }
+    ]
+  },
+  "project": {
+    "set": "/Users/rtavasso/Music/LiveMixer/Back To Us Project/LiveMixer - Two Song Trial.als",
+    "clips": [
+      {
+        "name": "Back To Us | 01 Kick",
+        "start": 0.0,
+        "end": 308.0,
+        "warp_markers": [
+          {
+            "Id": 7.0,
+            "SecTime": 0.216,
+            "BeatTime": 0.0
+          },
+          {
+            "Id": 6.0,
+            "SecTime": 249.94572972972975,
+            "BeatTime": 308.0
+          },
+          {
+            "Id": 5.0,
+            "SecTime": 249.9710675675676,
+            "BeatTime": 308.03125
+          }
+        ],
+        "relative_file": "Samples/Imported/01 Kick.wav",
+        "sha256": "5e67f2da2f221834a9f4d9db03c7d738983b82200ab9cbb2cadf2f1cced1fdef"
+      },
+      {
+        "name": "Ladders | 01 Kick",
+        "start": 308.0,
+        "end": 804.3927075528638,
+        "warp_markers": [
+          {
+            "Id": 129.0,
+            "SecTime": 0.0,
+            "BeatTime": 0.0
+          },
+          {
+            "Id": 128.0,
+            "SecTime": 286.3804081632653,
+            "BeatTime": 496.3927075528638
+          },
+          {
+            "Id": 127.0,
+            "SecTime": 286.3982206537286,
+            "BeatTime": 496.4239575528638
+          }
+        ],
+        "relative_file": "Samples/Imported/01 Kick-1.wav",
+        "sha256": "7f0904f5472f31f931e5a76b3e612babab3e6a610a25fc3d3fbfe1fef19e1d5a"
+      },
+      {
+        "name": "Back To Us | 02 Snare",
+        "start": 0.0,
+        "end": 308.0,
+        "warp_markers": [
+          {
+            "Id": 7.0,
+            "SecTime": 0.216,
+            "BeatTime": 0.0
+          },
+          {
+            "Id": 6.0,
+            "SecTime": 249.94572972972975,
+            "BeatTime": 308.0
+          },
+          {
+            "Id": 5.0,
+            "SecTime": 249.9710675675676,
+            "BeatTime": 308.03125
+          }
+        ],
+        "relative_file": "Samples/Imported/02 Snare.wav",
+        "sha256": "f78f93944f43850977664cfdede577676c79a255d28436081ef25532b806ad17"
+      },
+      {
+        "name": "Ladders | 02 Snare",
+        "start": 308.0,
+        "end": 804.3927075528638,
+        "warp_markers": [
+          {
+            "Id": 3.0,
+            "SecTime": 0.0,
+            "BeatTime": 0.0
+          },
+          {
+            "Id": 2.0,
+            "SecTime": 286.3804081632653,
+            "BeatTime": 496.3927075528638
+          },
+          {
+            "Id": 1.0,
+            "SecTime": 286.4057460011031,
+            "BeatTime": 496.4239575528638
+          }
+        ],
+        "relative_file": "Samples/Imported/02 Snare-1.wav",
+        "sha256": "9310740b66fa6e859c5ebfb01103e5390b359b44e83b0ed7f9cfcf5f4330ab1e"
+      },
+      {
+        "name": "Back To Us | 03 Other Drums",
+        "start": 0.0,
+        "end": 308.0,
+        "warp_markers": [
+          {
+            "Id": 7.0,
+            "SecTime": 0.216,
+            "BeatTime": 0.0
+          },
+          {
+            "Id": 6.0,
+            "SecTime": 249.94572972972975,
+            "BeatTime": 308.0
+          },
+          {
+            "Id": 5.0,
+            "SecTime": 249.9710675675676,
+            "BeatTime": 308.03125
+          }
+        ],
+        "relative_file": "Samples/Imported/03 Other Drums.wav",
+        "sha256": "e7a961b88494bd6e7d08693fe75cd9764a1a4deadc276dfdf209f335d6d9d74d"
+      },
+      {
+        "name": "Ladders | 03 Other Drums",
+        "start": 308.0,
+        "end": 804.3927075528638,
+        "warp_markers": [
+          {
+            "Id": 3.0,
+            "SecTime": 0.0,
+            "BeatTime": 0.0
+          },
+          {
+            "Id": 2.0,
+            "SecTime": 286.3804081632653,
+            "BeatTime": 496.3927075528638
+          },
+          {
+            "Id": 1.0,
+            "SecTime": 286.4057460011031,
+            "BeatTime": 496.4239575528638
+          }
+        ],
+        "relative_file": "Samples/Imported/03 Other Drums-1.wav",
+        "sha256": "51ad560808a1209bd609177d691c6fe4303abc8b11fc4a3dd0468a5bb2139acf"
+      },
+      {
+        "name": "Back To Us | 04 Bass",
+        "start": 0.0,
+        "end": 308.0,
+        "warp_markers": [
+          {
+            "Id": 7.0,
+            "SecTime": 0.216,
+            "BeatTime": 0.0
+          },
+          {
+            "Id": 6.0,
+            "SecTime": 249.94572972972975,
+            "BeatTime": 308.0
+          },
+          {
+            "Id": 5.0,
+            "SecTime": 249.9710675675676,
+            "BeatTime": 308.03125
+          }
+        ],
+        "relative_file": "Samples/Imported/04 Bass.wav",
+        "sha256": "0851c86560c5f5a7a24345bb25737fab095a1efa238e4fe59c74f5333fd08e7d"
+      },
+      {
+        "name": "Ladders | 04 Bass",
+        "start": 308.0,
+        "end": 804.3927075528638,
+        "warp_markers": [
+          {
+            "Id": 3.0,
+            "SecTime": 0.0,
+            "BeatTime": 0.0
+          },
+          {
+            "Id": 2.0,
+            "SecTime": 286.3804081632653,
+            "BeatTime": 496.3927075528638
+          },
+          {
+            "Id": 1.0,
+            "SecTime": 286.4057460011031,
+            "BeatTime": 496.4239575528638
+          }
+        ],
+        "relative_file": "Samples/Imported/04 Bass-1.wav",
+        "sha256": "073ed3a639a6fd373b8802d32744f71910b5bb577c7fb32e2246d190a11c0cad"
+      },
+      {
+        "name": "Back To Us | 05 Guitar",
+        "start": 0.0,
+        "end": 308.0,
+        "warp_markers": [
+          {
+            "Id": 7.0,
+            "SecTime": 0.216,
+            "BeatTime": 0.0
+          },
+          {
+            "Id": 6.0,
+            "SecTime": 249.94572972972975,
+            "BeatTime": 308.0
+          },
+          {
+            "Id": 5.0,
+            "SecTime": 249.9710675675676,
+            "BeatTime": 308.03125
+          }
+        ],
+        "relative_file": "Samples/Imported/05 Guitar.wav",
+        "sha256": "d009f814fd397480883b0c60190707a9a9bd7bcf37aa7577c39750db021ac596"
+      },
+      {
+        "name": "Ladders | 05 Guitar",
+        "start": 308.0,
+        "end": 804.3927075528638,
+        "warp_markers": [
+          {
+            "Id": 3.0,
+            "SecTime": 0.0,
+            "BeatTime": 0.0
+          },
+          {
+            "Id": 2.0,
+            "SecTime": 286.3804081632653,
+            "BeatTime": 496.3927075528638
+          },
+          {
+            "Id": 1.0,
+            "SecTime": 286.4057460011031,
+            "BeatTime": 496.4239575528638
+          }
+        ],
+        "relative_file": "Samples/Imported/05 Guitar-1.wav",
+        "sha256": "0cdeb230e2e5ff90de3b7bd7ec46e50668883e6c848045726a8afa0c1b51c60d"
+      },
+      {
+        "name": "Back To Us | 06 Piano",
+        "start": 0.0,
+        "end": 308.0,
+        "warp_markers": [
+          {
+            "Id": 7.0,
+            "SecTime": 0.216,
+            "BeatTime": 0.0
+          },
+          {
+            "Id": 6.0,
+            "SecTime": 249.94572972972975,
+            "BeatTime": 308.0
+          },
+          {
+            "Id": 5.0,
+            "SecTime": 249.9710675675676,
+            "BeatTime": 308.03125
+          }
+        ],
+        "relative_file": "Samples/Imported/06 Piano.wav",
+        "sha256": "933147475765007c87a139a3695a72ab3e085285f221e5163e7294f1afed1aec"
+      },
+      {
+        "name": "Ladders | 06 Piano",
+        "start": 308.0,
+        "end": 804.3927075528638,
+        "warp_markers": [
+          {
+            "Id": 3.0,
+            "SecTime": 0.0,
+            "BeatTime": 0.0
+          },
+          {
+            "Id": 2.0,
+            "SecTime": 286.3804081632653,
+            "BeatTime": 496.3927075528638
+          },
+          {
+            "Id": 1.0,
+            "SecTime": 286.4057460011031,
+            "BeatTime": 496.4239575528638
+          }
+        ],
+        "relative_file": "Samples/Imported/06 Piano-1.wav",
+        "sha256": "c28fa62cb2161344cfb521bbc8bbdebeea95a03f078bbcd5128d1becc2a9b822"
+      },
+      {
+        "name": "Back To Us | 07 Melodies",
+        "start": 0.0,
+        "end": 308.0,
+        "warp_markers": [
+          {
+            "Id": 7.0,
+            "SecTime": 0.216,
+            "BeatTime": 0.0
+          },
+          {
+            "Id": 6.0,
+            "SecTime": 249.94572972972975,
+            "BeatTime": 308.0
+          },
+          {
+            "Id": 5.0,
+            "SecTime": 249.9710675675676,
+            "BeatTime": 308.03125
+          }
+        ],
+        "relative_file": "Samples/Imported/07 Melodies.wav",
+        "sha256": "95b794d9edc6a4f13dd08a3e59562f9a94039a124e6e7d1a5cab5204f37c3750"
+      },
+      {
+        "name": "Ladders | 07 Melodies",
+        "start": 308.0,
+        "end": 804.3927075528638,
+        "warp_markers": [
+          {
+            "Id": 3.0,
+            "SecTime": 0.0,
+            "BeatTime": 0.0
+          },
+          {
+            "Id": 2.0,
+            "SecTime": 286.3804081632653,
+            "BeatTime": 496.3927075528638
+          },
+          {
+            "Id": 1.0,
+            "SecTime": 286.4057460011031,
+            "BeatTime": 496.4239575528638
+          }
+        ],
+        "relative_file": "Samples/Imported/07 Melodies-1.wav",
+        "sha256": "cbcfb5ffdaf68250e3b4f6cc617e14a82dc07f96bf1ca5f55f64dfc25e00bc9d"
+      },
+      {
+        "name": "Back To Us | 08 Lead Vocals",
+        "start": 0.0,
+        "end": 308.0,
+        "warp_markers": [
+          {
+            "Id": 7.0,
+            "SecTime": 0.216,
+            "BeatTime": 0.0
+          },
+          {
+            "Id": 6.0,
+            "SecTime": 249.94572972972975,
+            "BeatTime": 308.0
+          },
+          {
+            "Id": 5.0,
+            "SecTime": 249.9710675675676,
+            "BeatTime": 308.03125
+          }
+        ],
+        "relative_file": "Samples/Imported/08 Lead Vocals.wav",
+        "sha256": "4e76f403889c574695effae07eec3a3bdcbf452754a23cafcdd1b4fe2c7ebba0"
+      },
+      {
+        "name": "Ladders | 08 Lead Vocals",
+        "start": 308.0,
+        "end": 804.3927075528638,
+        "warp_markers": [
+          {
+            "Id": 3.0,
+            "SecTime": 0.0,
+            "BeatTime": 0.0
+          },
+          {
+            "Id": 2.0,
+            "SecTime": 286.3804081632653,
+            "BeatTime": 496.3927075528638
+          },
+          {
+            "Id": 1.0,
+            "SecTime": 286.4057460011031,
+            "BeatTime": 496.4239575528638
+          }
+        ],
+        "relative_file": "Samples/Imported/08 Lead Vocals-1.wav",
+        "sha256": "f189ce01d057668613327f4724c08c0ffc5bffb92efd6adc77803897aa5ab1ef"
+      },
+      {
+        "name": "Back To Us | 09 Background Vocals",
+        "start": 0.0,
+        "end": 308.0,
+        "warp_markers": [
+          {
+            "Id": 7.0,
+            "SecTime": 0.216,
+            "BeatTime": 0.0
+          },
+          {
+            "Id": 6.0,
+            "SecTime": 249.94572972972975,
+            "BeatTime": 308.0
+          },
+          {
+            "Id": 5.0,
+            "SecTime": 249.9710675675676,
+            "BeatTime": 308.03125
+          }
+        ],
+        "relative_file": "Samples/Imported/09 Background Vocals.wav",
+        "sha256": "a292695891df846e8c02170d3458d25921b0c4b2ab9a47ce1cfc38d06391dc20"
+      },
+      {
+        "name": "Ladders | 09 Background Vocals",
+        "start": 308.0,
+        "end": 804.3927075528638,
+        "warp_markers": [
+          {
+            "Id": 3.0,
+            "SecTime": 0.0,
+            "BeatTime": 0.0
+          },
+          {
+            "Id": 2.0,
+            "SecTime": 286.3804081632653,
+            "BeatTime": 496.3927075528638
+          },
+          {
+            "Id": 1.0,
+            "SecTime": 286.4057460011031,
+            "BeatTime": 496.4239575528638
+          }
+        ],
+        "relative_file": "Samples/Imported/09 Background Vocals-1.wav",
+        "sha256": "eabaac9437bfd8110ab8433214110937e1d9e3e0b4b1bf5cb10c51499b43e39f"
+      }
+    ],
+    "tempo_automation": [
+      {
+        "time": -63072000.0,
+        "bpm": 74.0
+      },
+      {
+        "time": 308.0,
+        "bpm": 74.0
+      },
+      {
+        "time": 308.0,
+        "bpm": 104.0
+      }
+    ],
+    "midi": [
+      [
+        16,
+        20
+      ],
+      [
+        16,
+        21
+      ],
+      [
+        16,
+        23
+      ],
+      [
+        16,
+        22
+      ]
+    ],
+    "temporary_setup_removed": true,
+    "collected_audio": true,
+    "matching_warp_maps_through_used_audio": true,
+    "native_tempos_verified_from_warp_markers": [
+      74,
+      104
+    ]
+  },
+  "unit_tests": {
+    "command": "npm run test:ableton",
+    "python_passed": 3,
+    "vitest_passed": 4
+  },
+  "build": {
+    "command": "npm run build",
+    "passed": true
+  },
+  "browser_integration": {
+    "after_final_set_reload": true,
+    "real_bridge_and_live_device": true,
+    "status": "Live connected",
+    "actual_simulation": "Presence \u00b7 input connected",
+    "stale_input_defaults": [
+      "100%",
+      "0%",
+      "0 beats",
+      "100%"
+    ],
+    "page_errors": []
+  },
+  "reopen": {
+    "controller_status": "Ready \u00b7 2 songs",
+    "missing_media": false,
+    "transport": "Stopped at 1.1.1",
+    "amount": 0,
+    "project_device_matches_source": true
+  },
+  "source_sha256": {
+    "devices/LiveMixer Beat Cycle/LiveMixer Beat Cycle.amxd": "12b0da4d3f0aa23afca5964a3e6f434de83067c61ab65014d834271ae599a4df",
+    "devices/LiveMixer Beat Cycle/beat-cycle.genexpr": "759e213753892686a8e0ba059252ae58e1e8cd5810071565cbe702328e13a292",
+    "devices/LiveMixer Beat Cycle/livemixer-bind.js": "86ff3c6d91e1e7f57e2ddf6443a47b5676354cfe3114dd65f538b2d1cd8b1d8b",
+    "scripts/ableton-bridge.py": "2d0f624ad316f72ff02c263379da87269308fbd8afb172a107f16830bbfd2800",
+    "src/ableton/controls.ts": "1015df57cb64ebdbb44f64fdf849af14def7095653b01c9a4db6986cd56682e6",
+    "src/ableton/main.ts": "92b8fd75d7877e23e5fb653826880152c3157aebae6978b49c7a994b3985addc"
+  },
+  "listening_note": "Repeated captured slices were confirmed by audio correlation. Musical balance and effect taste still need the user\u2019s listening pass."
+}
