@@ -1,5 +1,7 @@
 # Ableton simulation mix
 
+For the newer set with separate song groups and a 74 → 104 BPM drum transition, see [Back To Us → Ladders: drum transition](ABLETON-TRANSITIONS.md). The instructions below describe the earlier consecutive mix.
+
 Open `~/Music/LiveMixer/Back To Us Project/LiveMixer - Two Song Trial.als` in Live 12 Trial. Max for Live is included in this trial. The earlier one-song sets are retained. `LiveMixer - Before Quick Stutters.als` preserves the longer repeat behavior and the effect settings from before this adjustment.
 
 ## Try it
