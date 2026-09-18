@@ -145,6 +145,91 @@ test('the GPU wave field rests, propagates a dip, and dissipates without saturat
   for (const state of [result.dip, result.spread, result.calm]) expect(state.clipped).toBe(0);
 });
 
+for (const packed of [false, true]) test(`Shallows water rests, conserves volume, reflects off the screen edges, and loses ripples before the slosh (${packed ? 'RGBA8' : 'float'})`, async ({ page }) => {
+  test.setTimeout(180_000);
+  await page.goto('/sim.html?sim=presence&source=pointer&overlay=0&quality=low');
+  await page.waitForFunction(() => !!window.livemixerSim?.host);
+  const result = await page.evaluate(async packed => {
+    window.livemixerSim.host.stop();
+    const [{ wave, restColor }, model, { PingPong }, { quadProgram, drawQuad }] = await Promise.all([
+      import('../src/sim/sims/shallows/shaders'), import('../src/sim/sims/shallows/model'), import('../src/sim/gl/fbo'), import('../src/sim/gl/quad'),
+    ]);
+    const gl = document.createElement('canvas').getContext('webgl2')!;
+    if (!packed && !gl.getExtension('EXT_color_buffer_float')) throw new Error('Test requires floating targets as well as the RGBA8 fallback.');
+    const aspect = 1.5, rows = 96, cols = 144, dt = 1 / 60, speed = .5, settle = .2;
+    const n = model.substepsFor(speed, dt, rows), c = model.effectiveSpeed(speed, dt, rows), sub = dt / n, nu = model.rippleViscosity(.5);
+    const field = new PingPong(gl, cols, rows, packed ? 'rgba8' : 'rgba16f', 'linear');
+    const shader = quadProgram(gl, wave(packed), 'shallows-wave-test');
+    const stamps = new model.Stamps();
+    const bytes = new Uint8Array(cols * rows * 4), floats = new Float32Array(cols * rows * 4), heights = new Float32Array(cols * rows);
+    const reset = () => { for (const f of [field.read, field.write]) f.clear(...restColor(packed)); };
+    const step = () => {
+      shader.use().f2('u_texel', 1 / cols, 1 / rows).f1('u_dx', 1 / rows).f1('u_dt', sub).f1('u_stepDt', dt).f1('u_c2', c * c).f1('u_nu', nu)
+        .f1('u_damp', Math.exp(-settle * sub)).f1('u_relax', Math.exp(-model.HEIGHT_RELAX * sub)).f1('u_aspect', aspect)
+        .f4v('u_seg', stamps.seg).f4v('u_vel', stamps.vel).f4v('u_meta', stamps.meta);
+      for (let i = 0; i < n; i++) { field.write.bind(); shader.texture('u_field', field.read.texture, 0).i1('u_stampCount', i === 0 ? stamps.count : 0); drawQuad(gl); field.swap(); }
+      stamps.begin();
+    };
+    const measure = () => {
+      field.read.bind();
+      if (packed) { gl.readPixels(0, 0, cols, rows, gl.RGBA, gl.UNSIGNED_BYTE, bytes); for (let i = 0; i < heights.length; i++) heights[i] = (bytes[i * 4] * 256 + bytes[i * 4 + 1] - 32768) * model.HEIGHT_RANGE / 32767; }
+      else { gl.readPixels(0, 0, cols, rows, gl.RGBA, gl.FLOAT, floats); for (let i = 0; i < heights.length; i++) heights[i] = floats[i * 4]; }
+      let max = 0, sum = 0, sq = 0, right = 0, finite = true;
+      for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+        const h = heights[y * cols + x];
+        if (!Number.isFinite(h)) finite = false;
+        max = Math.max(max, Math.abs(h)); sum += h; sq += h * h;
+        if (x >= cols * .75) right += h * h;
+      }
+      return { max, mean: sum / heights.length, rms: Math.sqrt(sq / heights.length), right, finite };
+    };
+    /** Seed a standing wave with `waves` half-periods across the width, run for `seconds`, and return the share of its amplitude left. */
+    const survive = (waves: number, seconds: number) => {
+      reset(); field.read.bind();
+      gl.enable(gl.SCISSOR_TEST);
+      for (let x = 0; x < cols; x++) {
+        const h = .004 * Math.cos(Math.PI * waves * (x + .5) / cols);
+        const q = Math.round(h / model.HEIGHT_RANGE * 32767 + 32768);
+        gl.scissor(x, 0, 1, rows);
+        if (packed) gl.clearColor(Math.floor(q / 256) / 255, (q % 256) / 255, 128 / 255, 0); else gl.clearColor(h, 0, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+      }
+      gl.disable(gl.SCISSOR_TEST);
+      const before = measure().rms;
+      // Sample the envelope over the last stretch so the phase of the oscillation does not matter.
+      let peak = 0;
+      const total = Math.round(seconds * 60), tail = Math.round(total * .3);
+      for (let i = 0; i < total; i++) { step(); if (i >= total - tail && i % 4 === 0) peak = Math.max(peak, measure().rms); }
+      return peak / before;
+    };
+    try {
+      reset(); stamps.begin();
+      for (let i = 0; i < 20; i++) step();
+      const rest = measure();
+      stamps.addImpulse(.3, .5, .06, -.2); step();
+      for (let i = 0; i < 12; i++) step();
+      const splash = measure();
+      for (let i = 0; i < 150; i++) step();      // long enough to reach the right edge (1.2 units away at 0.5/s)
+      const spread = measure();
+      for (let i = 0; i < 2400; i++) step();
+      const calm = measure();
+      const slosh = survive(1, 4), ripple = survive(60, 4);
+      return { rest, splash, spread, calm, slosh, ripple, substeps: n, glError: gl.getError() };
+    } finally { shader.dispose(); field.dispose(); gl.getExtension('WEBGL_lose_context')?.loseContext(); }
+  }, packed);
+  expect(result.glError).toBe(0);
+  expect(result.rest.max).toBe(0);
+  for (const state of [result.splash, result.spread, result.calm]) expect(state.finite).toBe(true);
+  expect(result.splash.max).toBeGreaterThan(.001);
+  expect(result.splash.max).toBeLessThan(.05);                                       // no clipping
+  expect(Math.abs(result.splash.mean)).toBeLessThan(result.splash.max * .02);         // a splash moves water, it does not make any
+  expect(result.spread.right).toBeGreaterThan(result.splash.right * 10 + 1e-12);      // it has travelled
+  expect(result.calm.rms).toBeLessThan(result.splash.rms * .05);                      // and it settles
+  expect(result.slosh).toBeGreaterThan(.45);                                          // the sheet is still rocking after 4 s (e^-0.5 ≈ 0.6)
+  expect(result.slosh).toBeLessThan(1.02);
+  expect(result.ripple).toBeLessThan(result.slosh * .5);                              // short ripples are gone first
+});
+
 test('Retina resizing stays inside the selected budget and keeps publishing', async ({ page }) => {
   await page.setViewportSize({ width: 2560, height: 1600 });
   await page.goto('/sim.html?sim=basin&source=synthetic&overlay=0&quality=medium&dpr=2');

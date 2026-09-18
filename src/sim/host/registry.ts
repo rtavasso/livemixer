@@ -9,10 +9,11 @@ import trails from '../sims/trails';
 import veil from '../sims/veil';
 import basin from '../sims/basin';
 import prism from '../sims/prism';
+import shallows from '../sims/shallows';
 
 export type AnySimulation = SimulationDefinition<ParamSpecs, SignalSpecs>;
 
-export const SIMULATIONS: readonly AnySimulation[] = [trails, veil, basin, prism, presence] as unknown as AnySimulation[];
+export const SIMULATIONS: readonly AnySimulation[] = [trails, veil, basin, prism, shallows, presence] as unknown as AnySimulation[];
 
 export function findSimulation(id: string): AnySimulation | undefined { return SIMULATIONS.find(s => s.id === id); }
 
