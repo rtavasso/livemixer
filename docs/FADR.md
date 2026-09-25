@@ -47,3 +47,15 @@ The output layout is:
 The extraction step rejects unsafe paths, duplicate names, incomplete archives, and missing selected stem roles. It stages each song before publishing its folder and retains the ZIP. It does not convert stems to WAV or add them to a Live Mixer scene. The existing `prepare:fadr` command can prepare supported Pro exports afterward.
 
 `npm run test:fadr` covers matching, safe archive extraction and resumption, and a local browser fixture that exercises Pro subdivisions, selecting all stems, choosing MP3, downloading, and resuming. The fixture is not a live Fadr integration test; Fadr interface changes may require selector updates.
+
+## Ableton set with one group per song
+
+`scripts/ableton-stem-set.py` writes a Live 12 set from a folder of song folders (default `.fadr/groop-show/ableton-import`, as built by `fadr-ableton-import.py`). Each song becomes a collapsed group named "Artist - Title" containing one audio track per stem, and songs run end to end in the Arrangement with a `SONG:` locator at each start.
+
+```sh
+python3 scripts/ableton-stem-set.py --list                        # folder names to choose from
+python3 scripts/ableton-stem-set.py ladders 3 "if i ain't" 1 -o "Set.als"
+python3 scripts/ableton-stem-set.py --order setlist.txt -o "Set.als" --gap-bars 8
+```
+
+Selectors are a folder number, an exact name, or a unique part of a name; `--order` takes one per line (`#` comments allowed). Only listed songs are included; with none, every numbered folder is used in folder order. Clips are unwarped, so each song plays at its original speed and its stems stay aligned; `--tempo` (default 120) only sets the grid, and changing tempo later moves song start positions. Stem files are referenced in place, not copied; use **File → Collect All and Save** to gather them into a project.
