@@ -4,7 +4,9 @@ Reads a folder of song folders (default: the output of
 fadr-ableton-import.py), each holding that song's stems. Every song becomes a
 top-level group named "Artist - Title" containing one audio track per stem.
 
-Stems are first rendered to FLAC with every stem of a song cut or padded to
+Stems are first rendered to 16-bit WAV (or FLAC with --format flac; Live must
+decode FLAC into its decoding cache before it can play it, so large sets need
+WAV) with every stem of a song cut or padded to
 the same length: the latest point at which any of its stems is above the
 silence threshold. Trailing silence and near-silent noise are removed, and
 shorter stems are padded with silence. Renders are cached per song and
@@ -101,36 +103,42 @@ def audible_end(samples, rate, silence_db):
     return int(min(len(samples), (loud[-1] + 1) * block)) if len(loud) else 0
 
 
-def write_flac(samples, frames, rate, target):
-    """Cut or zero-pad to exactly `frames`, fade the last 10 ms, and encode as FLAC."""
+def write_stem(samples, frames, rate, target):
+    """Cut or zero-pad to exactly `frames`, fade the last 10 ms, and write WAV or FLAC by suffix."""
     out = np.zeros((frames, samples.shape[1]), dtype=np.int16)
     keep = min(frames, len(samples))
     out[:keep] = samples[:keep]
     fade = min(frames, rate // 100)
     out[frames - fade :] = (out[frames - fade :] * np.linspace(1, 0, fade)[:, None]).astype(np.int16)
-    temp = target.with_suffix(".wav")
+    temp = target.with_name(f"{target.stem}.part.wav")
     with wave.open(str(temp), "wb") as f:
         f.setnchannels(out.shape[1])
         f.setsampwidth(2)
         f.setframerate(rate)
         f.writeframes(out.tobytes())
-    subprocess.run(["afconvert", "-f", "flac", "-d", "flac", str(temp), str(target)], check=True)
-    temp.unlink()
+    if target.suffix == ".flac":
+        subprocess.run(["afconvert", "-f", "flac", "-d", "flac", str(temp), str(target)], check=True)
+        temp.unlink()
+    else:
+        temp.replace(target)
 
 
-def render_song(folder, render_root, silence_db):
-    """Render a song's stems to equal-length FLACs; returns ([(name, path)], frames, rate)."""
+def render_song(folder, render_root, silence_db, fmt):
+    """Render a song's stems to equal-length files; returns ([(name, path)], frames, rate)."""
     stems = sorted(f for f in folder.iterdir() if f.suffix.lower() in AUDIO)
     target_dir = render_root / folder.name
     manifest_path = target_dir / "_render.json"
     sources = {f.name: [f.stat().st_size, int(f.stat().st_mtime)] for f in stems}
-    outputs = [(f.stem, (target_dir / f.stem).with_suffix(".flac")) for f in stems]
+    outputs = [(f.stem, target_dir / f"{f.stem}.{fmt}") for f in stems]
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text())
         if manifest.get("sources") == sources and manifest.get("silence_db") == silence_db and all(p.exists() for _, p in outputs):
             return outputs, manifest["frames"], manifest["rate"]
     target_dir.mkdir(parents=True, exist_ok=True)
     manifest_path.unlink(missing_ok=True)
+    for old in target_dir.iterdir():
+        if old.suffix in (".wav", ".flac"):
+            old.unlink()
     with ThreadPoolExecutor(max_workers=len(stems)) as pool:
         decoded = list(pool.map(lambda f: decode(f, target_dir), stems))
     rates = {rate for _, rate in decoded}
@@ -141,7 +149,7 @@ def render_song(folder, render_root, silence_db):
     if frames == 0:
         sys.exit(f"{folder.name}: every stem is below {silence_db} dBFS")
     with ThreadPoolExecutor(max_workers=len(stems)) as pool:
-        list(pool.map(lambda job: write_flac(job[0][0], frames, rate, job[1][1]), zip(decoded, outputs)))
+        list(pool.map(lambda job: write_stem(job[0][0], frames, rate, job[1][1]), zip(decoded, outputs)))
     manifest_path.write_text(json.dumps({"silence_db": silence_db, "sources": sources, "frames": frames, "rate": rate}, indent=2))
     return outputs, frames, rate
 
@@ -201,7 +209,7 @@ def add_locator(locators, index, time, name):
         ET.SubElement(locator, tag, Value=value)
 
 
-def build(songs, output, tempo, gap_bars, unfold, render_root, silence_db):
+def build(songs, output, tempo, gap_bars, unfold, render_root, silence_db, fmt):
     with gzip.open(TEMPLATE, "rt", encoding="utf-8") as f:
         root = ET.fromstring(f.read())
     live_set = root.find("LiveSet")
@@ -221,7 +229,7 @@ def build(songs, output, tempo, gap_bars, unfold, render_root, silence_db):
     beat = 0.0
     for index, folder in enumerate(songs):
         name = display_name(folder)
-        stems, frames, rate = render_song(folder, render_root, silence_db)
+        stems, frames, rate = render_song(folder, render_root, silence_db, fmt)
         seconds = frames / rate
         color = COLORS[index % len(COLORS)]
         group = copy.deepcopy(group_template)
@@ -271,7 +279,8 @@ def main():
     parser.add_argument("--tempo", type=float, default=120, help="set tempo; clips are unwarped, so this only sets the grid")
     parser.add_argument("--gap-bars", type=int, default=0, help="empty bars between songs (0 = butt songs together exactly)")
     parser.add_argument("--silence-db", type=float, default=-60, help="level below which a stem's tail counts as silence (dBFS)")
-    parser.add_argument("--rendered", help="folder for equal-length FLAC stems (default: <stems>/../rendered-stems)")
+    parser.add_argument("--rendered", help="folder for equal-length stems (default: <stems>/../rendered-stems)")
+    parser.add_argument("--format", choices=("wav", "flac"), default="wav", help="rendered stem format (FLAC is smaller but Live must decode it before playback)")
     parser.add_argument("--unfold", action="store_true", help="leave song groups expanded")
     parser.add_argument("--force", action="store_true", help="overwrite an existing set")
     parser.add_argument("--list", action="store_true", help="print the available song folders and exit")
@@ -291,7 +300,7 @@ def main():
     if output.exists() and not args.force:
         sys.exit(f"{output} exists; pass --force to overwrite")
     render_root = Path(args.rendered) if args.rendered else root.parent / "rendered-stems"
-    build(songs, output, args.tempo, args.gap_bars, args.unfold, render_root.resolve(), args.silence_db)
+    build(songs, output, args.tempo, args.gap_bars, args.unfold, render_root.resolve(), args.silence_db, args.format)
 
 
 if __name__ == "__main__":
