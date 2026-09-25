@@ -1,45 +1,42 @@
-"""Write an Ableton Live set with one named group per song, in a chosen order.
+"""Write an Ableton Live set that plays the chosen songs as one continuous, beat-matched mix.
 
 Reads a folder of song folders (default: the output of
 fadr-ableton-import.py), each holding that song's stems. Every song becomes a
 top-level group named "Artist - Title" containing one audio track per stem.
 
-Stems are first rendered to 16-bit WAV (or FLAC with --format flac; Live must
-decode FLAC into its decoding cache before it can play it, so large sets need
-WAV) with every stem of a song cut or padded to
-the same length: the latest point at which any of its stems is above the
-silence threshold. Trailing silence and near-silent noise are removed, and
-shorter stems are padded with silence. Renders are cached per song and
-reused while the source files and threshold are unchanged. Songs then run
-back to back in the Arrangement with no gap, with a "SONG: …" locator at each
-start. Clips are unwarped, so they play at their original speed and stay
-sample-aligned with one another.
+1. Render: every stem of a song is cut or padded to the same length (the
+   latest point any stem is above --silence-db) and written as 16-bit WAV,
+   which Live streams without its decoding cache.
+2. Analyse: tempo, beats and downbeats per song (librosa in an isolated uv
+   environment), started from the tempo in tempo-key.json.
+3. Mix: clips are warped on their downbeats, songs overlap on phrase
+   boundaries, the tempo ramps from one song to the next across each
+   overlap, and each transition (stem handover, crossfade or EQ low swap) is
+   written as automation. See docs/superpowers/specs/2026-09-24-ableton-transitions-design.md.
+
+Renders and analyses are cached per song, so reordering is fast. The set is
+written with a report of every transition, also saved as <set>.transitions.json.
 
 Order songs with positional selectors or --order FILE (one selector per line,
 # comments allowed). A selector is a folder number ("7"), an exact name, or
 any unique part of a name ("ladders"). Only the listed songs are included;
 with no selectors, every numbered folder is included in folder order.
-
-The set is cloned from ableton-templates/stem-set.als (saved by Live 12.4),
-which holds one group track and one audio track routed into it.
 """
 import argparse
-import copy
-import gzip
 import json
-import os
+import math
 import re
-import subprocess
 import sys
-import wave
-import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
+import unicodedata
 from pathlib import Path
 
-import numpy as np
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-TEMPLATE = Path(__file__).parent / "ableton-templates" / "stem-set.als"
-AUDIO = {".mp3", ".wav", ".aif", ".aiff", ".flac", ".ogg", ".m4a"}
+from ableton_set import transitions as tx  # noqa: E402
+from ableton_set.als import write_mix  # noqa: E402
+from ableton_set.analysis import analyze_all  # noqa: E402
+from ableton_set.render import AUDIO, render_song  # noqa: E402
+
 NUMBERED = re.compile(r"^(\d+)\s+(.*)$")
 COLORS = [1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49, 53, 57, 61, 65, 3, 11, 19]
 
@@ -81,193 +78,75 @@ def read_order(path):
     return [line for line in lines if line]
 
 
-def decode(stem, scratch):
-    """Decode a stem to 16-bit PCM with afconvert; returns (frames x channels array, rate)."""
-    temp = scratch / f"{stem.stem}.decode.wav"
-    subprocess.run(["afconvert", "-f", "WAVE", "-d", "LEI16", str(stem), str(temp)], check=True)
-    with wave.open(str(temp)) as f:
-        rate, channels = f.getframerate(), f.getnchannels()
-        samples = np.frombuffer(f.readframes(f.getnframes()), dtype="<i2").reshape(-1, channels)
-    temp.unlink()
-    return samples, rate
+def reliable(analysis, prior):
+    """At least 16 bars, and the detected tempo within 10% of the listed one (allowing half/double)."""
+    if len(analysis["downbeats"]) < 16:
+        return False
+    if not prior:
+        return True
+    ratio = analysis["bpm"] / prior
+    while ratio > math.sqrt(2):
+        ratio /= 2
+    while ratio < 1 / math.sqrt(2):
+        ratio *= 2
+    return abs(ratio - 1) <= 0.10
 
 
-def audible_end(samples, rate, silence_db):
-    """Frame just after the last 50 ms block whose peak exceeds the threshold (0 if silent)."""
-    block = rate // 20
-    peaks = np.abs(samples.astype(np.int32)).max(axis=1)
-    count = -(-len(peaks) // block)
-    padded = np.zeros(count * block, dtype=np.int32)
-    padded[: len(peaks)] = peaks
-    loud = np.nonzero(padded.reshape(count, block).max(axis=1) > 32768 * 10 ** (silence_db / 20))[0]
-    return int(min(len(samples), (loud[-1] + 1) * block)) if len(loud) else 0
+def bar(beat):
+    return f"{int(beat // 4) + 1}.{int(beat % 4) + 1}"
 
 
-def write_stem(samples, frames, rate, target):
-    """Cut or zero-pad to exactly `frames`, fade the last 10 ms, and write WAV or FLAC by suffix."""
-    out = np.zeros((frames, samples.shape[1]), dtype=np.int16)
-    keep = min(frames, len(samples))
-    out[:keep] = samples[:keep]
-    fade = min(frames, rate // 100)
-    out[frames - fade :] = (out[frames - fade :] * np.linspace(1, 0, fade)[:, None]).astype(np.int16)
-    temp = target.with_name(f"{target.stem}.part.wav")
-    with wave.open(str(temp), "wb") as f:
-        f.setnchannels(out.shape[1])
-        f.setsampwidth(2)
-        f.setframerate(rate)
-        f.writeframes(out.tobytes())
-    if target.suffix == ".flac":
-        subprocess.run(["afconvert", "-f", "flac", "-d", "flac", str(temp), str(target)], check=True)
-        temp.unlink()
-    else:
-        temp.replace(target)
+def build(folders, output, args):
+    render_root = (Path(args.rendered) if args.rendered else Path(args.stems).parent / "rendered-stems").resolve()
+    key_file = Path(args.tempo_key) if args.tempo_key else Path(args.stems).parent / "tempo-key.json"
+    # Folder names from Spotify can contain non-breaking spaces; match them loosely.
+    loose = lambda name: unicodedata.normalize("NFKC", name).casefold()  # noqa: E731
+    listed = json.loads(key_file.read_text()) if key_file.exists() else {}
+    meta = {folder.name: next((v for k, v in listed.items() if loose(k) == loose(folder.name)), {}) for folder in folders}
+    missing = [f.name for f in folders if not meta[f.name]]
+    if missing:
+        print(f"Not in {key_file} (tempo from analysis only, key unknown): {', '.join(missing)}")
 
+    rendered = []
+    for folder in folders:
+        stems, frames, rate = render_song(folder, render_root, args.silence_db, "wav")
+        rendered.append((folder, stems, frames, rate))
+    print(f"Analysing {len(folders)} songs (cached per song)…")
+    analyses = analyze_all([render_root / f.name for f in folders], [meta.get(f.name, {}).get("bpm") for f in folders])
 
-def render_song(folder, render_root, silence_db, fmt):
-    """Render a song's stems to equal-length files; returns ([(name, path)], frames, rate)."""
-    stems = sorted(f for f in folder.iterdir() if f.suffix.lower() in AUDIO)
-    target_dir = render_root / folder.name
-    manifest_path = target_dir / "_render.json"
-    sources = {f.name: [f.stat().st_size, int(f.stat().st_mtime)] for f in stems}
-    outputs = [(f.stem, target_dir / f"{f.stem}.{fmt}") for f in stems]
-    if manifest_path.exists():
-        manifest = json.loads(manifest_path.read_text())
-        if manifest.get("sources") == sources and manifest.get("silence_db") == silence_db and all(p.exists() for _, p in outputs):
-            return outputs, manifest["frames"], manifest["rate"]
-    target_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path.unlink(missing_ok=True)
-    for old in target_dir.iterdir():
-        if old.suffix in (".wav", ".flac"):
-            old.unlink()
-    with ThreadPoolExecutor(max_workers=len(stems)) as pool:
-        decoded = list(pool.map(lambda f: decode(f, target_dir), stems))
-    rates = {rate for _, rate in decoded}
-    if len(rates) != 1:
-        sys.exit(f"{folder.name}: stems have different sample rates {sorted(rates)}")
-    rate = rates.pop()
-    frames = max(audible_end(samples, rate, silence_db) for samples, _ in decoded)
-    if frames == 0:
-        sys.exit(f"{folder.name}: every stem is below {silence_db} dBFS")
-    with ThreadPoolExecutor(max_workers=len(stems)) as pool:
-        list(pool.map(lambda job: write_stem(job[0][0], frames, rate, job[1][1]), zip(decoded, outputs)))
-    manifest_path.write_text(json.dumps({"silence_db": silence_db, "sources": sources, "frames": frames, "rate": rate}, indent=2))
-    return outputs, frames, rate
+    songs = []
+    for (folder, stems, frames, rate), analysis in zip(rendered, analyses):
+        info = meta.get(folder.name, {})
+        songs.append(tx.Song(
+            name=display_name(folder), native_bpm=analysis["bpm"], downbeats=analysis["downbeats"],
+            pickup_bars=analysis["pickup_bars"], duration=frames / rate, bar_levels=analysis["bar_levels"],
+            camelot=tx.camelot(info.get("key"), info.get("camelot")), reliable=reliable(analysis, info.get("bpm"))))
+    plan = tx.plan(songs, args.overlap_bars)
+    envelopes = tx.automation(plan)
 
+    write_mix(plan, envelopes, [(stems, frames, rate) for _, stems, frames, rate in rendered], output, COLORS, args.unfold)
 
-def renumber(element, next_pointee):
-    """Give every automation/modulation target in a cloned track a fresh set-wide Id."""
-    for node in element.iter():
-        if "Id" in node.attrib and (node.tag.endswith("Target") or node.tag == "Pointee"):
-            node.set("Id", str(next_pointee))
-            next_pointee += 1
-    return next_pointee
-
-
-def set_name(track, name):
-    track.find("Name/EffectiveName").set("Value", name)
-    track.find("Name/UserName").set("Value", name)
-
-
-def fill_clip(clip, stem, frames, rate, name, color, start, tempo, output_dir):
-    seconds = frames / rate
-    clip.set("Time", repr(start))
-    clip.find("CurrentStart").set("Value", repr(start))
-    clip.find("CurrentEnd").set("Value", repr(start + seconds * tempo / 60))
-    for tag in ("LoopStart", "StartRelative", "HiddenLoopStart"):
-        clip.find(f"Loop/{tag}").set("Value", "0")
-    for tag in ("LoopEnd", "OutMarker", "HiddenLoopEnd"):
-        clip.find(f"Loop/{tag}").set("Value", repr(seconds))
-    clip.find("Name").set("Value", name)
-    clip.find("Color").set("Value", str(color))
-    clip.find("IsWarped").set("Value", "false")
-    ref = clip.find("SampleRef")
-    file_ref = ref.find("FileRef")
-    file_ref.find("RelativePathType").set("Value", "1")
-    file_ref.find("RelativePath").set("Value", os.path.relpath(stem, output_dir))
-    file_ref.find("Path").set("Value", str(stem))
-    file_ref.find("OriginalFileSize").set("Value", str(stem.stat().st_size))
-    file_ref.find("OriginalCrc").set("Value", "0")
-    ref.find("LastModDate").set("Value", str(int(stem.stat().st_mtime)))
-    ref.find("DefaultDuration").set("Value", str(frames))
-    ref.find("DefaultSampleRate").set("Value", str(rate))
-    return seconds
-
-
-def set_tempo(live_set, tempo):
-    tempo_node = live_set.find("MainTrack/DeviceChain/Mixer/Tempo")
-    tempo_node.find("Manual").set("Value", repr(float(tempo)))
-    target = tempo_node.find("AutomationTarget").get("Id")
-    for envelope in live_set.iter("AutomationEnvelope"):
-        if envelope.find("EnvelopeTarget/PointeeId").get("Value") == target:
-            for event in envelope.iter("FloatEvent"):
-                event.set("Value", repr(float(tempo)))
-
-
-def add_locator(locators, index, time, name):
-    locator = ET.SubElement(locators, "Locator", Id=str(index))
-    for tag, value in (("LomId", "0"), ("Time", repr(time)), ("Name", name), ("Annotation", ""), ("IsSongStart", "false")):
-        ET.SubElement(locator, tag, Value=value)
-
-
-def build(songs, output, tempo, gap_bars, unfold, render_root, silence_db, fmt):
-    with gzip.open(TEMPLATE, "rt", encoding="utf-8") as f:
-        root = ET.fromstring(f.read())
-    live_set = root.find("LiveSet")
-    tracks = live_set.find("Tracks")
-    group_template, stem_template = tracks.find("GroupTrack"), tracks.find("AudioTrack")
-    tracks.remove(group_template)
-    tracks.remove(stem_template)
-    # Group and audio tracks must precede the return tracks in <Tracks>.
-    position = 0
-    next_pointee = int(live_set.find("NextPointeeId").get("Value"))
-    next_track = 1 + max(int(t.get("Id")) for t in live_set.iter() if t.tag in ("AudioTrack", "GroupTrack", "ReturnTrack", "MidiTrack"))
-    next_track = max(next_track, 100)
-    locators = live_set.find("Locators/Locators")
-    set_tempo(live_set, tempo)
-    output_dir = output.parent.resolve()
-
-    beat = 0.0
-    for index, folder in enumerate(songs):
-        name = display_name(folder)
-        stems, frames, rate = render_song(folder, render_root, silence_db, fmt)
-        seconds = frames / rate
-        color = COLORS[index % len(COLORS)]
-        group = copy.deepcopy(group_template)
-        group_id = next_track
-        next_track += 1
-        group.set("Id", str(group_id))
-        set_name(group, name)
-        group.find("Color").set("Value", str(color))
-        group.find("TrackUnfolded").set("Value", "true" if unfold else "false")
-        next_pointee = renumber(group, next_pointee)
-        tracks.insert(position, group)
-        position += 1
-        add_locator(locators, index, beat, f"SONG: {name}")
-
-        for stem_name, stem in stems:
-            track = copy.deepcopy(stem_template)
-            track.set("Id", str(next_track))
-            next_track += 1
-            set_name(track, stem_name)
-            track.find("Color").set("Value", str(color))
-            track.find("TrackGroupId").set("Value", str(group_id))
-            clip = track.find("DeviceChain/MainSequencer/Sample/ArrangerAutomation/Events/AudioClip")
-            fill_clip(clip, stem.resolve(), frames, rate, stem_name, color, beat, tempo, output_dir)
-            next_pointee = renumber(track, next_pointee)
-            tracks.insert(position, track)
-            position += 1
-        clock = beat * 60 / tempo
-        print(f"{int(clock // 60):>3}:{clock % 60:06.3f}  {name}  ({len(stems)} stems, {int(seconds // 60)}:{seconds % 60:06.3f})")
-        beat += seconds * tempo / 60
-        if gap_bars:
-            beat = (int(beat // 4) + (beat % 4 > 0) + gap_bars) * 4.0
-
-    live_set.find("NextPointeeId").set("Value", str(next_pointee))
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(output, "wt", encoding="utf-8") as f:
-        f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-        f.write(ET.tostring(root, encoding="unicode"))
-    print(f"Wrote {output} ({len(songs)} songs)")
+    report = []
+    print()
+    for index, (song, analysis) in enumerate(zip(songs, analyses)):
+        scale = "" if song.scale == 1 else f" (played as {song.bpm:.1f}, ×{song.scale:g})"
+        best, second = sorted(analysis["phase_scores"], reverse=True)[:2]
+        flag = "" if song.reliable else "  ⚠ beat grid uncertain: crossfades only"
+        if song.reliable and best > 0 and (best - second) / best < 0.10:
+            flag = "  ⚠ bar start uncertain: transitions may land a beat off"
+        print(f"{index + 1:>2}. {song.name}  {song.native_bpm:.1f} BPM{scale}  {song.camelot or '?'}{flag}")
+    print()
+    for t in plan.transitions:
+        a, b = songs[t.outgoing], songs[t.incoming]
+        line = (f"{t.outgoing + 1:>2}→{t.incoming + 1:<2} bar {bar(t.start):>7}  {t.style:<9} {t.bars:>2} bars  "
+                f"{a.bpm:.1f}→{b.bpm:.1f} BPM  {t.reason}")
+        print(line)
+        report.append({"from": a.name, "to": b.name, "bar": bar(t.start), "beat": t.start, "bars": t.bars,
+                       "style": t.style, "blend": t.blend, "tempo": [a.bpm, b.bpm],
+                       "keys": [a.camelot, b.camelot], "reason": t.reason})
+    output.with_suffix(".transitions.json").write_text(json.dumps(report, indent=2, ensure_ascii=False))
+    total = plan.clip_ends[-1]
+    print(f"\nWrote {output} ({len(songs)} songs, ends at bar {bar(total)})")
 
 
 def main():
@@ -276,11 +155,10 @@ def main():
     parser.add_argument("--stems", default=".fadr/groop-show/ableton-import", help="folder of song folders")
     parser.add_argument("--order", help="text file with one song selector per line")
     parser.add_argument("-o", "--output", help="set to write (default: <stems>/../Stem Set.als)")
-    parser.add_argument("--tempo", type=float, default=120, help="set tempo; clips are unwarped, so this only sets the grid")
-    parser.add_argument("--gap-bars", type=int, default=0, help="empty bars between songs (0 = butt songs together exactly)")
+    parser.add_argument("--tempo-key", help="tempo and key per song folder (default: <stems>/../tempo-key.json)")
+    parser.add_argument("--overlap-bars", type=int, default=16, help="length of each transition in bars")
     parser.add_argument("--silence-db", type=float, default=-60, help="level below which a stem's tail counts as silence (dBFS)")
     parser.add_argument("--rendered", help="folder for equal-length stems (default: <stems>/../rendered-stems)")
-    parser.add_argument("--format", choices=("wav", "flac"), default="wav", help="rendered stem format (FLAC is smaller but Live must decode it before playback)")
     parser.add_argument("--unfold", action="store_true", help="leave song groups expanded")
     parser.add_argument("--force", action="store_true", help="overwrite an existing set")
     parser.add_argument("--list", action="store_true", help="print the available song folders and exit")
@@ -293,14 +171,13 @@ def main():
             print(folder.name)
         return
     selectors = (read_order(args.order) if args.order else []) + args.songs
-    songs = pick(folders, selectors)
-    if not songs:
+    chosen = pick(folders, selectors)
+    if len(chosen) < 1:
         sys.exit(f"No song folders found in {root}")
     output = Path(args.output) if args.output else root.parent / "Stem Set.als"
     if output.exists() and not args.force:
         sys.exit(f"{output} exists; pass --force to overwrite")
-    render_root = Path(args.rendered) if args.rendered else root.parent / "rendered-stems"
-    build(songs, output, args.tempo, args.gap_bars, args.unfold, render_root.resolve(), args.silence_db, args.format)
+    build(chosen, output, args)
 
 
 if __name__ == "__main__":
