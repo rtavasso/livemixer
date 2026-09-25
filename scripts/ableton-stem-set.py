@@ -145,8 +145,11 @@ def build(songs, output, tempo, gap_bars, unfold):
     group_template, stem_template = tracks.find("GroupTrack"), tracks.find("AudioTrack")
     tracks.remove(group_template)
     tracks.remove(stem_template)
+    # Group and audio tracks must precede the return tracks in <Tracks>.
+    position = 0
     next_pointee = int(live_set.find("NextPointeeId").get("Value"))
-    next_track = 100
+    next_track = 1 + max(int(t.get("Id")) for t in live_set.iter() if t.tag in ("AudioTrack", "GroupTrack", "ReturnTrack", "MidiTrack"))
+    next_track = max(next_track, 100)
     locators = live_set.find("Locators/Locators")
     set_tempo(live_set, tempo)
     output_dir = output.parent.resolve()
@@ -163,7 +166,8 @@ def build(songs, output, tempo, gap_bars, unfold):
         group.find("Color").set("Value", str(color))
         group.find("TrackUnfolded").set("Value", "true" if unfold else "false")
         next_pointee = renumber(group, next_pointee)
-        tracks.append(group)
+        tracks.insert(position, group)
+        position += 1
         add_locator(locators, index, beat, f"SONG: {name}")
 
         longest = 0.0
@@ -179,7 +183,8 @@ def build(songs, output, tempo, gap_bars, unfold):
             seconds = fill_clip(clip, stem.resolve(), stem.stem, color, beat, tempo, output_dir)
             longest = max(longest, seconds)
             next_pointee = renumber(track, next_pointee)
-            tracks.append(track)
+            tracks.insert(position, track)
+            position += 1
         print(f"{beat / 4 + 1:>6.0f}.1.1  {name}  ({len(stems)} stems, {int(longest // 60)}:{longest % 60:04.1f})")
         end = beat + longest * tempo / 60
         beat = (int(end // 4) + (end % 4 > 0) + gap_bars) * 4.0
