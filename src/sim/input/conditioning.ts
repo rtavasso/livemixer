@@ -49,6 +49,15 @@ export const trackerSettingsSchema = z.object({
   /** The scan is resampled to this grid; 192×144 keeps finger-level detail from a bridge sending 160×120 or more. */
   surfaceWidth: z.number().int().min(8).max(512).default(192),
   surfaceHeight: z.number().int().min(8).max(512).default(144),
+  /**
+   * Teleport guard: a hand seen again after a gap (longer than `teleportGapMs` and than 2.5 of its
+   * own frame intervals) further than `teleportDistance` (sim units) from where it was restarts at
+   * the new place with zero velocity for `teleportSettleMs`, so a tracking glitch never reads as a
+   * fast movement.
+   */
+  teleportDistance: z.number().positive().default(.12),
+  teleportGapMs: z.number().min(0).default(60),
+  teleportSettleMs: z.number().min(0).default(150),
 }).strict();
 export type TrackerSettings = z.infer<typeof trackerSettingsSchema>;
 export const DEFAULT_TRACKER_SETTINGS: TrackerSettings = trackerSettingsSchema.parse({});
@@ -78,6 +87,8 @@ interface Track {
   firstSeenMs: number;
   lastSeenMs: number;
   present: boolean;
+  /** Velocity is held at zero until this time (teleport guard). */
+  settleUntilMs?: number;
   filters: [OneEuro, OneEuro, OneEuro];
   pushFilter: OneEuro;
   position: Vec3;
@@ -171,13 +182,28 @@ export class HandTracker {
       this.tracks.set(o.id, track);
       return;
     }
+    const gapMs = now - track.lastSeenMs;
+    const jump = Math.hypot(o.position.x - track.position.x, o.position.y - track.position.y, o.position.z - track.position.z);
+    if (gapMs > Math.max(s.teleportGapMs, 2.5 * track.intervalMs) && jump > s.teleportDistance) {
+      track.filters.forEach((f, i) => f.reset([o.position.x, o.position.y, o.position.z][i]));
+      track.pushFilter.reset(o.position.z);
+      track.position = { ...o.position }; track.push = o.position.z;
+      track.velocity = { x: 0, y: 0, z: 0 };
+      track.settleUntilMs = now + s.teleportSettleMs;
+      track.extent = o.extent ?? defaultExtent(o.position);
+      track.openness = o.openness ?? track.openness; track.pinch = o.pinch ?? track.pinch; track.confidence = o.confidence;
+      track.points = o.points ?? track.points; track.capsules = o.capsules ?? track.capsules; track.rawPosition = o.position;
+      track.lastSeenMs = now; track.lastFilterMs = now;
+      return;
+    }
     const dt = Math.max(1e-3, (now - track.lastFilterMs) / 1000);
     track.intervalMs += .2 * ((now - track.lastSeenMs) - track.intervalMs);
     const previous = track.position;
     const position = { x: track.filters[0].filter(o.position.x, dt), y: track.filters[1].filter(o.position.y, dt), z: track.filters[2].filter(o.position.z, dt) };
     const instantaneous = { x: (position.x - previous.x) / dt, y: (position.y - previous.y) / dt, z: (position.z - previous.z) / dt };
     const k = 1 - Math.exp(-dt / s.velocityTau);
-    track.velocity = { x: track.velocity.x + k * (instantaneous.x - track.velocity.x), y: track.velocity.y + k * (instantaneous.y - track.velocity.y), z: track.velocity.z + k * (instantaneous.z - track.velocity.z) };
+    track.velocity = track.settleUntilMs !== undefined && now < track.settleUntilMs ? { x: 0, y: 0, z: 0 }
+      : { x: track.velocity.x + k * (instantaneous.x - track.velocity.x), y: track.velocity.y + k * (instantaneous.y - track.velocity.y), z: track.velocity.z + k * (instantaneous.z - track.velocity.z) };
     track.position = position;
     track.push = track.pushFilter.filter(o.position.z, dt);
     track.extent = o.extent ?? defaultExtent(position);
