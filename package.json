@@ -24,6 +24,7 @@
     "ableton:bridge": "uv run scripts/ableton-bridge.py",
     "ableton:device": "python3 scripts/build-ableton-device.py",
     "test:ableton": "python3 -m unittest discover -s tests -p 'test_ableton_bridge.py' && vitest run tests/ableton-controls.test.ts",
+    "test:ableton-set": "python3 -m unittest discover -s tests -p 'test_ableton_transitions.py' && python3 -m unittest discover -s tests -p 'test_ableton_set_xml.py'",
     "benchmark:sim": "tsx scripts/sim-benchmark.ts"
   },
   "dependencies": {
