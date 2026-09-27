@@ -16,3 +16,10 @@ export function smooth(previous: number, target: number, elapsedMs: number): num
   // repeats enabled indefinitely after a gesture has settled.
   return Math.abs(next - target) < .001 ? target : next;
 }
+/** The simulation-page message relaying Live's transport from a bridge status state, or null when unusable. */
+export function musicRelay(state: unknown): { direction: 'inbound'; message: { type: 'music'; beat: number; playing: boolean } } | null {
+  if (!state || typeof state !== 'object') return null;
+  const { beat, playing } = state as { beat?: unknown; playing?: unknown };
+  if (typeof beat !== 'number' || !Number.isFinite(beat)) return null;
+  return { direction: 'inbound', message: { type: 'music', beat, playing: Boolean(playing) } };
+}

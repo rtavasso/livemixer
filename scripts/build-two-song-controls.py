@@ -61,5 +61,10 @@ s=s.replace("function tick(){try{if(!refs||!automatic)return;", "function tick()
 s=s.replace("t-(t>=308?308:0)","localtime(t)")
 s=s.replace("if(refs)for(var k in refs)v.targets[k]=Number(scalar(refs[k],'value'));", "if(refs)for(var k in refs){var p=refs[k];v.targets[k]=p instanceof Array?p.map(function(x){return Number(scalar(x,'value'));}):Number(scalar(p,'value'));}")
 s=s[:s.index('function finish_setup()')]
-(out/'two-song-fx.js').write_text(s);save('LiveMixer Two Song FX.amxd',p)
+# two-song-fx.js is maintained by hand since the living installation (arrangement balance, FX QUIET zones,
+# watchdog): generate it only when it is missing, never over the maintained copy.
+fx=out/'two-song-fx.js'
+if fx.exists():print('kept the maintained',fx.name,'(delete it to regenerate the original derivation)')
+else:fx.write_text(s)
+save('LiveMixer Two Song FX.amxd',p)
 print(out)
