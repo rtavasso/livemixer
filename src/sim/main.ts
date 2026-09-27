@@ -3,6 +3,8 @@ import { SettingsStore } from './host/settings';
 import type { Overlay } from './ui/overlay';
 import { SimulationPlayer } from './player';
 import { PatchEditor } from '../integration/patch-editor';
+import { SIMULATIONS } from './host/registry';
+import { rotationFromUrl, SimRotation } from './host/rotation';
 
 const root = document.getElementById('stage-root') as HTMLElement;
 const video = document.getElementById('webcam') as HTMLVideoElement;
@@ -20,6 +22,18 @@ const showCursor = () => { document.body.classList.remove('sim-idle'); if (curso
 window.addEventListener('pointermove', showCursor); showCursor();
 
 player.setActive(true);
+
+// Optional timer rotation for a long show: sim.html?rotate=MINUTES&rotation=tide,lantern,murmuration
+const rotationSettings = rotationFromUrl(location.search, SIMULATIONS.map(s => s.id));
+if (rotationSettings) {
+  const rotation = new SimRotation(rotationSettings, host.simulation.id);
+  if (host.simulation.id !== rotation.current) host.selectSimulation(rotation.current);
+  setInterval(() => {
+    const { opacity, switchTo } = rotation.tick(performance.now(), host.state().tracked.presence);
+    if (switchTo) host.selectSimulation(switchTo);
+    root.style.opacity = String(opacity);
+  }, 100);
+}
 // Only persist on hide: disposing here would leave a dead page after a back/forward-cache restore.
 window.addEventListener('pagehide', () => settings.flush());
 
