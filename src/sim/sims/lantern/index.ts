@@ -1,25 +1,52 @@
 /**
- * Lantern (placeholder: replaced by the full simulation). See docs/LIVING.md.
+ * Lantern: one translucent jellyfish, glowing on black, that swims with the music.
+ *
+ * Its bell contracts once every `pulseBeats` beats of Live's transport (a free ~70 bpm breath
+ * without music), and each contraction is the jet that moves it. It wanders the active area; a
+ * still hand earns its trust (the shared `Mood`) and it settles just above it so its verlet
+ * tentacles fall over the fingers (real collisions against the hand's capsules). A slow stroke
+ * against the bell brightens it, a poke makes it flinch, and repeated fast motion sends it to a
+ * far corner, dim, until calm returns. Its glow also rises with presence (the vocal gate).
+ *
+ * Physics and mind: creature.ts (plain TypeScript, unit-tested). Drawing: render.ts.
+ * See docs/LIVING.md.
  */
 import { defineSimulation } from '../../core/types';
-import { bindScreen } from '../../gl/fbo';
-import { LIVING_SIGNALS } from '../living';
+import { areaUniform, LIVING_SIGNALS, pictureHands } from '../living';
+import { DEFAULT_LANTERN, Lantern, MAX_TENTACLES } from './creature';
+import { LanternRenderer } from './render';
 
 export default defineSimulation({
   id: 'lantern',
   title: 'Lantern',
   description: 'One translucent jellyfish that pulses with the music, drifts to a still hand and drapes its tentacles over it.',
   hologramFrame: 'wall',
-  params: {},
+  params: {
+    color: { kind: 'color', default: '#8b5cff', label: 'Rim colour', description: 'Colour of the bell\'s skin, margin and tentacles.' },
+    core: { kind: 'color', default: '#ffae6b', label: 'Core colour', description: 'Colour of the light inside: gonads, core glow and oral arms.' },
+    size: { kind: 'number', default: DEFAULT_LANTERN.size, min: .06, max: .22, step: .005, label: 'Bell size', description: 'Half-width of the bell, in canvas heights.' },
+    tentacles: { kind: 'number', default: DEFAULT_LANTERN.tentacles, min: 6, max: MAX_TENTACLES, step: 1, label: 'Tentacles', description: 'Number of trailing tentacles (plus four oral arms).' },
+    length: { kind: 'number', default: DEFAULT_LANTERN.length, min: .15, max: .7, step: .01, label: 'Tentacle length', description: 'Typical tentacle length, in canvas heights.' },
+    pulseBeats: { kind: 'number', default: DEFAULT_LANTERN.pulseBeats, min: 1, max: 8, step: 1, unit: 'beats', label: 'Beats per pulse', description: 'One contraction (one jet) every this many beats of the music; fear halves it.' },
+    glow: { kind: 'number', default: DEFAULT_LANTERN.glow, min: .2, max: 2, step: .05, label: 'Glow', description: 'Overall brightness.' },
+  },
   signals: LIVING_SIGNALS,
   create(ctx) {
-    const gl = ctx.gl;
-    let presence = 0;
+    const creature = new Lantern(ctx.aspect);
+    const renderer = new LanternRenderer(ctx);
     return {
-      step(input) { presence = input.presence; },
-      render(frame) { bindScreen(gl, frame.width, frame.height); gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT); },
-      signals() { return { presence, reach: 0, lift: 0, closeness: 0, agitation: 0 }; },
-      dispose() {},
+      step(input, params) {
+        creature.setFrame(ctx.aspect, areaUniform(ctx.activeArea));
+        const { hands, primary } = pictureHands(input);
+        creature.step({ dt: input.dt, hands, primary, presence: input.presence, music: input.music }, params);
+      },
+      render(frame, params) {
+        renderer.render(creature, frame.width, frame.height, frame.aspect, frame.time, params);
+      },
+      signals() {
+        return { presence: creature.presence, reach: creature.reach, lift: creature.lift, closeness: creature.closeness.value, agitation: creature.agitation.value };
+      },
+      dispose() { renderer.dispose(); },
     };
   },
 });
