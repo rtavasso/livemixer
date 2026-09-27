@@ -4,10 +4,18 @@ The template (ableton-templates/stem-set.als, saved by Live 12.4) holds one
 group track, one audio track routed into it, and two return tracks. Every
 automation or modulation target in a clone gets a fresh set-wide Id below
 NextPointeeId; group and stem tracks are inserted before the return tracks.
+
+A living set (`write_mix(..., living=...)`) adds the installation's effects
+from ableton-templates/living.xml (see scripts/extract-living-templates.py):
+each song group holds DRUM FX / Bass / TEXTURE FX (Auto Filter) / VOCALS
+(Vocal Presence utility) like the hand-built sets, the returns become the dub
+echo and halo reverb, Main gets Space, Mix Gain, a limiter and the LiveMixer
+Living FX Max device, and every transition is marked FX QUIET … FX ON.
 """
 import copy
 import gzip
 import os
+import shutil
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -53,15 +61,22 @@ class LiveSet:
         self.position += 1
         return track
 
-    def add_group(self, name, color, unfold=False, eq=False):
+    def add_group(self, name, color, unfold=False, eq=False, parent=None, devices=()):
         group = copy.deepcopy(self.group_template)
         _set_name(group, name)
         group.find("Color").set("Value", str(color))
         group.find("TrackUnfolded").set("Value", "true" if unfold else "false")
+        if parent is not None:
+            group.find("TrackGroupId").set("Value", parent.get("Id"))
+        chain = group.find("DeviceChain/DeviceChain/Devices")
         if eq:
             device = copy.deepcopy(self.eq_template)
             device.set("Id", "0")
-            group.find("DeviceChain/DeviceChain/Devices").append(device)
+            chain.append(device)
+        for index, device in enumerate(devices, start=len(chain)):
+            device = copy.deepcopy(device)
+            device.set("Id", str(index))
+            chain.append(device)
         return self._insert(group)
 
     def add_stem(self, group, name, color):
@@ -157,7 +172,35 @@ class LiveSet:
         for tag, value in (("LomId", "0"), ("Time", repr(float(beat))), ("Name", name), ("Annotation", ""), ("IsSongStart", "false")):
             ET.SubElement(locator, tag, Value=value)
 
+    def use_returns(self, returns):
+        """Replace the template's return tracks with `returns` (same count, so every send still has its return)."""
+        current = self.tracks.findall("ReturnTrack")
+        if len(current) != len(returns):
+            raise ValueError(f"expected {len(current)} return tracks, got {len(returns)}")
+        for old, new in zip(current, returns):
+            new = copy.deepcopy(new)
+            new.set("Id", old.get("Id"))
+            self._renumber(new)
+            index = list(self.tracks).index(old)
+            self.tracks.remove(old)
+            self.tracks.insert(index, new)
+
+    def add_main_devices(self, devices):
+        chain = self.live_set.find("MainTrack/DeviceChain/DeviceChain/Devices")
+        for device in devices:
+            device = copy.deepcopy(device)
+            device.set("Id", str(len(chain)))
+            self._renumber(device)
+            chain.append(device)
+            yield device
+
     def write(self, output):
+        locators = self.live_set.find("Locators/Locators")
+        ordered = sorted(locators, key=lambda l: float(l.find("Time").get("Value")))
+        for index, locator in enumerate(ordered):
+            locators.remove(locator)
+            locator.set("Id", str(index))
+            locators.append(locator)
         self.live_set.find("NextPointeeId").set("Value", str(self.next_pointee))
         output.parent.mkdir(parents=True, exist_ok=True)
         with gzip.open(output, "wt", encoding="utf-8") as f:
@@ -165,18 +208,82 @@ class LiveSet:
             f.write(ET.tostring(self.root, encoding="unicode"))
 
 
-def write_mix(plan, envelopes, rendered, output, colors, unfold=False):
-    """Write a planned mix. `rendered` is one (stems [(name, path)], frames, rate) per song."""
+LIVING_FX = Path(__file__).resolve().parent.parent.parent / "devices" / "LiveMixer Living FX"
+# Sub-groups of a living song group, by stem role, in track order; None: directly in the song group.
+LIVING_GROUPS = [(tx.DRUMS, "DRUM FX"), (tx.BASS, None), (tx.MELODIC, "TEXTURE FX"), (tx.VOCALS, "VOCALS")]
+
+
+class Living:
+    """The installation's devices, from ableton-templates/living.xml."""
+
+    def __init__(self, template=TEMPLATES / "living.xml", device_dir=LIVING_FX):
+        root = ET.parse(template).getroot()
+        self.texture_filter = root.find("TextureFilter")[0]
+        self.vocal_presence = root.find("VocalPresence")[0]
+        self.returns = list(root.find("Returns"))
+        self.main = list(root.find("Main"))
+        self.device_dir = Path(device_dir)
+
+    def vocal_device(self, first):
+        """Vocal Presence; only the first song's keeps the MIDI mapping (the Max device mirrors it to the rest)."""
+        device = copy.deepcopy(self.vocal_presence)
+        if not first:
+            for parent in device.iter():
+                for key_midi in parent.findall("KeyMidi"):
+                    parent.remove(key_midi)
+        return device
+
+    def install_device(self, output_dir):
+        """Copy the Max device next to the set; returns the .amxd path."""
+        target = output_dir / "LiveMixer Living FX"
+        target.mkdir(parents=True, exist_ok=True)
+        for name in ("LiveMixer Living FX.amxd", "living-fx.js"):
+            shutil.copy2(self.device_dir / name, target / name)
+        return target / "LiveMixer Living FX.amxd"
+
+
+def _point_max_device(device, amxd, output_dir):
+    ref = device.find("PatchSlot/Value/MxPatchRef")
+    file_ref = ref.find("FileRef")
+    file_ref.find("RelativePathType").set("Value", "1")
+    file_ref.find("RelativePath").set("Value", os.path.relpath(amxd, output_dir))
+    file_ref.find("Path").set("Value", str(amxd))
+    file_ref.find("OriginalFileSize").set("Value", str(amxd.stat().st_size))
+    file_ref.find("OriginalCrc").set("Value", "0")
+    ref.find("LastModDate").set("Value", str(int(amxd.stat().st_mtime)))
+
+
+def quiet_zones(plan):
+    """(start, end) beats of every overlapping transition: the effects hold at home while songs hand over."""
+    return [(t.start, t.start + 4 * t.bars) for t in plan.transitions if t.bars > 0]
+
+
+def write_mix(plan, envelopes, rendered, output, colors, unfold=False, living=None):
+    """Write a planned mix. `rendered` is one (stems [(name, path)], frames, rate) per song.
+
+    `living`: a `Living` to add the installation's effects, or None for a plain stem set.
+    """
     live = LiveSet()
     output_dir = output.parent.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
     groups, stem_tracks = [], {}
     for index, ((stems, frames, rate), song) in enumerate(zip(rendered, plan.songs)):
         color = colors[index % len(colors)]
         group = live.add_group(song.name, color, unfold=unfold, eq=True)
         groups.append(group)
         g = plan.grids[index]
+        parents = {}
+        if living is not None:
+            # Role order, each sub-group created just before its first stem: Live lists a group's tracks under it.
+            order = [role for role, _ in LIVING_GROUPS]
+            stems = sorted(stems, key=lambda s: order.index(tx.stem_role(s[0])))
         for stem_name, path in stems:
-            track = live.add_stem(group, stem_name, color)
+            role = tx.stem_role(stem_name)
+            if living is not None and role not in parents:
+                sub = dict(LIVING_GROUPS)[role]
+                devices = {tx.MELODIC: [living.texture_filter], tx.VOCALS: [living.vocal_device(index == 0)]}.get(role, [])
+                parents[role] = group if sub is None else live.add_group(sub, color, unfold=unfold, parent=group, devices=devices)
+            track = live.add_stem(parents.get(role, group), stem_name, color)
             mode = WARP_BEATS if tx.stem_role(stem_name) == tx.DRUMS else WARP_COMPLEX_PRO
             live.set_clip(track, Path(path).resolve(), frames, rate, stem_name, color, output_dir,
                           start=plan.origins[index] + g.start_beat, end=plan.clip_ends[index],
@@ -194,4 +301,13 @@ def write_mix(plan, envelopes, rendered, output, colors, unfold=False):
             live.add_envelope(groups[target[1]], live.eq_low_target(groups[target[1]]), initial, points)
     for beat, song in plan.locators:
         live.add_locator(beat, f"SONG: {song.name} · {song.native_bpm:.0f} BPM · {song.camelot or '?'}")
+    if living is not None:
+        live.use_returns(living.returns)
+        amxd = living.install_device(output_dir)
+        for device in live.add_main_devices(living.main):
+            if device.tag == "MxDeviceAudioEffect":
+                _point_max_device(device, amxd, output_dir)
+        for start, end in quiet_zones(plan):
+            live.add_locator(start, "FX QUIET")
+            live.add_locator(end, "FX ON")
     live.write(output)

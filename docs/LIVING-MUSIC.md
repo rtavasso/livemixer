@@ -39,9 +39,21 @@ These values are defaults in `DEFAULT_MAPPING` and `DEFAULT_GOVERNOR`.
 
 To add one, create a locator in Live's Arrangement and name it **`FX QUIET`**. Anything after that prefix is allowed, for example `FX QUIET drum switch`. The zone runs from that locator to the next locator of any name. If there is no later locator, it runs to the end of the set. Inside a zone, the depth, space and arrangement effects fade out over 2 beats, and they fade back in over 2 beats after the zone ends. Vocals are not affected. Put the locator about half a bar before a pre-mixed transition so the effects are gone when the transition starts. Press **Refresh** on the device after adding or moving locators. The device status shows how many zones it found.
 
+## Generated stem sets (`scripts/ableton-stem-set.py`)
+
+The set builder adds the installation to every set it writes unless `--plain` is given:
+
+- Each song group holds **DRUM FX** (Kick, Snare, Other Drums), **04 Bass**, **TEXTURE FX** (Guitar, Piano, Melodies; Auto Filter "Velvet Dive") and **VOCALS** (Lead, Background; Utility "Vocal Presence"), the layout of the hand-built sets. The song group keeps the EQ Three and the transition automation.
+- The returns are **A-DUB THROW** (Echo) and **B-HALO BLOOM** (Hybrid Reverb); Main carries **Space** (Reverb, MIDI CC21), **Mix Gain** (Utility, CC23), the Limiter and **LiveMixer Living FX**.
+- Only the first song's Vocal Presence is mapped to CC20 (Live maps a control to one parameter); Living FX mirrors its gain to every other VOCALS group.
+- Every overlapping transition is wrapped in `FX QUIET` … `FX ON` locators, so the box never colours a handover. In Living FX a zone ends at the next locator that is **not** a `SONG:` locator (the incoming song's locator sits inside the zone).
+- `LiveMixer Living FX.amxd` and `living-fx.js` are copied into a `LiveMixer Living FX` folder beside the set. The device drives all song groups together (only the playing song is heard), has no one-shots, and reports Live's position to the bridge (UDP 7401) so the simulations follow the beat.
+
+The device templates are extracted from the hand-built Drum Transition set: `python3 scripts/extract-living-templates.py` (writes `scripts/ableton-templates/living.xml`). Rebuild the device with `npm run ableton:living-fx`. Tests: `npm run test:ableton-set` (set structure) and `node --test tests/living-fx.test.mjs` (the device script against a mock of Live's API).
+
 ## Try it
 
-1. In Live, open `LiveMixer - Two Song Trial.als`. On Main, press **Refresh** on **LiveMixer Two Song FX**, or delete it and add it again from the project's Presets, so it loads the new `two-song-fx.js`. Its status should read `Ready - both song groups` and, when there are zones, `· N FX QUIET`. If it shows `balance off`, the DRUM FX groups were not found.
+1. In Live, open a set built by `scripts/ableton-stem-set.py`; **LiveMixer Living FX** on Main should read `Ready · N songs · M FX QUIET`. Or, for the hand-built set, open `LiveMixer - Two Song Trial.als`. On Main, press **Refresh** on **LiveMixer Two Song FX**, or delete it and add it again from the project's Presets, so it loads the new `two-song-fx.js`. Its status should read `Ready - both song groups` and, when there are zones, `· N FX QUIET`. If it shows `balance off`, the DRUM FX groups were not found.
 2. In this repository, run `npm run dev` and, in another terminal, `uv run scripts/ableton-bridge.py`.
 3. Open http://127.0.0.1:4178/sim.html?sim=tide (or `lantern` or `murmuration`).
 4. In the same browser, open http://127.0.0.1:4178/ableton.html and click **Connect to Live**. **Living** is selected automatically once the simulation's schema arrives. The meters show the song axes and the incoming signals.
@@ -64,4 +76,4 @@ To add one, create a locator in Live's Arrangement and name it **`FX QUIET`**. A
 
 - Adjust DRUM FX or TEXTURE FX group volumes only while the song is at home, then press **Refresh**. That reading becomes the new home.
 - Press **Release & reset** on the controls page before saving the set, so that offset group volumes are not saved.
-- `scripts/build-two-song-controls.py` regenerates `two-song-fx.js` from the FX Playground source. Re-running it would remove these changes.
+- `scripts/build-two-song-controls.py` keeps the maintained `two-song-fx.js`; delete the file first only if you want its original derivation back.

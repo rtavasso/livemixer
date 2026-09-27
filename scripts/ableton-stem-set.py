@@ -13,6 +13,12 @@ top-level group named "Artist - Title" containing one audio track per stem.
    boundaries, the tempo ramps from one song to the next across each
    overlap, and each transition (stem handover, crossfade or EQ low swap) is
    written as automation. See docs/superpowers/specs/2026-09-24-ableton-transitions-design.md.
+4. Living installation (default; --plain leaves it out): each song group gets
+   DRUM FX / Bass / TEXTURE FX / VOCALS with the installation's filter and
+   vocal-presence devices, the returns become the dub echo and halo reverb,
+   Main gets Space, Mix Gain, a limiter and LiveMixer Living FX (copied next
+   to the set), and every transition is marked FX QUIET … FX ON so the box
+   never colours a handover. See docs/LIVING-MUSIC.md.
 
 Renders and analyses are cached per song, so reordering is fast. The set is
 written with a report of every transition, also saved as <set>.transitions.json.
@@ -33,7 +39,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ableton_set import transitions as tx  # noqa: E402
-from ableton_set.als import write_mix  # noqa: E402
+from ableton_set.als import Living, write_mix  # noqa: E402
 from ableton_set.analysis import analyze_all  # noqa: E402
 from ableton_set.render import AUDIO, render_song  # noqa: E402
 
@@ -124,7 +130,8 @@ def build(folders, output, args):
     plan = tx.plan(songs, args.overlap_bars)
     envelopes = tx.automation(plan)
 
-    write_mix(plan, envelopes, [(stems, frames, rate) for _, stems, frames, rate in rendered], output, COLORS, args.unfold)
+    write_mix(plan, envelopes, [(stems, frames, rate) for _, stems, frames, rate in rendered], output, COLORS, args.unfold,
+              living=None if args.plain else Living())
 
     report = []
     print()
@@ -147,6 +154,8 @@ def build(folders, output, args):
     output.with_suffix(".transitions.json").write_text(json.dumps(report, indent=2, ensure_ascii=False))
     total = plan.clip_ends[-1]
     print(f"\nWrote {output} ({len(songs)} songs, ends at bar {bar(total)})")
+    if not args.plain:
+        print("Living installation: LiveMixer Living FX copied beside the set; start the bridge and the controls page in Living mode.")
 
 
 def main():
@@ -160,6 +169,7 @@ def main():
     parser.add_argument("--silence-db", type=float, default=-60, help="level below which a stem's tail counts as silence (dBFS)")
     parser.add_argument("--rendered", help="folder for equal-length stems (default: <stems>/../rendered-stems)")
     parser.add_argument("--unfold", action="store_true", help="leave song groups expanded")
+    parser.add_argument("--plain", action="store_true", help="leave out the living installation's groups, effects and FX QUIET markers")
     parser.add_argument("--force", action="store_true", help="overwrite an existing set")
     parser.add_argument("--list", action="store_true", help="print the available song folders and exit")
     args = parser.parse_args()
