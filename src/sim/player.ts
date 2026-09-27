@@ -1,4 +1,5 @@
 import './ui/overlay.css';
+import { HologramCalibration } from './ui/hologram';
 import { SimHost, type HostOptions } from './host/app';
 import type { SettingsStore } from './host/settings';
 import { Overlay } from './ui/overlay';
@@ -7,6 +8,7 @@ import { Overlay } from './ui/overlay';
 export class SimulationPlayer {
   readonly host: SimHost;
   readonly overlay: Overlay;
+  readonly hologram: HologramCalibration;
   private active = false;
   private readonly keyboardRoot: HTMLElement | Document;
   private keydown = (event: KeyboardEvent) => {
@@ -15,6 +17,7 @@ export class SimulationPlayer {
     if (key === 'h') { this.overlay.visible = !this.overlay.visible; this.settings.update(s => { s.overlay = this.overlay.visible; }); }
     else if (key === 'f') this.host.toggleFullscreen();
     else if (key === 'c') this.overlay.captureNext();
+    else if (key === 'x') this.hologram.toggle();
     else if (/^[1-9]$/.test(key)) this.overlay.selectByIndex(Number(key) - 1);
     else return;
     event.preventDefault();
@@ -25,6 +28,8 @@ export class SimulationPlayer {
   constructor(root: HTMLElement, video: HTMLVideoElement, overlayRoot: HTMLElement, readonly settings: SettingsStore, options: HostOptions & { keyboardRoot?: HTMLElement | Document } = {}) {
     this.host = new SimHost(root, video, settings, undefined, options);
     this.overlay = new Overlay(overlayRoot, this.host, video);
+    this.hologram = new HologramCalibration(this.host, root.ownerDocument.body);
+    this.overlay.onCalibrateHologram = () => this.hologram.show();
     this.overlay.visible = settings.value.overlay;
     this.host.canvas.tabIndex = 0;
     this.keyboardRoot = options.keyboardRoot ?? root;
@@ -35,6 +40,6 @@ export class SimulationPlayer {
   dispose() {
     document.removeEventListener('visibilitychange', this.visibility);
     this.keyboardRoot.removeEventListener('keydown', this.keydown as EventListener);
-    this.overlay.dispose(); this.host.dispose();
+    this.hologram.dispose(); this.overlay.dispose(); this.host.dispose();
   }
 }

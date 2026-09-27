@@ -2011,5 +2011,56 @@ class UprightDumpTests(ProtocolAssertions):
             self.assertNotEqual(proc.returncode, 0, flags)
 
 
+class BackgroundModelTests(unittest.TestCase):
+    """The learned empty scene is removed from later frames; only what stands in front of it survives."""
+
+    def scene(self) -> np.ndarray:
+        depth = np.zeros((24, 32), dtype=np.uint16)
+        depth[4:20, 8:24] = 400  # a wall inside the height range
+        depth[0:4, :] = 300      # a shelf
+        return depth
+
+    def test_learning_frames_go_out_empty_then_the_scene_is_removed(self) -> None:
+        model = db.BackgroundModel(seconds=1.0, margin_mm=30.0)
+        self.assertTrue((model.apply(self.scene(), 0.0) == 0).all())
+        self.assertFalse(model.ready)
+        self.assertTrue((model.apply(self.scene(), 0.5) == 0).all())
+        self.assertTrue(model.ready is False)
+        out = model.apply(self.scene(), 1.0)  # learning finishes on this frame; the frame itself is still withheld
+        self.assertTrue(model.ready)
+        self.assertTrue((out == 0).all())
+        self.assertTrue((model.apply(self.scene(), 1.1) == 0).all(), "the static scene must vanish once learned")
+
+    def test_a_hand_in_front_of_the_wall_survives_but_not_within_the_margin(self) -> None:
+        model = db.BackgroundModel(seconds=0.0, margin_mm=30.0)
+        model.apply(self.scene(), 0.0)
+        frame = self.scene()
+        frame[10:14, 12:16] = 340  # 60 mm in front of the wall
+        frame[10:14, 18:22] = 385  # 15 mm in front: within the noise margin
+        out = model.apply(frame, 1.0)
+        self.assertTrue((out[10:14, 12:16] == 340).all())
+        self.assertTrue((out[10:14, 18:22] == 0).all())
+        self.assertEqual(int((out > 0).sum()), 16)
+
+    def test_pixels_the_empty_scene_never_measured_pass_through(self) -> None:
+        model = db.BackgroundModel(seconds=0.0, margin_mm=30.0)
+        model.apply(np.zeros((8, 8), dtype=np.uint16), 0.0)
+        frame = np.zeros((8, 8), dtype=np.uint16)
+        frame[2:6, 2:6] = 350
+        self.assertEqual(int((model.apply(frame, 1.0) > 0).sum()), 16)
+
+    def test_analyzer_option_removes_the_scene_from_the_blobs(self) -> None:
+        box = db.BoxConfig(near_m=0.25, far_m=0.55)
+        config = db.AnalyzerConfig(background_s=0.0, min_pixels=4, morph_iterations=0)
+        analyzer = db.BoxAnalyzer(box, config)
+        scene = self.scene()
+        analyzer.analyze(db.DepthFrame(scene, 0.0))  # learns
+        frame = scene.copy()
+        frame[10:14, 12:16] = 340
+        result = analyzer.analyze(db.DepthFrame(frame, 1.0))
+        self.assertEqual(int(result.stats["pixels"]), 16)
+        self.assertEqual(len(result.blobs), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -54,6 +54,18 @@ export const LEAP_MAPPING: SpaceMapping = {
   z: { from: 'z', low: 1, high: 0, mirror: false },
 };
 
+/**
+ * The hologram frame (see `hologram.ts`: screen x right, screen y down, z = distance from the
+ * picture toward the viewer) onto a top-down water simulation: the screen is the water plane
+ * (x across, z up the screen) and the distance from the picture is the height, so a fingertip on
+ * the picture is in the water and a raised one is above it.
+ */
+export const HOLOGRAM_FLOOR_MAPPING: SpaceMapping = {
+  x: { from: 'x', low: 0, high: 1, mirror: false },
+  y: { from: 'z', low: 0, high: 1, mirror: false },
+  z: { from: 'y', low: 1, high: 0, mirror: false },
+};
+
 /** Unclamped axis map: geometry that may legitimately leave the volume (a forearm, a fingertip past the edge). */
 export function mapAxisOpen(map: AxisMap, value: number): number {
   const t = (value - map.low) / (map.high - map.low);

@@ -87,17 +87,21 @@ def emit(**data):
 
 
 def library():
-    if sys.platform != "win32" or c.sizeof(c.c_void_p) != 8:
-        raise RuntimeError("Leap input currently needs Windows and 64-bit Python. Mouse preview works on any desktop.")
-    folder = Path(os.environ.get("ProgramFiles", "C:/Program Files"))
-    candidates = [Path(os.environ["LEAPC_DLL"])] if os.environ.get("LEAPC_DLL") else [
-        folder / "Ultraleap/LeapSDK/lib/x64/LeapC.dll",
-        folder / "Leap Motion/Core Services/LeapC.dll",
-    ]
+    if c.sizeof(c.c_void_p) != 8:
+        raise RuntimeError("Leap input needs 64-bit Python. Mouse preview works on any desktop.")
+    if os.environ.get("LEAPC_DLL"):
+        candidates = [Path(os.environ["LEAPC_DLL"])]
+    elif sys.platform == "win32":
+        folder = Path(os.environ.get("ProgramFiles", "C:/Program Files"))
+        candidates = [folder / "Ultraleap/LeapSDK/lib/x64/LeapC.dll", folder / "Leap Motion/Core Services/LeapC.dll"]
+    elif sys.platform == "darwin":
+        candidates = [Path("/Applications/Ultraleap Hand Tracking.app/Contents/LeapSDK/lib/libLeapC.dylib")]
+    else:
+        candidates = [Path("/usr/lib/ultraleap-hand-tracking-service/libLeapC.so")]
     path = next((p for p in candidates if p.is_file()), None)
     if path is None:
-        raise RuntimeError("LeapC.dll was not found. Install Ultraleap Hand Tracking, or set LEAPC_DLL to its full path.")
-    dll = c.WinDLL(str(path))
+        raise RuntimeError("The LeapC library was not found. Install Ultraleap Hand Tracking, or set LEAPC_DLL to its full path.")
+    dll = (c.WinDLL if sys.platform == "win32" else c.CDLL)(str(path))
     signatures = {
         "LeapCreateConnection": ([c.c_void_p, c.POINTER(c.c_void_p)], c.c_uint32),
         "LeapOpenConnection": ([c.c_void_p], c.c_uint32),

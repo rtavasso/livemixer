@@ -12,6 +12,7 @@
 import { z } from 'zod';
 import type { OccupancyField, SurfaceField, Vec3, VolumeField } from '../core/types';
 import { mapObservation, mapOccupancy, mapSurface, mapVoxels, type SpaceMapping } from './mapping';
+import { rectifyObservation, rectifySurface, type Affine3 } from './hologram';
 import type { Box3, Capsule, HandObservation, HandState, InputFrame } from './types';
 
 export const trackerSettingsSchema = z.object({
@@ -125,6 +126,12 @@ export class HandTracker {
   private stats: Record<string, number> = {};
   discarded = 0;
 
+  /**
+   * Optional hologram rectification applied to hands and the scan BEFORE `mapping` (see `hologram.ts`).
+   * The occupancy grid and voxels are not rectified: they stay in the camera's view.
+   */
+  rectify: Affine3 | null = null;
+
   constructor(public mapping: SpaceMapping, public settings: TrackerSettings = DEFAULT_TRACKER_SETTINGS) {}
 
   /** Forget everything, e.g. when the source or mapping changes. */
@@ -144,12 +151,12 @@ export class HandTracker {
     if (frame.stats) this.stats = { ...frame.stats };
     for (const raw of frame.hands) {
       if (raw.confidence < s.minConfidence || !isFinitePoint(raw.position)) continue;
-      const o = mapObservation(this.mapping, raw);
+      const o = mapObservation(this.mapping, this.rectify ? rectifyObservation(this.rectify, raw) : raw);
       this.observe(o, now);
     }
     if (frame.occupancy) { this.occupancy = mapOccupancy(this.mapping, frame.occupancy, s.occupancyWidth, s.occupancyHeight); this.occupancyAtMs = now; }
     if (frame.voxels) { this.volume = mapVoxels(this.mapping, frame.voxels, s.volumeNx, s.volumeNy, s.volumeNz); this.volumeAtMs = now; }
-    if (frame.surface) { this.surface = mapSurface(this.mapping, frame.surface, s.surfaceWidth, s.surfaceHeight); this.surfaceAtMs = now; }
+    if (frame.surface) { this.surface = this.rectify ? rectifySurface(this.rectify, this.mapping, frame.surface, s.surfaceWidth, s.surfaceHeight) : mapSurface(this.mapping, frame.surface, s.surfaceWidth, s.surfaceHeight); this.surfaceAtMs = now; }
     return true;
   }
 

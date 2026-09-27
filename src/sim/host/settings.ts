@@ -10,6 +10,7 @@ import { z } from 'zod';
 import { gestureSettingsSchema } from '../input/gestures';
 import { spaceMappingSchema, DEPTH_MAPPING, IMAGE_MAPPING, LEAP_MAPPING, SCREEN_MAPPING, type SpaceMapping } from '../input/mapping';
 import { trackerSettingsSchema } from '../input/conditioning';
+import { affine3Schema } from '../input/hologram';
 import { DEFAULT_LEAP_BOX, leapBoxSchema } from '../input/leap';
 import type { SourceId } from '../input/types';
 
@@ -31,6 +32,10 @@ export const settingsSchema = z.object({
   solid: z.enum(['both', 'scan', 'skeleton']).default('both'),
   overlay: z.boolean().default(true),
   mappings: z.record(sourceId, spaceMappingSchema).default({}),
+  /** Per-source hologram calibration (source frame → hologram frame), applied before the mapping. */
+  /** The part of the display the hologram actually shows (fractions of the picture), where calibration targets are placed. */
+  hologramArea: z.object({ x0: z.number().min(0).max(1), y0: z.number().min(0).max(1), x1: z.number().min(0).max(1), y1: z.number().min(0).max(1) }).strict().default({ x0: 0, y0: 0, x1: 1, y1: 1 }),
+  holograms: z.record(sourceId, z.object({ affine: affine3Schema, rmsError: z.number().finite(), capturedAt: z.string() }).strict()).default({}),
   params: z.record(z.string(), z.record(z.string(), z.union([z.number(), z.boolean(), z.string()]))).default({}),
   tracker: trackerSettingsSchema.partial().default({}),
   gestures: gestureSettingsSchema.partial().default({}),
