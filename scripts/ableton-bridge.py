@@ -16,18 +16,28 @@ import time
 DEFAULTS = {"vocals": 1., "space": 0., "stutter": 0., "gain": 1.}
 CC = {"vocals": 20, "space": 21, "gain": 23}
 TIMEOUT = 1.5
+FX = ("flicker", "dub", "dive", "halo", "balance")  # Two Song FX: /fx/values on UDP 7403
+FX_HEARTBEAT = .25
+
+
+def unit(name, value):
+    if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
+        raise ValueError(f"{name} must be a finite number from 0 to 1")
+    return float(value)
 
 
 def controls(raw):
     if not isinstance(raw, dict) or raw.get("type") != "controls":
         raise ValueError("Expected a controls message")
-    result = {}
-    for name in DEFAULTS:
-        value = raw.get(name)
-        if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
-            raise ValueError(f"{name} must be a finite number from 0 to 1")
-        result[name] = float(value)
-    return result
+    return {name: unit(name, raw.get(name)) for name in DEFAULTS}
+
+
+def fx_values(raw):
+    """Optional living-mode effects: None when absent, else five validated values in FX order."""
+    fx = raw.get("fx") if isinstance(raw, dict) else None
+    if fx is None: return None
+    if not isinstance(fx, dict): raise ValueError("fx must be an object")
+    return tuple(unit(f"fx.{name}", fx.get(name)) for name in FX)
 
 
 def osc_string(value):
@@ -35,8 +45,8 @@ def osc_string(value):
     return data + b"\0" * (-len(data) % 4)
 
 
-def osc_packet(address, value):
-    return osc_string(address) + osc_string(",f") + struct.pack(">f", value)
+def osc_packet(address, *values):
+    return osc_string(address) + osc_string("," + "f" * len(values)) + b"".join(struct.pack(">f", v) for v in values)
 
 
 def osc_state(packet):
@@ -66,12 +76,21 @@ class Bridge:
         self.last_controls = 0.
         self.value = DEFAULTS.copy()
         self.state, self.last_state = None, 0.
+        self.fx, self.last_fx = None, 0.
+
+    def send_fx(self, now):
+        self.udp.sendto(osc_packet("/fx/values", *self.fx), ("127.0.0.1", 7403)); self.last_fx = now
+
+    def release_fx(self):
+        if self.fx is None: return
+        self.udp.sendto(osc_packet("/fx/release", 1.), ("127.0.0.1", 7403)); self.fx = None
 
     def osc(self, address, value):
         self.udp.sendto(osc_packet("/livemixer/" + address, value), ("127.0.0.1", 7400))
 
     def release(self):
         self.osc("release", 1.)
+        self.release_fx()
         self.value = DEFAULTS.copy()
         for name, cc in CC.items():
             value = round(self.value[name] * 127)
@@ -80,7 +99,7 @@ class Bridge:
         self.owner, self.last_controls = None, 0.
 
     def receive(self, client, message, now):
-        value = controls(message)
+        value, fx = controls(message), fx_values(message)
         if self.owner is not None and self.owner is not client:
             raise ValueError("Another control window is connected")
         self.owner, self.last_controls, self.value = client, now, value
@@ -89,6 +108,8 @@ class Bridge:
             if self.last_midi.get(name) != v:
                 self.midi.send_message([0xBF, cc, v]); self.last_midi[name] = v
         self.osc("stutter", value["stutter"])
+        if fx is None: self.release_fx()
+        elif fx != self.fx: self.fx = fx; self.send_fx(now)
 
     def tick(self, now):
         if self.owner is None: return
@@ -96,6 +117,7 @@ class Bridge:
             self.release()
         else:
             self.osc("stutter", self.value["stutter"])
+            if self.fx is not None and now - self.last_fx >= FX_HEARTBEAT - 1e-6: self.send_fx(now)
 
     def status(self, now):
         fresh = self.state is not None and now - self.last_state < TIMEOUT

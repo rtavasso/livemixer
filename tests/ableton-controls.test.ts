@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { normalize, stutterCount, smooth } from '../src/ableton/controls';
+import { musicRelay, normalize, stutterCount, smooth } from '../src/ableton/controls';
+import { parseInbound } from '../src/sim/telemetry/types';
 
 describe('Ableton controls', () => {
   it('keeps a MIDI midpoint at two sixteenth-note stutters and clamps the endpoints', () => {
@@ -23,5 +24,13 @@ describe('Ableton controls', () => {
     for (let i = 0; i < 10; i++) amount = smooth(amount, 0, 120);
     expect(amount).toBe(0);
     expect(stutterCount(amount)).toBe(0);
+  });
+  it('relays Live\'s transport to the simulation page in the inbound music format', () => {
+    const relay = musicRelay({ repeat: 0, onLeft: 0, offLeft: 0, beat: 12.5, playing: 1, amount: 0, bound: 1 });
+    expect(relay).toEqual({ direction: 'inbound', message: { type: 'music', beat: 12.5, playing: true } });
+    expect(parseInbound(relay!.message)).toEqual(relay!.message);
+    expect(musicRelay({ beat: 0, playing: 0 })!.message.playing).toBe(false);
+    expect(musicRelay(null)).toBeNull();
+    expect(musicRelay({ beat: NaN, playing: 1 })).toBeNull();
   });
 });

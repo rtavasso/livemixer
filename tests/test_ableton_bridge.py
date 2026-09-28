@@ -33,4 +33,50 @@ class BridgeTests(unittest.TestCase):
         with self.assertRaises(ValueError): bridge.receive(second, dict(type='controls', **module.DEFAULTS), 2)
         self.assertIs(bridge.owner, first)
 
+    def test_fx_values_are_validated_before_controlling_any_parameter(self):
+        good = dict(flicker=0, dub=.1, dive=.2, halo=.3, balance=.5)
+        for invalid in [float('nan'), float('inf'), -.1, 1.1, True, '0.5', None]:
+            for key in good:
+                midi, udp = Midi(), UDP(); bridge = module.Bridge(midi, udp)
+                with self.assertRaises(ValueError):
+                    bridge.receive('owner', dict(type='controls', **module.DEFAULTS, fx={**good, key: invalid}), 1)
+                self.assertEqual((midi.messages, udp.messages, bridge.owner), ([], [], None))
+        for invalid in [[0, 0, 0, 0, .5], 'fx', 1, {}]:
+            with self.assertRaises(ValueError): module.fx_values(dict(type='controls', fx=invalid))
+        self.assertIsNone(module.fx_values(dict(type='controls')))
+
+    def test_fx_values_are_sent_on_change_and_as_a_heartbeat(self):
+        udp = UDP(); bridge = module.Bridge(Midi(), udp)
+        fx = dict(flicker=0, dub=.25, dive=.5, halo=.75, balance=.625)
+        bridge.receive('owner', dict(type='controls', **module.DEFAULTS, fx=fx), 10)
+        sent = [m for m, a in udp.messages if a == ('127.0.0.1', 7403)]
+        self.assertEqual(sent, [fx_packet(0, .25, .5, .75, .625)])
+        bridge.receive('owner', dict(type='controls', **module.DEFAULTS, fx=fx), 10.05)
+        self.assertEqual(len(fx_sends(udp)), 1)  # unchanged: no resend
+        bridge.tick(10.1); self.assertEqual(len(fx_sends(udp)), 1)
+        bridge.tick(10.3); self.assertEqual(len(fx_sends(udp)), 2)  # heartbeat 250 ms after the last send
+        bridge.receive('owner', dict(type='controls', **module.DEFAULTS, fx={**fx, 'dive': .6}), 10.31)
+        self.assertEqual(fx_sends(udp)[-1], fx_packet(0, .25, .6, .75, .625))
+
+    def test_fx_release_on_timeout_disconnect_and_when_fx_stops(self):
+        fx = dict(flicker=0, dub=0, dive=0, halo=0, balance=.5)
+        udp = UDP(); bridge = module.Bridge(Midi(), udp)
+        bridge.receive('owner', dict(type='controls', **module.DEFAULTS, fx=fx), 10)
+        bridge.tick(11.5)
+        self.assertEqual(fx_sends(udp)[-1], module.osc_packet('/fx/release', 1.))
+        self.assertIn(b'/livemixer/release', udp.messages[-2][0])
+        bridge.release(); self.assertEqual(fx_sends(udp).count(module.osc_packet('/fx/release', 1.)), 1)  # only once
+        bridge.receive('owner', dict(type='controls', **module.DEFAULTS, fx=fx), 20)
+        bridge.receive('owner', dict(type='controls', **module.DEFAULTS), 20.1)  # left living mode
+        self.assertEqual(fx_sends(udp)[-1], module.osc_packet('/fx/release', 1.))
+        bridge.tick(20.5); self.assertEqual(fx_sends(udp)[-1], module.osc_packet('/fx/release', 1.))  # no heartbeat
+
+    def test_controls_without_fx_never_touch_the_fx_device(self):
+        udp = UDP(); bridge = module.Bridge(Midi(), udp)
+        bridge.receive('owner', dict(type='controls', **module.DEFAULTS), 1); bridge.tick(1.3); bridge.release()
+        self.assertEqual(fx_sends(udp), [])
+
+def fx_sends(udp): return [m for m, a in udp.messages if a == ('127.0.0.1', 7403)]
+def fx_packet(*values): return module.osc_packet('/fx/values', *values)
+
 if __name__ == '__main__': unittest.main()

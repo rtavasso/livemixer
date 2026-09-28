@@ -21,6 +21,7 @@
  * A simulation may use any camera it likes (top-down for a bowl on a table, say);
  * the hand's x, y, z are world coordinates either way.
  */
+import type { MusicClock } from './music';
 import type { HandState } from '../input/types';
 import type { GestureEvent } from '../input/gestures';
 
@@ -114,6 +115,8 @@ export interface SimInput {
    * depth map is available. Null for sources without one.
    */
   surface: SurfaceField | null;
+  /** Live's transport, when the Ableton controls page relays it; null or absent otherwise. */
+  music?: MusicClock | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +146,11 @@ export interface SimContext {
   /** Depth of the volume in uniform units (canvas height = 1). Constant for the life of the instance. */
   depth: number;
   dpr: number;
+  /**
+   * The part of the picture the hologram actually shows, in screen units (0..1, y down), from the
+   * hologram calibration. Absent means the whole canvas. The host updates it in place.
+   */
+  activeArea?: { x0: number; y0: number; x1: number; y1: number };
   quality: Quality;
   capabilities: GlCapabilities;
   /** Report a non-fatal problem to the host (shown in the overlay, sent to telemetry). */
@@ -185,6 +193,12 @@ export interface SimulationDefinition<P extends ParamSpecs = ParamSpecs, S exten
   signals: S;
   /** Physics rate. Defaults to 60. */
   stepHz?: number;
+  /**
+   * How a hologram-calibrated source is mapped for this simulation: `floor` (default) makes the
+   * picture a surface seen from above (water in a bowl); `wall` makes it an upright plane the
+   * visitor reaches through (`HOLOGRAM_WALL_MAPPING`, picture plane at sim z = 0.5).
+   */
+  hologramFrame?: 'floor' | 'wall';
   /** Build GPU resources. `params` holds the resolved initial values (defaults merged with saved overrides). */
   create(context: SimContext, params: ParamValues<P>): SimulationInstance<P, S>;
 }

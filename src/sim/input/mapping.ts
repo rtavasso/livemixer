@@ -66,6 +66,18 @@ export const HOLOGRAM_FLOOR_MAPPING: SpaceMapping = {
   z: { from: 'y', low: 1, high: 0, mirror: false },
 };
 
+/**
+ * The hologram frame onto an UPRIGHT simulation: the picture is the plane the visitor reaches
+ * through. Sim x/y are the picture (y up); sim z is depth with the picture plane at 0.5, the
+ * viewer's side (up to the pull-back distance) toward 0 and the far side toward 1, so a hand
+ * pushed through the picture keeps its reach instead of being clamped to the plane.
+ */
+export const HOLOGRAM_WALL_MAPPING: SpaceMapping = {
+  x: { from: 'x', low: 0, high: 1, mirror: false },
+  y: { from: 'y', low: 1, high: 0, mirror: false },
+  z: { from: 'z', low: 1, high: -1, mirror: false },
+};
+
 /** Unclamped axis map: geometry that may legitimately leave the volume (a forearm, a fingertip past the edge). */
 export function mapAxisOpen(map: AxisMap, value: number): number {
   const t = (value - map.low) / (map.high - map.low);

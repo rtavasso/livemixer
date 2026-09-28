@@ -73,6 +73,22 @@ describe('hand tracker', () => {
     const held = t.tick(200); expect(held.hands).toHaveLength(1); expect(held.hands[0].staleMs).toBe(130);
     expect(t.tick(70 + DEFAULT_TRACKER_SETTINGS.leaveMs + 1).hands).toHaveLength(0);
   });
+  it('restarts a hand that reappears far away after a gap with zero velocity (teleport guard)', () => {
+    const t = new HandTracker(SCREEN_MAPPING);
+    let seq = 0;
+    for (let at = 0; at <= 400; at += 16) { t.ingest(frame(seq++, at, .3, .5)); t.tick(at); }
+    // 120 ms without frames, then the same id 0.4 away: a glitch, not a 3.3 units/s movement.
+    t.ingest(frame(seq++, 520, .7, .5));
+    let state = t.tick(520);
+    expect(state.hands[0].position.x).toBeCloseTo(.7, 5);
+    expect(state.hands[0].speed).toBe(0);
+    t.ingest(frame(seq++, 536, .7, .5)); state = t.tick(536);
+    expect(state.hands[0].speed).toBe(0);
+    // A continuous fast movement with no gap still has its speed.
+    const c = new HandTracker(SCREEN_MAPPING);
+    for (let at = 0, x = .1; at <= 400; at += 16, x += .03) { c.ingest(frame(seq++, at, x, .5)); state = c.tick(at); }
+    expect(state.hands[0].speed).toBeGreaterThan(1);
+  });
   it('discards stale and out-of-order frames and ignores low confidence', () => {
     const t = new HandTracker(SCREEN_MAPPING);
     expect(t.ingest(frame(5, 100, .5, .5))).toBe(true);

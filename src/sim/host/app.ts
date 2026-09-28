@@ -7,10 +7,11 @@
  */
 import type { AnyParamValue, GestureSettingsLike, OccupancyField, Quality, SimContext, SimInput, SimulationInstance } from './contracts';
 import { clampSignals, coerceParam, resolveParams } from '../core/params';
+import { MusicClockEstimator } from '../core/music';
 import { createGl, describeGpu, fitCanvas } from '../gl/context';
 import { DEFAULT_TRACKER_SETTINGS, HandTracker, trackerSettingsSchema, type TrackedInput } from '../input/conditioning';
 import { DEFAULT_GESTURE_SETTINGS, detectGestures, emptyGestureMemory, gestureSettingsSchema, GESTURE_TYPES, type GestureEvent, type GestureMemory } from '../input/gestures';
-import { calibrateMapping, HOLOGRAM_FLOOR_MAPPING, spaceMappingSchema, stableCapture, type CalibrationCaptures, type SpaceMapping } from '../input/mapping';
+import { calibrateMapping, HOLOGRAM_FLOOR_MAPPING, HOLOGRAM_WALL_MAPPING, spaceMappingSchema, stableCapture, type CalibrationCaptures, type SpaceMapping } from '../input/mapping';
 import { fitHologram, hologramFingertip, type Affine3, type HologramFit, type HologramPair, type HologramSide } from '../input/hologram';
 import type { Vec3 } from '../core/types';
 import { DepthBridgeSource } from '../input/depth';
@@ -78,6 +79,7 @@ export class SimHost {
   private capabilities!: SimContext['capabilities'];
   private gpu = 'unknown';
   private definition!: AnySimulation;
+  private music = new MusicClockEstimator();
   private instance: SimulationInstance | null = null;
   /** The context object handed to the live instance; its size fields are updated in place on resize. */
   private simContext: SimContext | null = null;
@@ -136,6 +138,7 @@ export class SimHost {
     this.bus.onInbound(message => {
       if (message.type === 'set-param') this.setParam(message.name, message.value);
       else if (message.type === 'set-params') for (const [name, value] of Object.entries(message.values)) this.setParam(name, value);
+      else if (message.type === 'music') this.music.report(message.beat, message.playing, this.now(), message.bpm);
       else if (message.type === 'select-sim') { if (!this.selectSimulation(message.id)) this.bus.publishStatus('warning', `Unknown simulation "${message.id}".`); }
     });
     this.configureTelemetry();
@@ -154,6 +157,8 @@ export class SimHost {
   }
 
   private mappingFor(source: SourceId): SpaceMapping {
+    // An upright simulation reads a hologram-calibrated source through the wall frame, whatever the source's stored (floor) mapping.
+    if (this.settings.value.holograms[source] && this.definition?.hologramFrame === 'wall') return HOLOGRAM_WALL_MAPPING;
     const stored = this.settings.value.mappings[source];
     return stored ? spaceMappingSchema.parse(stored) : defaultMapping(source);
   }
@@ -173,7 +178,7 @@ export class SimHost {
 
   private context(): SimContext {
     const { width, height } = this.canvas;
-    return { gl: this.gl, canvas: this.canvas, width, height, aspect: width / Math.max(1, height), depth: this.settings.value.volumeDepth, dpr: this.canvas.width / Math.max(1, this.canvas.clientWidth), quality: this.settings.value.quality, capabilities: this.capabilities, warn: message => this.warn(message) };
+    return { gl: this.gl, canvas: this.canvas, width, height, aspect: width / Math.max(1, height), depth: this.settings.value.volumeDepth, dpr: this.canvas.width / Math.max(1, this.canvas.clientWidth), activeArea: { ...this.settings.value.hologramArea }, quality: this.settings.value.quality, capabilities: this.capabilities, warn: message => this.warn(message) };
   }
 
   private createInstance() {
@@ -210,7 +215,9 @@ export class SimHost {
   selectSimulation(id: string): boolean {
     const definition = findSimulation(id);
     if (!definition) return false;
+    const previousFrame = this.definition?.hologramFrame ?? 'floor';
     this.definition = definition;
+    if ((definition.hologramFrame ?? 'floor') !== previousFrame && this.settings.value.holograms[this.sourceId]) { this.tracker.mapping = this.mappingFor(this.sourceId); this.tracker.reset(); }
     this.params = resolveParams(definition.params, this.settings.value.params[id]) as Record<string, AnyParamValue>;
     this.settings.update(s => { s.sim = id; });
     this.createInstance();
@@ -320,6 +327,7 @@ export class SimHost {
     this.settings.update(s => { s.holograms[this.sourceId] = { affine: fit.affine, rmsError: fit.rmsError, capturedAt: new Date().toISOString() }; });
     this.tracker.rectify = fit.affine;
     this.setMapping(HOLOGRAM_FLOOR_MAPPING);
+    if (this.definition.hologramFrame === 'wall') { this.tracker.mapping = HOLOGRAM_WALL_MAPPING; this.tracker.reset(); }
     return fit;
   }
   get hologramArea(): Settings['hologramArea'] { return this.settings.value.hologramArea; }
@@ -327,7 +335,9 @@ export class SimHost {
     const clamp = (v: number) => Math.min(1, Math.max(0, Math.round(v * 1000) / 1000));
     const next = { x0: clamp(area.x0), y0: clamp(area.y0), x1: clamp(area.x1), y1: clamp(area.y1) };
     if (next.x1 - next.x0 < .1 || next.y1 - next.y0 < .1) return;
-    this.settings.update(s => { s.hologramArea = next; }); this.notify();
+    this.settings.update(s => { s.hologramArea = next; });
+    if (this.simContext) this.simContext.activeArea = { ...next };
+    this.notify();
   }
   clearHologram() {
     this.settings.update(s => { delete s.holograms[this.sourceId]; delete s.mappings[this.sourceId]; });
@@ -452,7 +462,7 @@ export class SimHost {
     try {
       result = this.stepper.advance(now, dt => {
         this.simTime += dt;
-        const input: SimInput = { time: this.simTime, dt, hands, primary, events: stepped ? [] : this.pendingEvents, presence: this.tracked.presence, activity: this.tracked.activity, occupancy: this.tracked.occupancy, volume, surface };
+        const input: SimInput = { time: this.simTime, dt, hands, primary, events: stepped ? [] : this.pendingEvents, presence: this.tracked.presence, activity: this.tracked.activity, occupancy: this.tracked.occupancy, volume, surface, music: this.music.sample(now) };
         this.instance!.step(input, this.params as never);
         stepped = true;
       });

@@ -70,6 +70,8 @@ export const inboundSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('set-params'), values: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])) }).strict(),
   z.object({ type: z.literal('select-sim'), id: z.string().min(1) }).strict(),
   z.object({ type: z.literal('get-schema') }).strict(),
+  /** Live's transport from the Ableton controls page: song position in beats, optionally the tempo. */
+  z.object({ type: z.literal('music'), beat: z.number().finite(), playing: z.boolean(), bpm: z.number().finite().optional() }).strict(),
   z.object({ type: z.literal('ping'), id: z.union([z.number(), z.string()]).optional() }).strict(),
 ]);
 export type TelemetryInbound = z.infer<typeof inboundSchema>;
