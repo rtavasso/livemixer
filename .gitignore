@@ -17,3 +17,4 @@ __pycache__/
 shots/
 .fadr/
 /public/fx-auditions/*.wav
+bridge/.background.npy

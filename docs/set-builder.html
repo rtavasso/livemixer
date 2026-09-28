@@ -1,0 +1,343 @@
+<title>Groop Show Set Builder</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@85,600;85,800&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --bg:#EDEFF3; --surface:#FFFFFF; --surface-2:#F5F6F8; --ink:#1B2230; --muted:#5B6572; --line:#D3D8DF;
+  --accent:#C2731A; --accent-ink:#FFFFFF; --accent-soft:#F6E6D3;
+  --good:#1F7A6D; --good-soft:#DCEFEA; --ok:#9A6B00; --ok-soft:#F5EBCC; --bad:#B23A3A; --bad-soft:#F4DCDC;
+  --focus:#2F6FD6;
+  --display:"Archivo","Helvetica Neue",Arial,sans-serif;
+  --body:"IBM Plex Sans","Segoe UI",Helvetica,Arial,sans-serif;
+  --mono:"IBM Plex Mono",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#14181E; --surface:#1D232B; --surface-2:#242B34; --ink:#E7EAEE; --muted:#9AA4B0; --line:#2F3844;
+    --accent:#E39A45; --accent-ink:#1B1408; --accent-soft:#3A2A16;
+    --good:#4FB3A3; --good-soft:#173430; --ok:#D9A43A; --ok-soft:#33290F; --bad:#E06C6C; --bad-soft:#3A1C1C;
+    --focus:#7AA7F0;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#14181E; --surface:#1D232B; --surface-2:#242B34; --ink:#E7EAEE; --muted:#9AA4B0; --line:#2F3844;
+  --accent:#E39A45; --accent-ink:#1B1408; --accent-soft:#3A2A16;
+  --good:#4FB3A3; --good-soft:#173430; --ok:#D9A43A; --ok-soft:#33290F; --bad:#E06C6C; --bad-soft:#3A1C1C;
+  --focus:#7AA7F0;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--body);font-size:14px;line-height:1.45}
+.wrap{max-width:1180px;margin:0 auto;padding-inline:20px;padding-block:24px 48px}
+header{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:12px 24px;margin-bottom:20px}
+h1{font-family:var(--display);font-weight:800;font-stretch:85%;font-size:30px;letter-spacing:-0.01em;margin:0;line-height:1.05;text-wrap:balance}
+.sub{color:var(--muted);margin:6px 0 0;max-width:60ch}
+.stats{display:flex;gap:18px;flex-wrap:wrap}
+.stat{display:flex;flex-direction:column;gap:2px}
+.stat b{font-family:var(--mono);font-weight:500;font-size:20px;line-height:1;font-variant-numeric:tabular-nums}
+.stat span{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.grid{display:grid;grid-template-columns:minmax(300px,380px) 1fr;gap:20px;align-items:start}
+@media (max-width:820px){.grid{grid-template-columns:1fr}}
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:10px}
+.panel-h{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 16px;border-bottom:1px solid var(--line)}
+.panel-h h2{font-family:var(--display);font-weight:600;font-stretch:85%;font-size:16px;margin:0;letter-spacing:.01em}
+.panel-b{padding:12px 16px}
+button{font:inherit;color:var(--ink);background:var(--surface-2);border:1px solid var(--line);border-radius:6px;padding:5px 10px;cursor:pointer;line-height:1.2}
+button:hover{border-color:var(--muted)}
+button:focus-visible,select:focus-visible,label:focus-within{outline:2px solid var(--focus);outline-offset:2px}
+button.primary{background:var(--accent);color:var(--accent-ink);border-color:transparent;font-weight:600}
+button.tiny{padding:2px 7px;font-size:12px}
+button:disabled{opacity:.4;cursor:default}
+/* set list */
+.setlist{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
+.setitem{display:grid;grid-template-columns:22px 1fr auto;gap:8px;align-items:center;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--surface);cursor:pointer}
+.setitem.sel{border-color:var(--accent);box-shadow:inset 3px 0 0 var(--accent)}
+.setitem .pos{font-family:var(--mono);color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
+.setitem .name{min-width:0}
+.setitem .t{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.setitem .a{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.setitem .ctl{display:flex;gap:3px}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:3px}
+.chip{font-family:var(--mono);font-size:11px;padding:1px 6px;border-radius:4px;background:var(--surface-2);border:1px solid var(--line);font-variant-numeric:tabular-nums;white-space:nowrap}
+.chip.bpm{color:var(--accent);border-color:var(--accent);background:var(--accent-soft)}
+.chip.good{color:var(--good);background:var(--good-soft);border-color:transparent}
+.chip.ok{color:var(--ok);background:var(--ok-soft);border-color:transparent}
+.chip.bad{color:var(--bad);background:var(--bad-soft);border-color:transparent}
+.join{font-size:12px;color:var(--muted);padding:0 0 0 30px;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.empty{color:var(--muted);padding:12px 4px;text-align:center}
+/* chart */
+.chart{position:relative;margin-top:6px}
+.chart svg{width:100%;height:auto;display:block;overflow:visible}
+.chart .bar{fill:var(--accent);opacity:.85}
+.chart .bar:hover{opacity:1}
+.chart .axis{stroke:var(--line);stroke-width:1}
+.chart text{font-family:var(--mono);font-size:10px;fill:var(--muted)}
+.tip{position:absolute;pointer-events:none;background:var(--ink);color:var(--bg);font-family:var(--mono);font-size:11px;padding:4px 7px;border-radius:4px;transform:translate(-50%,-110%);white-space:nowrap;display:none}
+/* controls */
+.controls{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--surface-2);border-radius:0}
+.controls label{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted)}
+select{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:4px 8px}
+input[type=checkbox]{accent-color:var(--accent)}
+.now{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;padding:12px 16px 4px}
+.now .lbl{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.now .t{font-family:var(--display);font-stretch:85%;font-weight:800;font-size:22px}
+/* candidates */
+table{width:100%;border-collapse:collapse}
+.tblwrap{overflow-x:auto}
+th{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);text-align:left;font-weight:500;padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
+tr.cand:hover td{background:var(--surface-2)}
+tr.used td{opacity:.45}
+td.num,th.num{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+td .t{font-weight:600}
+td .a{color:var(--muted);font-size:12px}
+.delta{font-family:var(--mono);font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.delta.up{color:var(--accent)}
+.delta.down{color:var(--muted)}
+.tempobar{display:inline-block;width:80px;height:6px;border-radius:3px;background:var(--surface-2);border:1px solid var(--line);position:relative;vertical-align:middle;margin-right:6px}
+.tempobar i{position:absolute;top:-3px;width:2px;height:10px;background:var(--muted)}
+.tempobar b{position:absolute;top:-3px;width:2px;height:10px;background:var(--accent)}
+.legend{font-size:12px;color:var(--muted);padding:8px 16px 12px;line-height:1.5}
+.export{margin-top:20px}
+textarea{width:100%;min-height:160px;font-family:var(--mono);font-size:12px;color:var(--ink);background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:10px;resize:vertical}
+@media (prefers-reduced-motion:no-preference){.setitem,button{transition:border-color .12s,background .12s}}
+</style>
+
+<div class="wrap">
+<header>
+  <div>
+    <h1>Groop Show Set Builder</h1>
+    <p class="sub">Pick what plays next by key or tempo. Fadr's BPM and key estimates for all 19 stems; songs over 140 BPM are treated at half time.</p>
+  </div>
+  <div class="stats">
+    <div class="stat"><b id="stSet">0</b><span>in set</span></div>
+    <div class="stat"><b id="stLeft">19</b><span>left</span></div>
+    <div class="stat"><b id="stBlend">0</b><span>full blends</span></div>
+    <div class="stat"><b id="stSwing">–</b><span>avg tempo swing</span></div>
+  </div>
+</header>
+
+<div class="grid">
+  <section class="panel">
+    <div class="panel-h"><h2>Your set</h2>
+      <div style="display:flex;gap:6px"><button class="tiny" id="btnUndo" title="Remove last">Undo</button><button class="tiny" id="btnClear">Clear</button></div>
+    </div>
+    <div class="panel-b">
+      <ol class="setlist" id="setlist"></ol>
+      <div class="chart" id="chart"></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-h"><h2>What comes next</h2><span style="font-size:12px;color:var(--muted)">click a row to add it after the highlighted song</span></div>
+    <div class="controls">
+      <label>Rank by
+        <select id="mode">
+          <option value="alt">Alternate slow ↔ fast, best key first</option>
+          <option value="key">Best key match</option>
+          <option value="near">Closest tempo</option>
+          <option value="far">Biggest tempo jump</option>
+        </select>
+      </label>
+      <label>Direction
+        <select id="dir">
+          <option value="any">Any</option>
+          <option value="up">Faster only</option>
+          <option value="down">Slower only</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="hideClash"> Hide key clashes</label>
+      <label><input type="checkbox" id="showUsed"> Show already used</label>
+    </div>
+    <div class="now" id="now"></div>
+    <div class="tblwrap"><table>
+      <thead><tr><th>#</th><th>Song</th><th class="num">BPM</th><th>Tempo change</th><th>Key</th><th>Relation</th><th>Transition</th></tr></thead>
+      <tbody id="cands"></tbody>
+    </table></div>
+    <div class="legend">
+      <b>Key relation</b>: same, relative (A↔B same number) and parallel (same root, major↔minor) blend freely; adjacent (±1) blends; energy shift (±1 with A↔B) works with bass last; a clash needs a drums-only bridge.
+      <b>Tempo</b>: within ±4% is a straight swap; beyond ~12% put a tempo ramp on the drum bridge. Half- and double-time matches are flagged when the feel lines up at 2:1.
+    </div>
+  </section>
+</div>
+
+<section class="panel export">
+  <div class="panel-h"><h2>Running order</h2><button class="tiny" id="btnCopy">Copy</button></div>
+  <div class="panel-b"><textarea id="out" readonly spellcheck="false"></textarea></div>
+</section>
+</div>
+
+<script>
+const SONGS=[
+ [1,"Rec Hall","Back To Us",74,"Cmin"],
+ [2,"underscores","Innuendo (I Get U)",148,"F#min"],
+ [3,"coldroses","Name",105,"C#min"],
+ [4,"Black Hibiscus","FORLÖRN",127,"C#maj"],
+ [5,"Alicia Keys","If I Ain't Got You",118,"Gmaj"],
+ [6,"Jermango Dreaming","Breeze",117,"Amin"],
+ [7,"Tyler, The Creator","THAT GUY",108,"C#maj"],
+ [8,"Hotel Ugly","The Ballad of Eddie Jabuley",85,"Emin"],
+ [9,"54 Ultra","Turnaround",76,"G#min"],
+ [10,"Mac Miller","Ladders",104,"Gmin"],
+ [11,"NxWorries, Anderson .Paak","KeepHer (feat. Thundercat)",83,"Gmaj"],
+ [12,"Gorillaz, MF DOOM","November Has Come",84,"Amin"],
+ [13,"Dr. Dog","Where'd All the Time Go?",166.5,"Dmaj"],
+ [14,"Parcels","Gamesofluck",105,"Amin"],
+ [15,"Glass Animals","Mama's Gun",90,"F#min"],
+ [16,"Glass Animals","Cocoa Hooves",67,"Dmin"],
+ [17,"Turnstile, BADBADNOTGOOD, Blood Orange","Alien Love Call",126,"C#min"],
+ [18,"Effin","Divine",120,"F#maj"],
+ [19,"Erykah Badu","Danger",89,"F#maj"],
+].map(([n,artist,title,bpm,key])=>{
+  const feel=bpm>140?bpm/2:bpm;
+  return {n,artist,title,bpm,key,feel,cam:camelot(key)};
+});
+const MIN={"G#":1,"D#":2,"A#":3,"F":4,"C":5,"G":6,"D":7,"A":8,"E":9,"B":10,"F#":11,"C#":12};
+const MAJ={"B":1,"F#":2,"C#":3,"G#":4,"D#":5,"A#":6,"F":7,"C":8,"G":9,"D":10,"A":11,"E":12};
+function camelot(k){const m=k.match(/^([A-G]#?)(min|maj)$/);const num=(m[2]==="min"?MIN:MAJ)[m[1]];return {num,let:m[2]==="min"?"A":"B",str:num+(m[2]==="min"?"A":"B")};}
+const byN=Object.fromEntries(SONGS.map(s=>[s.n,s]));
+
+function keyRel(a,b){
+  const d=((b.cam.num-a.cam.num)%12+12)%12, same=a.cam.let===b.cam.let;
+  if(d===0&&same)return {s:4,l:"Same key",c:"good"};
+  if(d===0)return {s:4,l:"Relative",c:"good"};
+  if((d===3||d===9)&&!same)return {s:3,l:"Parallel",c:"good"};
+  if((d===1||d===11)&&same)return {s:3,l:"Adjacent",c:"good"};
+  if((d===1||d===11)&&!same)return {s:2,l:"Energy shift",c:"ok"};
+  if((d===2||d===10)&&same)return {s:1,l:"Two steps",c:"ok"};
+  return {s:0,l:"Clash",c:"bad"};
+}
+function tempoRel(a,b){
+  const pct=(b.feel-a.feel)/a.feel*100;
+  let note="";
+  const r2=Math.abs(b.feel*2-a.feel)/a.feel, r05=Math.abs(b.feel/2-a.feel)/a.feel;
+  if(Math.abs(pct)>12&&r2<0.08)note="double-time match";
+  else if(Math.abs(pct)>12&&r05<0.08)note="half-time match";
+  return {pct,note};
+}
+function transition(k,t){
+  const ramp=Math.abs(t.pct)>12&&!t.note?" + tempo ramp":"";
+  if(k.s>=3)return "Full blend"+ramp;
+  if(k.s===2)return "Blend, bass last"+ramp;
+  if(k.s===1)return "Drums first, short overlap"+ramp;
+  return "Drums-only bridge"+ramp;
+}
+function band(s){return s.feel<95?"slow":"fast";}
+
+let set=[1], sel=0;
+try{const saved=JSON.parse(localStorage.getItem("groop-set")||"null");if(saved&&Array.isArray(saved.set)&&saved.set.length){set=saved.set.filter(n=>byN[n]);sel=Math.min(saved.sel??set.length-1,set.length-1);}}catch(e){}
+function save(){try{localStorage.setItem("groop-set",JSON.stringify({set,sel}));}catch(e){}}
+
+const $=id=>document.getElementById(id);
+const esc=s=>s.replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const fmtBpm=s=>s.bpm>140?`${s.feel} <span style="color:var(--muted)">(${s.bpm})</span>`:`${s.bpm}`;
+
+function render(){
+  if(sel>set.length-1)sel=set.length-1;
+  renderSet(); renderChart(); renderCands(); renderOut(); renderStats(); save();
+}
+
+function renderSet(){
+  const ol=$("setlist"); ol.innerHTML="";
+  if(!set.length){ol.innerHTML='<li class="empty">Empty. Pick any song on the right to start.</li>';return;}
+  set.forEach((n,i)=>{
+    const s=byN[n];
+    if(i>0){const p=byN[set[i-1]],k=keyRel(p,s),t=tempoRel(p,s);
+      const j=document.createElement("li");j.className="join";
+      j.innerHTML=`<span class="chip ${k.c}">${k.l}</span><span class="delta ${t.pct>=0?"up":"down"}">${t.pct>=0?"+":""}${t.pct.toFixed(0)}%</span><span>${transition(k,t)}${t.note?" · "+t.note:""}</span>`;
+      ol.appendChild(j);}
+    const li=document.createElement("li");li.className="setitem"+(i===sel?" sel":"");li.tabIndex=0;
+    li.innerHTML=`<span class="pos">${String(i+1).padStart(2,"0")}</span>
+      <div class="name"><div class="t">${esc(s.title)}</div><div class="a">${esc(s.artist)}</div>
+      <div class="chips"><span class="chip bpm">${fmtBpm(s)} BPM</span><span class="chip">${s.key} · ${s.cam.str}</span></div></div>
+      <div class="ctl"><button class="tiny" data-up="${i}" title="Move up" ${i===0?"disabled":""}>↑</button><button class="tiny" data-down="${i}" title="Move down" ${i===set.length-1?"disabled":""}>↓</button><button class="tiny" data-rm="${i}" title="Remove">×</button></div>`;
+    li.addEventListener("click",e=>{if(e.target.closest("button"))return;sel=i;render();});
+    li.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();sel=i;render();}});
+    ol.appendChild(li);
+  });
+  ol.querySelectorAll("button[data-up]").forEach(b=>b.onclick=()=>{const i=+b.dataset.up;[set[i-1],set[i]]=[set[i],set[i-1]];sel=i-1;render();});
+  ol.querySelectorAll("button[data-down]").forEach(b=>b.onclick=()=>{const i=+b.dataset.down;[set[i+1],set[i]]=[set[i],set[i+1]];sel=i+1;render();});
+  ol.querySelectorAll("button[data-rm]").forEach(b=>b.onclick=()=>{const i=+b.dataset.rm;set.splice(i,1);if(sel>=i)sel=Math.max(0,sel-1);render();});
+}
+
+function renderChart(){
+  const c=$("chart");
+  if(set.length<2){c.innerHTML="";return;}
+  const W=340,H=110,pl=28,pr=6,pt=14,pb=18,lo=60,hi=130;
+  const iw=W-pl-pr,ih=H-pt-pb,bw=Math.min(22,iw/set.length-3);
+  const y=v=>pt+ih-(v-lo)/(hi-lo)*ih;
+  let s=`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Tempo feel across the set">`;
+  [60,80,100,120].forEach(v=>{s+=`<line class="axis" x1="${pl}" x2="${W-pr}" y1="${y(v)}" y2="${y(v)}"/><text x="${pl-4}" y="${y(v)+3}" text-anchor="end">${v}</text>`;});
+  set.forEach((n,i)=>{const sg=byN[n];const x=pl+(i+0.5)*(iw/set.length)-bw/2;const top=y(sg.feel);const bh=y(lo)-top;
+    s+=`<rect class="bar" data-i="${i}" x="${x.toFixed(1)}" y="${top.toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(bh,1).toFixed(1)}" rx="0" ry="0"/>`;
+    s+=`<rect class="bar" x="${x.toFixed(1)}" y="${top.toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.min(4,Math.max(bh,1)).toFixed(1)}" rx="2" ry="2" pointer-events="none"/>`;
+    s+=`<text x="${(x+bw/2).toFixed(1)}" y="${H-5}" text-anchor="middle">${i+1}</text>`;});
+  s+=`<text x="${pl}" y="9">BPM feel by position</text></svg><div class="tip" id="tip"></div>`;
+  c.innerHTML=s;
+  const tip=$("tip");
+  c.querySelectorAll("rect[data-i]").forEach(r=>{
+    r.addEventListener("mousemove",e=>{const sg=byN[set[+r.dataset.i]];const b=c.getBoundingClientRect();tip.style.display="block";tip.style.left=(e.clientX-b.left)+"px";tip.style.top=(e.clientY-b.top)+"px";tip.textContent=`${sg.title} · ${sg.feel} BPM · ${sg.key}`;});
+    r.addEventListener("mouseleave",()=>tip.style.display="none");
+  });
+}
+
+function renderCands(){
+  const cur=set.length?byN[set[sel]]:null;
+  const now=$("now");
+  now.innerHTML=cur?`<span class="lbl">After</span><span class="t">${esc(cur.title)}</span><span class="chip bpm">${fmtBpm(cur)} BPM</span><span class="chip">${cur.key} · ${cur.cam.str}</span><span class="chip">${band(cur)} band</span>`:`<span class="lbl">Start with</span><span class="t">any song</span>`;
+  const mode=$("mode").value,dir=$("dir").value,hide=$("hideClash").checked,showUsed=$("showUsed").checked;
+  let rows=SONGS.map(s=>{
+    const used=set.includes(s.n);
+    if(!cur)return {s,used,k:null,t:null};
+    return {s,used,k:keyRel(cur,s),t:tempoRel(cur,s)};
+  }).filter(r=>r.s.n!==(cur&&cur.n));
+  if(!showUsed)rows=rows.filter(r=>!r.used);
+  if(cur){
+    if(dir==="up")rows=rows.filter(r=>r.t.pct>0);
+    if(dir==="down")rows=rows.filter(r=>r.t.pct<0);
+    if(hide)rows=rows.filter(r=>r.k.s>0);
+    const want=band(cur)==="slow"?"fast":"slow";
+    const sorters={
+      alt:(a,b)=>((band(b.s)===want)-(band(a.s)===want))||(b.k.s-a.k.s)||(Math.abs(b.t.pct)-Math.abs(a.t.pct)),
+      key:(a,b)=>(b.k.s-a.k.s)||(Math.abs(a.t.pct)-Math.abs(b.t.pct)),
+      near:(a,b)=>(Math.abs(a.t.pct)-Math.abs(b.t.pct))||(b.k.s-a.k.s),
+      far:(a,b)=>(Math.abs(b.t.pct)-Math.abs(a.t.pct))||(b.k.s-a.k.s),
+    };
+    rows.sort(sorters[mode]);
+  }else rows.sort((a,b)=>a.s.feel-b.s.feel);
+  const tb=$("cands");tb.innerHTML="";
+  if(!rows.length){tb.innerHTML='<tr><td colspan="7" class="empty">Nothing matches these filters. Loosen the direction or show clashes.</td></tr>';return;}
+  rows.forEach(r=>{
+    const s=r.s,tr=document.createElement("tr");tr.className="cand"+(r.used?" used":"");
+    const pos=v=>Math.max(0,Math.min(100,(v-60)/70*100));
+    const bar=cur?`<span class="tempobar"><i style="left:${pos(cur.feel)}%"></i><b style="left:${pos(s.feel)}%"></b></span>`:"";
+    tr.innerHTML=`<td class="num">${String(s.n).padStart(2,"0")}</td>
+      <td><div class="t">${esc(s.title)}</div><div class="a">${esc(s.artist)}</div></td>
+      <td class="num">${fmtBpm(s)}</td>
+      <td>${cur?`${bar}<span class="delta ${r.t.pct>=0?"up":"down"}">${r.t.pct>=0?"+":""}${r.t.pct.toFixed(0)}%</span>${r.t.note?`<div class="a">${r.t.note}</div>`:""}`:`<span class="a">${band(s)} band</span>`}</td>
+      <td class="num">${s.key} · ${s.cam.str}</td>
+      <td>${cur?`<span class="chip ${r.k.c}">${r.k.l}</span>`:""}</td>
+      <td>${cur?transition(r.k,r.t):""}${r.used?' <span class="a">(in set)</span>':""}</td>`;
+    tr.addEventListener("click",()=>{if(r.used)return;const at=set.length?sel+1:0;set.splice(at,0,s.n);sel=at;render();});
+    tb.appendChild(tr);
+  });
+}
+
+function renderOut(){
+  const lines=["#  | Song | BPM | Key | From previous"];
+  set.forEach((n,i)=>{const s=byN[n];let j="—";
+    if(i>0){const p=byN[set[i-1]],k=keyRel(p,s),t=tempoRel(p,s);j=`${k.l}, ${t.pct>=0?"+":""}${t.pct.toFixed(0)}% → ${transition(k,t)}${t.note?" ("+t.note+")":""}`;}
+    lines.push(`${String(i+1).padStart(2,"0")} | ${String(s.n).padStart(2,"0")} ${s.artist} – ${s.title} | ${s.bpm}${s.bpm>140?" (feel "+s.feel+")":""} | ${s.key} ${s.cam.str} | ${j}`);});
+  $("out").value=lines.join("\n");
+}
+function renderStats(){
+  $("stSet").textContent=set.length;$("stLeft").textContent=SONGS.length-set.length;
+  let blends=0,swing=0;
+  for(let i=1;i<set.length;i++){const p=byN[set[i-1]],s=byN[set[i]];if(keyRel(p,s).s>=3)blends++;swing+=Math.abs(tempoRel(p,s).pct);}
+  $("stBlend").textContent=blends;$("stSwing").textContent=set.length>1?(swing/(set.length-1)).toFixed(0)+"%":"–";
+}
+
+["mode","dir","hideClash","showUsed"].forEach(id=>$(id).addEventListener("change",renderCands));
+$("btnUndo").onclick=()=>{set.pop();sel=set.length-1;render();};
+$("btnClear").onclick=()=>{set=[];sel=0;render();};
+$("btnCopy").onclick=async()=>{const ta=$("out");ta.select();try{await navigator.clipboard.writeText(ta.value);$("btnCopy").textContent="Copied";}catch(e){$("btnCopy").textContent="Select & copy";}setTimeout(()=>$("btnCopy").textContent="Copy",1500);};
+render();
+</script>

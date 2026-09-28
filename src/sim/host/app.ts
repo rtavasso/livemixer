@@ -10,7 +10,9 @@ import { clampSignals, coerceParam, resolveParams } from '../core/params';
 import { createGl, describeGpu, fitCanvas } from '../gl/context';
 import { DEFAULT_TRACKER_SETTINGS, HandTracker, trackerSettingsSchema, type TrackedInput } from '../input/conditioning';
 import { DEFAULT_GESTURE_SETTINGS, detectGestures, emptyGestureMemory, gestureSettingsSchema, GESTURE_TYPES, type GestureEvent, type GestureMemory } from '../input/gestures';
-import { calibrateMapping, spaceMappingSchema, stableCapture, type CalibrationCaptures, type SpaceMapping } from '../input/mapping';
+import { calibrateMapping, HOLOGRAM_FLOOR_MAPPING, spaceMappingSchema, stableCapture, type CalibrationCaptures, type SpaceMapping } from '../input/mapping';
+import { fitHologram, hologramFingertip, type Affine3, type HologramFit, type HologramPair, type HologramSide } from '../input/hologram';
+import type { Vec3 } from '../core/types';
 import { DepthBridgeSource } from '../input/depth';
 import { LeapSource } from '../input/leap';
 import { PointerSource } from '../input/pointer';
@@ -43,6 +45,10 @@ export interface HostState {
   events: GestureEvent[];
   mapping: SpaceMapping;
   calibration: CalibrationCaptures;
+  /** Hologram calibration of the active source, when one is stored. */
+  hologram: { affine: Affine3; rmsError: number; capturedAt: string } | null;
+  /** Which end of the source depth axis the hologram was last seen to be on (from where the arm enters). */
+  hologramSide: HologramSide;
   perf: HostPerf;
   warnings: HostWarning[];
   gpu: string;
@@ -92,6 +98,9 @@ export class SimHost {
   private tracked: TrackedInput = { hands: [], presence: 0, activity: 0, occupancy: null, volume: null, surface: null, sourceAgeMs: Infinity, discarded: 0, stats: {} };
   private rawSamples: { position: { x: number; y: number; z: number }; atMs: number }[] = [];
   private calibration: CalibrationCaptures = {};
+  /** Fingertip positions in the SOURCE frame from recent raw frames, for hologram calibration. */
+  private fingertipSamples: { position: Vec3; atMs: number }[] = [];
+  private hologramSide: HologramSide = 'far';
   private warnings: HostWarning[] = [];
   private fps = new RateMeter();
   private perf: HostPerf = { fps: 0, stepMs: 0, renderMs: 0, steps: 0, droppedMs: 0 };
@@ -122,6 +131,7 @@ export class SimHost {
     // A persisted 'replay' has no file to replay at launch; fall back to the pointer.
     this.sourceId = settings.value.source === 'replay' ? 'pointer' : settings.value.source;
     this.tracker = new HandTracker(this.mappingFor(this.sourceId), this.trackerSettingsFor(this.sourceId));
+    this.tracker.rectify = this.settings.value.holograms[this.sourceId]?.affine ?? null;
     this.gestureSettings = gestureSettingsSchema.parse({ ...DEFAULT_GESTURE_SETTINGS, ...settings.value.gestures });
     this.bus.onInbound(message => {
       if (message.type === 'set-param') this.setParam(message.name, message.value);
@@ -241,7 +251,7 @@ export class SimHost {
     const running = this.running; this.stop();
     this.settings.value = settings;
     this.sourceId = settings.source === 'replay' ? 'pointer' : settings.source;
-    this.tracker.mapping = this.mappingFor(this.sourceId); this.tracker.settings = this.trackerSettingsFor(this.sourceId); this.tracker.reset();
+    this.tracker.mapping = this.mappingFor(this.sourceId); this.tracker.settings = this.trackerSettingsFor(this.sourceId); this.tracker.rectify = settings.holograms[this.sourceId]?.affine ?? null; this.tracker.reset();
     this.gestureSettings = gestureSettingsSchema.parse({ ...DEFAULT_GESTURE_SETTINGS, ...settings.gestures });
     this.configureTelemetry(); this.selectSimulation(settings.sim);
     if (running) this.start();
@@ -260,8 +270,8 @@ export class SimHost {
     this.source?.stop(); this.source = null;
     this.sourceId = id;
     if (id !== 'replay') this.settings.update(s => { s.source = id; }); // a replay cannot be resumed at launch
-    this.tracker.mapping = this.mappingFor(id); this.tracker.settings = this.trackerSettingsFor(id); this.tracker.reset();
-    this.gestureMemory = emptyGestureMemory(); this.pendingEvents = []; this.rawSamples = []; this.calibration = {};
+    this.tracker.mapping = this.mappingFor(id); this.tracker.settings = this.trackerSettingsFor(id); this.tracker.rectify = this.settings.value.holograms[id]?.affine ?? null; this.tracker.reset();
+    this.gestureMemory = emptyGestureMemory(); this.pendingEvents = []; this.rawSamples = []; this.fingertipSamples = []; this.calibration = {};
     const emit = (frame: InputFrame) => { if (generation === this.sourceGeneration) this.ingest(frame); };
     let source: InputSource;
     switch (id) {
@@ -293,6 +303,42 @@ export class SimHost {
     this.notify();
   }
   resetMapping() { this.settings.update(s => { delete s.mappings[this.sourceId]; }); this.setMapping(defaultMapping(this.sourceId)); this.calibration = {}; }
+
+  /** The fingertip's current SOURCE-frame position, held steady for the last half second. Throws when it is not. */
+  captureFingertip(): Vec3 {
+    const now = this.now();
+    return stableCapture(this.fingertipSamples.filter(s => now - s.atMs <= RAW_SAMPLE_WINDOW_MS), 6, 350, .03);
+  }
+  /** The most recent fingertip in the source frame, or null when nothing has been seen for a while. */
+  latestFingertip(): Vec3 | null {
+    const last = this.fingertipSamples[this.fingertipSamples.length - 1];
+    return last && this.now() - last.atMs < 300 ? last.position : null;
+  }
+  /** Fit the touches, store the rectification for this source and switch it to the hologram water mapping. */
+  applyHologram(pairs: HologramPair[], pullBack?: Vec3): HologramFit {
+    const fit = fitHologram(pairs, pullBack, { viewer: this.viewerHint(pairs), depthSpan: .2 });
+    this.settings.update(s => { s.holograms[this.sourceId] = { affine: fit.affine, rmsError: fit.rmsError, capturedAt: new Date().toISOString() }; });
+    this.tracker.rectify = fit.affine;
+    this.setMapping(HOLOGRAM_FLOOR_MAPPING);
+    return fit;
+  }
+  get hologramArea(): Settings['hologramArea'] { return this.settings.value.hologramArea; }
+  setHologramArea(area: Settings['hologramArea']) {
+    const clamp = (v: number) => Math.min(1, Math.max(0, Math.round(v * 1000) / 1000));
+    const next = { x0: clamp(area.x0), y0: clamp(area.y0), x1: clamp(area.x1), y1: clamp(area.y1) };
+    if (next.x1 - next.x0 < .1 || next.y1 - next.y0 < .1) return;
+    this.settings.update(s => { s.hologramArea = next; }); this.notify();
+  }
+  clearHologram() {
+    this.settings.update(s => { delete s.holograms[this.sourceId]; delete s.mappings[this.sourceId]; });
+    this.tracker.rectify = null;
+    this.setMapping(defaultMapping(this.sourceId));
+  }
+  /** A source point on the viewer's side of the touches: the touch centroid pushed away from the hologram side. */
+  private viewerHint(pairs: HologramPair[]): Vec3 {
+    const c = pairs.reduce((acc, p) => ({ x: acc.x + p.point.x / pairs.length, y: acc.y + p.point.y / pairs.length, z: acc.z + p.point.z / pairs.length }), { x: 0, y: 0, z: 0 });
+    return { ...c, z: c.z + (this.hologramSide === 'far' ? -.5 : .5) };
+  }
 
   /** Capture the primary hand's current SOURCE-frame position for calibration. Throws when the hand is not steady. */
   captureCalibration(kind: keyof CalibrationCaptures) {
@@ -365,6 +411,11 @@ export class SimHost {
       const now = frame.receivedAtMs;
       this.rawSamples.push({ position: hand.position, atMs: now });
       while (this.rawSamples.length && now - this.rawSamples[0].atMs > RAW_SAMPLE_WINDOW_MS) this.rawSamples.shift();
+      // The arm enters the box from the viewer's edge of the depth axis; the hologram is at the other end.
+      const extent = frame.hands.reduce<typeof hand.extent>((best, h) => !best || (h.extent && (h.extent.max.z - h.extent.min.z) > (best.max.z - best.min.z)) ? h.extent : best, undefined);
+      if (extent) { if (extent.min.z < .05 && extent.max.z < .95) this.hologramSide = 'far'; else if (extent.max.z > .95 && extent.min.z > .05) this.hologramSide = 'near'; }
+      const tip = hologramFingertip(frame, this.hologramSide);
+      if (tip) { this.fingertipSamples.push({ position: tip, atMs: now }); while (this.fingertipSamples.length && now - this.fingertipSamples[0].atMs > RAW_SAMPLE_WINDOW_MS) this.fingertipSamples.shift(); }
     }
   }
 
@@ -461,7 +512,7 @@ export class SimHost {
   state(): HostState {
     return {
       simulation: this.definition, params: this.params, signals: this.signals, signalViolations: this.signalViolations,
-      source: this.source, sourceId: this.sourceId, tracked: this.tracked, events: this.lastEvents, mapping: this.tracker.mapping, calibration: this.calibration,
+      source: this.source, sourceId: this.sourceId, tracked: this.tracked, events: this.lastEvents, mapping: this.tracker.mapping, calibration: this.calibration, hologram: this.settings.value.holograms[this.sourceId] ?? null, hologramSide: this.hologramSide,
       perf: this.perf, warnings: this.warnings, gpu: this.gpu, dpr: this.canvas.width / Math.max(1, this.canvas.clientWidth), width: this.canvas.width, height: this.canvas.height,
       quality: this.settings.value.quality, solid: this.settings.value.solid, recording: { active: this.recording, frames: this.recorder.length },
       telemetry: { sent: this.bus.sent, rateHz: this.bus.rateHz, transports: this.bus.transportStatus() }, contextLost: this.contextLost,

@@ -6,7 +6,7 @@
  * The overlay never touches simulation state directly; it only calls host
  * methods and re-renders from `host.state()`.
  */
-import type { AnyParamValue, ParamSpec } from '../core/types';
+import type { AnyParamValue, ParamSpec, Vec3 } from '../core/types';
 import type { SimHost, HostState } from '../host/app';
 import { SIMULATIONS } from '../host/registry';
 import { SOLID_CHOICES, type SolidChoice } from '../host/settings';
@@ -210,6 +210,9 @@ export class Overlay {
     this.sourceBox.replaceChildren(...nodes);
   }
 
+  /** Set by the player: opens the hologram calibration screen. */
+  onCalibrateHologram: (() => void) | null = null;
+  private hologramStatus = el('div', { class: 'status' });
   private mappingInputs: Record<Axis, { from: HTMLSelectElement; low: HTMLInputElement; high: HTMLInputElement; mirror: HTMLInputElement }> | null = null;
   private buildMapping(s: HostState) {
     const inputs = {} as NonNullable<typeof this.mappingInputs>;
@@ -224,7 +227,9 @@ export class Overlay {
     }
     this.mappingInputs = inputs;
     const capture = (kind: keyof CalibrationCaptures) => el('button', { onclick: () => { try { this.host.captureCalibration(kind); this.calibrationStatus.textContent = `Captured ${label(kind)}.`; this.calibrationStatus.className = 'status ok'; } catch (error) { this.calibrationStatus.textContent = error instanceof Error ? error.message : String(error); this.calibrationStatus.className = 'status error'; } } }, label(kind));
-    rows.push(el('p', { class: 'hint' }, 'Hold the hand at each corner of the intended play area and capture; then apply. Depth captures are optional.'));
+    rows.push(el('p', { class: 'hint' }, 'Hologram: the picture is a plane the camera sees edge-on. Touch nine X\u2019s on it to fit the plane; the source then feeds the water with screen position and distance from the picture (key X).'));
+    rows.push(el('div', { class: 'row' }, el('button', { class: 'primary', onclick: () => this.onCalibrateHologram?.() }, 'Calibrate hologram\u2026'), el('button', { onclick: () => { this.host.clearHologram(); this.calibrationStatus.textContent = 'Hologram calibration cleared; mapping reset to the source default.'; this.calibrationStatus.className = 'status'; } }, 'Clear hologram')), this.hologramStatus);
+    rows.push(el('p', { class: 'hint' }, 'Two-corner: hold the hand at each corner of the intended play area and capture; then apply. Depth captures are optional.'));
     rows.push(el('div', { class: 'row' }, capture('bottomLeft'), capture('topRight'), capture('withdrawn'), capture('pushed')));
     rows.push(el('div', { class: 'row' }, el('button', { class: 'primary', onclick: () => { try { this.host.applyCalibration(); this.host.clearCalibration(); this.calibrationStatus.textContent = 'Calibration applied.'; this.calibrationStatus.className = 'status ok'; } catch (error) { this.calibrationStatus.textContent = error instanceof Error ? error.message : String(error); this.calibrationStatus.className = 'status error'; } } }, 'Apply calibration'), el('button', { onclick: () => { this.host.resetMapping(); this.calibrationStatus.textContent = 'Mapping reset to the source default.'; this.calibrationStatus.className = 'status'; } }, 'Reset mapping')));
     this.mappingBox.replaceChildren(...rows);
@@ -242,6 +247,9 @@ export class Overlay {
       if ([i.from, i.low, i.high, i.mirror].includes(document.activeElement as HTMLInputElement)) continue;
       i.from.value = m.from; i.low.value = String(m.low); i.high.value = String(m.high); i.mirror.checked = m.mirror;
     }
+    const h = s.hologram;
+    const text = h ? `Hologram calibrated ${new Date(h.capturedAt).toLocaleString()} \u00b7 mean error ${(h.rmsError * 100).toFixed(1)}% of the width \u00b7 hologram on the ${s.hologramSide} end of the depth axis` : `No hologram calibration for this source (hologram seen on the ${s.hologramSide} end of the depth axis).`;
+    if (this.hologramStatus.textContent !== text) this.hologramStatus.textContent = text;
   }
 
   private telemetrySection(): HTMLElement {
@@ -324,13 +332,29 @@ export class Overlay {
     const w = c.width, h = c.height;
     ctx.fillStyle = '#070908'; ctx.fillRect(0, 0, w, h);
     const scan = s.tracked.surface;
+    // With a hologram calibration the volume's height is the distance from the picture and its depth runs up the
+    // screen, so the front view would draw a finger pointing at the picture as a tall streak. Show the picture as
+    // the performer sees it instead: screen x across, screen y down, brighter the nearer the plane (touching = brightest).
+    const screenView = !!s.hologram && s.mapping.y.from === 'z';
+    const toX = (p: Vec3) => p.x * w, toY = (p: Vec3) => (1 - (screenView ? p.z : p.y)) * h;
+    const nearness = (p: Vec3) => 1 - Math.min(1, Math.max(0, screenView ? p.y : p.z));
     if (scan) {
-      // The depth scan: nearer cells brighter.
       const cw = w / scan.width, ch = h / scan.height;
-      for (let row = 0; row < scan.height; row++) for (let col = 0; col < scan.width; col++) {
-        const i = row * scan.width + col; if (!scan.mask[i]) continue;
-        const near = 1 - Math.min(1, Math.max(0, scan.z[i]));
-        ctx.fillStyle = `rgba(150, 200, 255, ${.15 + .7 * near})`; ctx.fillRect(col * cw, h - (row + 1) * ch, cw + .5, ch + .5);
+      if (screenView) {
+        // Rows are heights above the plane, z the position up the screen. Highest rows first, so where several
+        // cells land on one spot the one nearest the plane is drawn last and wins.
+        const dot = Math.max(2, cw);
+        for (let row = scan.height - 1; row >= 0; row--) for (let col = 0; col < scan.width; col++) {
+          const i = row * scan.width + col; if (!scan.mask[i]) continue;
+          const near = 1 - (row + .5) / scan.height;
+          ctx.fillStyle = `rgba(150, 200, 255, ${.15 + .7 * near})`; ctx.fillRect(col * cw, (1 - scan.z[i]) * h - dot / 2, cw + .5, dot);
+        }
+      } else {
+        // Front view of the depth scan: nearer cells brighter.
+        for (let row = 0; row < scan.height; row++) for (let col = 0; col < scan.width; col++) {
+          const i = row * scan.width + col; if (!scan.mask[i]) continue;
+          ctx.fillStyle = `rgba(150, 200, 255, ${.15 + .7 * nearness({ x: 0, y: 0, z: scan.z[i] })})`; ctx.fillRect(col * cw, h - (row + 1) * ch, cw + .5, ch + .5);
+        }
       }
     }
     const occ = s.tracked.occupancy;
@@ -342,16 +366,24 @@ export class Overlay {
       }
     }
     ctx.strokeStyle = '#2c342f'; ctx.strokeRect(.5, .5, w - 1, h - 1);
+    if (screenView) {
+      // The part of the picture the hologram shows (see the calibration screen's active-area step).
+      const a = this.host.hologramArea;
+      ctx.setLineDash([4, 3]); ctx.strokeStyle = '#4a5a4c'; ctx.strokeRect(a.x0 * w + .5, a.y0 * h + .5, (a.x1 - a.x0) * w - 1, (a.y1 - a.y0) * h - 1); ctx.setLineDash([]);
+      ctx.fillStyle = '#4a5a4c'; ctx.fillText('screen view · bright = at the picture', 4, h - 4);
+    }
     for (const hand of s.tracked.hands) {
-      // Front view: nearer hands (z → 0) draw larger, as the window camera would show them.
-      const x = hand.position.x * w, y = (1 - hand.position.y) * h, size = 4 + 10 * (1 - hand.position.z);
-      ctx.strokeStyle = 'rgba(185, 236, 128, .5)'; ctx.strokeRect(hand.extent.min.x * w, (1 - hand.extent.max.y) * h, (hand.extent.max.x - hand.extent.min.x) * w, (hand.extent.max.y - hand.extent.min.y) * h);
+      // Nearer hands (to the window, or to the picture in the screen view) draw larger.
+      const x = toX(hand.position), y = toY(hand.position), size = 4 + 10 * nearness(hand.position);
+      const ex0 = toX(hand.extent.min), ex1 = toX(hand.extent.max), ey0 = Math.min(toY(hand.extent.min), toY(hand.extent.max)), ey1 = Math.max(toY(hand.extent.min), toY(hand.extent.max));
+      ctx.strokeStyle = 'rgba(185, 236, 128, .5)'; ctx.strokeRect(ex0, ey0, ex1 - ex0, ey1 - ey0);
       // The solid shape, when the source knows it: each capsule as a stroke of its own thickness.
       ctx.strokeStyle = 'rgba(185, 236, 128, .8)'; ctx.lineCap = 'round';
-      for (const c of hand.capsules) { ctx.lineWidth = Math.max(1, c.radius * 2 * w); ctx.beginPath(); ctx.moveTo(c.a.x * w, (1 - c.a.y) * h); ctx.lineTo(c.b.x * w, (1 - c.b.y) * h); ctx.stroke(); }
+      for (const c of hand.capsules) { ctx.lineWidth = Math.max(1, c.radius * 2 * w); ctx.beginPath(); ctx.moveTo(toX(c.a), toY(c.a)); ctx.lineTo(toX(c.b), toY(c.b)); ctx.stroke(); }
       ctx.lineWidth = 1;
       ctx.beginPath(); ctx.arc(x, y, size, 0, Math.PI * 2); ctx.fillStyle = `rgba(185, 236, 128, ${.4 + .6 * hand.openness})`; ctx.fill();
-      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + hand.velocity.x * w * .25, y - hand.velocity.y * h * .25); ctx.strokeStyle = '#e5e9e4'; ctx.stroke();
+      const vy = screenView ? hand.velocity.z : hand.velocity.y;
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + hand.velocity.x * w * .25, y - vy * h * .25); ctx.strokeStyle = '#e5e9e4'; ctx.stroke();
       ctx.fillStyle = '#9aa79e'; ctx.fillText(`#${hand.id}`, x + 8, y - 8);
     }
     // Top view: x across, depth upward (the glass at the bottom edge, the back wall at the top).
@@ -359,7 +391,7 @@ export class Overlay {
     if (!tc) return;
     tc.fillStyle = '#070908'; tc.fillRect(0, 0, t.width, t.height);
     tc.strokeStyle = '#2c342f'; tc.strokeRect(.5, .5, t.width - 1, t.height - 1);
-    tc.fillStyle = '#4a5a4c'; tc.fillText('glass', 4, t.height - 4); tc.fillText('back', 4, 10);
+    tc.fillStyle = '#4a5a4c'; tc.fillText(screenView ? 'picture bottom' : 'glass', 4, t.height - 4); tc.fillText(screenView ? 'picture top' : 'back', 4, 10);
     if (scan) {
       // Top view of the scan: for each column, the nearest scanned depth.
       tc.fillStyle = 'rgba(150, 200, 255, .8)';

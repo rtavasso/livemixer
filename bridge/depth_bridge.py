@@ -87,7 +87,7 @@ import os
 import sys
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Sequence, TextIO
 
 try:
@@ -717,8 +717,15 @@ class AnalyzerConfig:
     fuse_tolerance_mm: float = DEFAULT_FUSE_TOLERANCE_MM
     slab_mm: float = DEFAULT_SLAB_MM
     front_wcells: int = DEFAULT_FRONT_WCELLS
+    background_s: float | None = None
+    background_margin_mm: float = 30.0
+    background_file: str | None = None
 
     def __post_init__(self) -> None:
+        if self.background_s is not None and not (math.isfinite(self.background_s) and self.background_s >= 0.0):
+            raise ValueError("background_s must be non-negative")
+        if not (self.background_margin_mm >= 0.0):
+            raise ValueError("background_margin_mm must be non-negative")
         if self.scan_fuse not in SCAN_FUSE_MODES:
             raise ValueError(f"scan_fuse must be one of {SCAN_FUSE_MODES}, got {self.scan_fuse!r}")
         if not (self.fuse_tolerance_mm >= 0.0):
@@ -1303,6 +1310,65 @@ class RateMeter:
         return self.value
 
 
+class BackgroundModel:
+    """Learns the empty scene, then removes it, so an enclosure's walls inside the box are not a hand.
+
+    For the first ``seconds`` of frames (keep the box empty) the nearest depth
+    seen at each pixel is kept and the frames go out empty. Afterwards a pixel
+    survives only if it is more than ``margin_mm`` in front of that scene; the
+    scene is first spread over a 5x5 neighbourhood so its edges do not flicker
+    through. Pixels the empty scene never measured have no background.
+    """
+
+    UNSEEN = np.iinfo(np.uint16).max
+
+    def __init__(self, seconds: float, margin_mm: float, path: str | None = None) -> None:
+        self.seconds, self.margin_mm, self.path = float(seconds), float(margin_mm), path
+        self._started: float | None = None
+        self._nearest: np.ndarray | None = None
+        self._limit: np.ndarray | None = None
+        if path and os.path.isfile(path):
+            try:
+                loaded = np.load(path)
+                if loaded.dtype == np.uint16 and loaded.ndim == 2:
+                    self._limit = loaded
+                    log.info("background loaded from %s (%dx%d); delete the file to learn the scene again", path, loaded.shape[1], loaded.shape[0])
+            except (OSError, ValueError) as exc:
+                log.warning("could not load the background from %s: %s", path, exc)
+
+    @property
+    def ready(self) -> bool:
+        return self._limit is not None
+
+    def apply(self, depth_mm: np.ndarray, timestamp: float) -> np.ndarray:
+        if self._limit is not None and self._limit.shape == depth_mm.shape:
+            return np.where(depth_mm < self._limit, depth_mm, 0).astype(np.uint16)
+        if self._nearest is None or self._nearest.shape != depth_mm.shape:
+            self._started, self._limit = timestamp, None
+            self._nearest = np.full(depth_mm.shape, self.UNSEEN, dtype=np.uint16)
+        np.minimum(self._nearest, np.where(depth_mm > 0, depth_mm, self.UNSEEN), out=self._nearest)
+        assert self._started is not None
+        if timestamp - self._started >= self.seconds:
+            nearest = self._nearest
+            if cv2 is not None:
+                nearest = cv2.erode(nearest, np.ones((5, 5), np.uint8))
+            else:
+                padded = np.pad(nearest, 2, mode="edge")
+                nearest = np.min([padded[dy:dy + nearest.shape[0], dx:dx + nearest.shape[1]] for dy in range(5) for dx in range(5)], axis=0)
+            limit = np.clip(nearest.astype(np.int64) - int(round(self.margin_mm)), 0, self.UNSEEN).astype(np.uint16)
+            limit[nearest == self.UNSEEN] = self.UNSEEN
+            self._limit = limit
+            log.info("background learned over %.1f s: %d of %d pixels have a surface behind them; anything within %g mm of it is ignored",
+                     self.seconds, int((nearest < self.UNSEEN).sum()), nearest.size, self.margin_mm)
+            if self.path:
+                try:
+                    np.save(self.path, limit)
+                    log.info("background saved to %s", self.path)
+                except OSError as exc:
+                    log.warning("could not save the background to %s: %s", self.path, exc)
+        return np.zeros_like(depth_mm)
+
+
 class BoxAnalyzer:
     """Turns a depth frame into blobs, an occupancy grid, and stats.
 
@@ -1348,6 +1414,7 @@ class BoxAnalyzer:
             self.upright = UprightGeometry(self.intrinsics, box)
         self.tracker = BlobTracker(self.config.max_jump, self.config.max_missed)
         self._rate = RateMeter()
+        self.background = BackgroundModel(self.config.background_s, self.config.background_margin_mm, self.config.background_file) if self.config.background_s is not None else None
         self._fusion = _import_scan_fusion() if self.config.scan_fuse != "off" else None
         self._model_canvas: np.ndarray | None = None  # reused across frames: a fresh 1 MB float32 image costs more than rendering into it
         self._front_canvas: np.ndarray | None = None  # upright mode: the model's front and back faces over the front-view grid
@@ -1505,6 +1572,8 @@ class BoxAnalyzer:
 
     def analyze(self, frame: DepthFrame) -> AnalysisResult:
         started = time.perf_counter()
+        if self.background is not None:
+            frame = replace(frame, depth_mm=self.background.apply(frame.depth_mm, frame.timestamp))
         if self.upright is not None:
             return self._analyze_upright(frame, started)
         cfg, box = self.config, self.box
@@ -1769,6 +1838,10 @@ def _websockets_api() -> tuple[Callable[..., Any], Callable[..., Any], type[Base
     return serve, broadcast, ConnectionClosed
 
 
+class SourceGaveUp(RuntimeError):
+    """The source failed more times in a row than ``max_restarts`` allows."""
+
+
 class BridgeServer:
     """Asyncio WebSocket server that broadcasts analyzer output to every client.
 
@@ -1779,7 +1852,9 @@ class BridgeServer:
     ``status`` messages and trigger a restart with backoff.
     """
 
-    def __init__(self, source: FrameSource, analyzer: BoxAnalyzer, hello: dict[str, Any], host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
+    def __init__(self, source: FrameSource, analyzer: BoxAnalyzer, hello: dict[str, Any], host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, max_restarts: int | None = None) -> None:
+        #: Consecutive failed source restarts after which :meth:`run` gives up (``None``: never), so a supervisor can start a fresh process.
+        self.max_restarts = max_restarts
         self.source, self.analyzer, self.hello, self.host, self.port = source, analyzer, hello, host, port
         self._clients: set[Any] = set()
         self._serve, self._broadcast, self._closed = _websockets_api()
@@ -1823,11 +1898,16 @@ class BridgeServer:
         return True
 
     async def _pump(self) -> None:
-        backoff = 1.0
+        backoff, failures = 1.0, 0
         while True:
             if await self.pump_once():
-                backoff = 1.0
+                backoff, failures = 1.0, 0
                 continue
+            failures += 1
+            if self.max_restarts is not None and failures > self.max_restarts:
+                log.error("%s failed %d times in a row; giving up so a fresh process can take over", self.source.name, failures)
+                self.broadcast(status_message("error", f"{self.source.name}: giving up after {failures} failures; restarting the bridge"))
+                raise SourceGaveUp(failures)
             await asyncio.sleep(backoff)
             backoff = min(8.0, backoff * 2.0)
             try:
@@ -1930,6 +2010,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dump", type=int, metavar="N", help="print the hello and N frames as JSON lines to stdout, then exit")
     p.add_argument("--points", type=int, default=16, help=f"sample points per blob, 0..{MAX_POINTS} (default: %(default)s)")
     p.add_argument("--morph", type=int, default=1, help="3x3 opening iterations for speckle removal, 0 to disable (default: %(default)s)")
+    p.add_argument("--background", type=float, default=None, metavar="SECONDS", help="learn the empty scene for this long at start-up (keep hands out), then ignore whatever it saw: for an enclosure whose walls or screen stand inside the box (default: off)")
+    p.add_argument("--background-file", default=None, metavar="PATH", help="with --background, save the learned scene here (.npy) and reuse it on later starts instead of learning again; delete the file to relearn")
+    p.add_argument("--background-margin", type=float, default=30.0, metavar="MM", help="with --background, how far in front of the learned scene a pixel must be to count (default: %(default)s)")
+    p.add_argument("--max-restarts", type=int, default=None, metavar="N", help="exit with status 3 after N consecutive failed source restarts instead of retrying forever, so a supervisor (bridge/run-leap.sh) can start a fresh process; the Leap service sometimes re-enumerates the camera in a way only a new LeapC connection from a new process recovers from (default: keep retrying)")
     p.add_argument("--max-jump", type=float, default=0.25, help="largest normalized centroid move per frame that keeps a blob id (default: %(default)s)")
     p.add_argument("--resolution", type=int, nargs=2, default=(640, 480), metavar=("W", "H"), help="camera/synthetic frame size (default: 640 480)")
     p.add_argument("--decimation", type=int, default=0, help="RealSense decimation filter magnitude, 0 = off (default: %(default)s)")
@@ -2032,6 +2116,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             sample_points=args.points, max_jump=args.max_jump,
             scan_fuse=args.scan_fuse, fuse_tolerance_mm=args.fuse_tolerance,
             slab_mm=args.slab_mm, front_wcells=args.front_wcells,
+            background_s=args.background, background_margin_mm=args.background_margin, background_file=args.background_file,
         )
     except ValueError as exc:
         parser.error(str(exc))
@@ -2063,14 +2148,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (RuntimeError, NotImplementedError) as exc:
         log.error("%s", exc)
         return 1
-    server = BridgeServer(source, analyzer, hello, args.host, args.port)
+    server = BridgeServer(source, analyzer, hello, args.host, args.port, max_restarts=args.max_restarts)
+    code = 0
     try:
         asyncio.run(server.run())
     except KeyboardInterrupt:
         log.info("stopping")
+    except SourceGaveUp:
+        code = 3
     finally:
         source.stop()
-    return _finish(source, 0)
+    return _finish(source, code)
 
 
 if __name__ == "__main__":
