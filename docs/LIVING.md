@@ -30,7 +30,8 @@ does not change with the simulation:
    reflection, is learned): `sh bridge/run-leap.sh`. The box is 20-55 cm above the controller; the
    picture spans about 25-46 cm.
    It restarts the Ultraleap service by itself when the controller stops streaming (a known Hyperion
-   6.2 stall). On a new machine, allow that once with `sudo sh bridge/install-leap-restart.sh`; see
+   6.2 stall). On a new machine, allow that once with `sudo sh bridge/install-leap-restart.sh`, and
+   tick *inverted orientation* in the Ultraleap Control Panel (without it no hand is detected); see
    *Keeping it running* in [the bridge README](../bridge/README.md).
 2. **Vite**: `npm run dev`.
 3. **Simulation page**: `http://127.0.0.1:4178/sim.html?source=depth&sim=tide&overlay=0`, fullscreen with **F**.
