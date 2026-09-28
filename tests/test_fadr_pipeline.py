@@ -23,6 +23,10 @@ class PipelineTests(unittest.TestCase):
         self.assertIsNotNone(audio.match_score(track, candidate))
         for title in ['THAT GUY (clean)', 'THAT GUY live', 'THAT GUY cover', 'THAT GUY (slowed)', 'Something Else']:
             self.assertIsNone(audio.match_score(track, {**candidate, 'title': title}))
+        # Studio and radio sessions are other recordings too (a "Selector Radio Session" once got through).
+        for title in ["Tyler, The Creator 'THAT GUY' Selector Radio Session", 'Tyler, The Creator - THAT GUY (Sessions)',
+                      'Tyler, The Creator - THAT GUY | Tiny Desk Performance']:
+            self.assertIsNone(audio.match_score(track, {**candidate, 'title': title}), title)
         self.assertIsNone(audio.match_score(track, {**candidate, 'duration': 30}))
         self.assertIsNone(audio.match_score(track, {**candidate, 'title': 'THAT GUY', 'channel': 'Someone Else'}))
 

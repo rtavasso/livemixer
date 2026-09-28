@@ -28,7 +28,7 @@ def match_score(track, candidate):
     found_title = words(candidate.get("title") or "")
     found = found_title | words(candidate.get("channel") or candidate.get("uploader") or "")
     artist = words(track["artist"].split(",\u00a0")[0])
-    versions = {"live", "remix", "cover", "instrumental", "karaoke", "slowed", "sped", "acoustic", "nightcore", "reverb", "remaster", "remastered", "clean", "censored", "extended"}
+    versions = {"live", "remix", "cover", "instrumental", "karaoke", "slowed", "sped", "acoustic", "nightcore", "reverb", "remaster", "remastered", "clean", "censored", "extended", "session", "sessions", "performance"}
     if (found_title & versions) - (words(track["title"]) & versions):
         return None
     if not title or not artist or not title <= found_title or len(artist & found) / len(artist) < 0.8:
