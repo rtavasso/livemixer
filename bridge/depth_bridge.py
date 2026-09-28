@@ -2046,6 +2046,7 @@ def build_parser() -> argparse.ArgumentParser:
     leap.add_argument("--swap-cameras", action="store_true", help="exchange the two cameras before matching (use when the depth image stays empty with a hand over the device)")
     leap.add_argument("--leap-orient", choices=LEAP_ORIENTATIONS, default="none", help="rotate/flip the depth image before analysis so image right/down mean what the browser expects (default: none)")
     leap.add_argument("--leap-hand-frame", default="auto", metavar="MODE", help="how the LeapC hand skeleton is projected onto the depth image: 'auto' (default: every convention is scored against the scan until one clearly leads) or a convention name u{+|-}{x|z}_v{+|-}{z|x}_ref{+|-}, see bridge/README.md")
+    leap.add_argument("--leap-timeout", type=float, default=20.0, metavar="S", help="treat the Leap as failed after S seconds without a stereo pair; the service streams even with the box empty, so silence means it stopped (default: %(default)s)")
     p.add_argument("--log-level", default="info", choices=("debug", "info", "warning", "error"))
     return p
 
@@ -2064,7 +2065,8 @@ def make_source(args: argparse.Namespace) -> FrameSource:
             if args.source == "leap-synthetic":
                 return leap.LeapSyntheticSource(view, params, args.swap_cameras, args.leap_orient, fps=args.fps, paced=args.dump is None, hand_frame=args.leap_hand_frame, far_mm=args.far * 1000.0)
             return leap.LeapStereoSource(args.leapc, view, params, args.swap_cameras, args.leap_orient, fps=args.fps, hand_frame=args.leap_hand_frame,
-                                         alignment=args.leap_align, calibration=args.leap_calibration, far_mm=args.far * 1000.0)
+                                         alignment=args.leap_align, calibration=args.leap_calibration, far_mm=args.far * 1000.0,
+                                         restart_after=args.leap_timeout)
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
     raise SystemExit(f"unknown source {args.source!r}")
