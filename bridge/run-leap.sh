@@ -14,6 +14,10 @@
 #
 # The picture spans ~25-46 cm above the controller: --near 0.2 keeps a hand touching its bottom edge whole.
 #
+# Hands come only from the Leap's own tracker (--no-blob-hands): the stereo scan invents surfaces around
+# 25-30 cm from false matches that no background removes, and those used to become phantom hands. The
+# scan itself still goes out for the simulations; pass --blob-hands to get scan blobs as hands again.
+#
 # Usage: sh bridge/run-leap.sh [extra depth_bridge.py arguments]
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -37,7 +41,7 @@ while :; do
   started=$(date +%s)
   uv run --no-project --python 3.12 --with numpy --with websockets --with opencv-python-headless \
     python bridge/depth_bridge.py --source leap --frame upright --near 0.2 --far 0.55 --box-mm 700 500 \
-    --background 4 --background-file bridge/.background.npy --max-restarts 0 --leap-timeout 8 "$@"
+    --background 4 --background-file bridge/.background.npy --max-restarts 0 --leap-timeout 8 --no-blob-hands "$@"
   code=$?
   [ "$code" -eq 130 ] && exit 0  # Ctrl-C
   [ $(( $(date +%s) - started )) -ge "$HEALTHY_S" ] && kicks=0

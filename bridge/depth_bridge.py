@@ -685,6 +685,9 @@ class AnalyzerConfig:
     A tracked hand (skeleton) is reported while its palm is inside the box
     widened by ``hand_margin`` on every axis (normalized units); farther out it
     is dropped like any pixel outside the box, instead of sticking to a wall.
+    With ``blob_hands`` off the blobs are still found and counted but never
+    reported as hands: only tracked hands are, so a source whose stereo can
+    invent a surface (the Leap) never turns that noise into a hand.
     ``scan_fuse`` (one of :data:`SCAN_FUSE_MODES`) fuses the reported hands'
     capsule model into the depth before the mask, the blobs, the occupancy,
     the voxels and the scan are computed from it: ``fill`` keeps a measurement
@@ -713,6 +716,7 @@ class AnalyzerConfig:
     depth_percentile: float = 10.0
     conf_saturation: float = 4.0
     hand_margin: float = 0.25
+    blob_hands: bool = True
     scan_fuse: str = DEFAULT_SCAN_FUSE
     fuse_tolerance_mm: float = DEFAULT_FUSE_TOLERANCE_MM
     slab_mm: float = DEFAULT_SLAB_MM
@@ -1524,6 +1528,8 @@ class BoxAnalyzer:
                 ))
         ids = self.tracker.update([(b.u, b.v) for b in blobs])
         tracked = tuple(Blob(id=i, u=b.u, v=b.v, w=b.w, extent=b.extent, conf=b.conf, pixels=b.pixels, points=b.points) for i, b in zip(ids, blobs))
+        if not cfg.blob_hands:
+            tracked = ()
 
         occupancy = voxels = surface = None
         fused_hands = model_cells = front_cells = 0
@@ -1631,6 +1637,8 @@ class BoxAnalyzer:
                 ))
         ids = self.tracker.update([(b.u, b.v) for b in blobs])
         tracked = tuple(Blob(id=i, u=b.u, v=b.v, w=b.w, extent=b.extent, conf=b.conf, pixels=b.pixels, points=b.points) for i, b in zip(ids, blobs))
+        if not cfg.blob_hands:
+            tracked = ()
 
         occupancy = downsample_occupancy(mask, *cfg.occupancy) if cfg.occupancy else None
         voxels = voxelize(roi, mask, near_mm, far_mm, *cfg.voxels) if cfg.voxels else None
@@ -2005,6 +2013,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--scan-fuse", choices=SCAN_FUSE_MODES, default=DEFAULT_SCAN_FUSE, help="fuse the tracked hands' capsule model into the depth before the scan, voxels, occupancy and blobs: 'fill' keeps measurements that agree with the model within --fuse-tolerance and takes the model where the measurement is missing or disagrees, 'blend' does the same with the measurement median-smoothed under the model and mixed toward the model by its local noise and depth (a far, noisy hand reads as the smooth model), 'model' takes the model wherever it has a surface, 'off' uses the measurement alone (default: %(default)s)")
     p.add_argument("--fuse-tolerance", type=float, default=DEFAULT_FUSE_TOLERANCE_MM, metavar="MM", help="under --scan-fuse fill or blend, how far a measurement may differ from the model and still be kept (default: %(default)s mm)")
     p.add_argument("--min-pixels", type=int, default=150, help="smallest blob in pixels (default: %(default)s)")
+    p.add_argument("--blob-hands", action=argparse.BooleanOptionalAction, default=True, help="report depth blobs as hands when a frame has no tracked hand; --no-blob-hands reports only the Leap's tracked hands (the scan still carries everything) (default: on)")
     p.add_argument("--max-hands", type=int, default=2, help=f"largest number of blobs to report, 0..{MAX_HANDS} (default: %(default)s)")
     p.add_argument("--fps", type=float, default=30.0, help="capture rate (default: %(default)s)")
     p.add_argument("--dump", type=int, metavar="N", help="print the hello and N frames as JSON lines to stdout, then exit")
@@ -2114,7 +2123,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             occupancy=None if args.no_occupancy else tuple(args.occupancy),
             voxels=None if args.no_voxels else tuple(args.voxels),
             surface=None if args.no_surface else tuple(args.surface),
-            min_pixels=args.min_pixels, max_hands=args.max_hands, morph_iterations=args.morph,
+            min_pixels=args.min_pixels, max_hands=args.max_hands, blob_hands=args.blob_hands, morph_iterations=args.morph,
             sample_points=args.points, max_jump=args.max_jump,
             scan_fuse=args.scan_fuse, fuse_tolerance_mm=args.fuse_tolerance,
             slab_mm=args.slab_mm, front_wcells=args.front_wcells,

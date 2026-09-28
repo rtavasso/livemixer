@@ -738,6 +738,20 @@ class TrackedHandTests(ProtocolAssertions):
             self.assertEqual(m["hands"][0]["id"], result.blobs[0].id)
             self.assert_frame(m, (8, 6), (8, 6, 4), (8, 6))
 
+    def test_without_blob_hands_only_tracked_hands_are_reported(self) -> None:
+        src, t = synthetic(), 2.0
+        analyzer = make_analyzer(blob_hands=False)
+        result = analyzer.analyze(db.DepthFrame(src.render(t), t, ()))
+        self.assertEqual(result.blobs, (), "a blob is never promoted to a hand")
+        self.assertEqual(result.stats["blobs"], 1.0, "but it is still counted")
+        m = db.frame_message(0, 0.0, result)
+        self.assertEqual(m["hands"], [])
+        self.assert_frame(m, (8, 6), (8, 6, 4), (8, 6))
+        self.assertTrue(any(c != "A" for c in m["surface"][:64]), "the scan still carries the foreground")
+        tracked = analyzer.analyze(db.DepthFrame(src.render(t), t, src.tracked_hands(t)))
+        self.assertEqual(len(db.frame_message(1, 0.0, tracked)["hands"]), 1)
+        self.assertEqual(set(db.frame_message(1, 0.0, tracked)["hands"][0]), TRACKED_HAND_KEYS)
+
     def test_hand_outside_the_box_is_dropped(self) -> None:
         analyzer = make_analyzer()
         depth = backdrop()
