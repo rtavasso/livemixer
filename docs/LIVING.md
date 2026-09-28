@@ -8,7 +8,7 @@ Music side: [LIVING-MUSIC.md](LIVING-MUSIC.md).
 |---|---|
 | **Tide** (`tide`) | An upright sheet of dark water that glows like plankton where it is disturbed, home to a school of luminous eels. A still hand draws them in; a splash scatters them. |
 | **Lantern** (`lantern`) | One translucent jellyfish that swims in time with the music, comes to a still hand and drapes its tentacles over it; a poke makes it flinch, fast motion sends it away. |
-| **Murmuration** (`murmuration`) | Thousands of motes of light flocking in folding ribbons; a gentle hand gathers an orbiting halo, stillness tightens it into a ring, fast motion tears it apart. |
+| **Murmuration** (`murmuration`) | Thousands of motes of light flocking in folding ribbons; a gentle hand gathers an orbiting halo, stillness tightens it into a ring, fast motion tears it apart. Drawn in depth: far motes contract, soften and fade, glints run through a banking sheet, and the far half shades from gold to rose (*Perspective*, *Shimmer*, *Colour depth*, *Glow*; all at 0 is the flat original). |
 
 All three are emissive light on black (black is invisible in the ghost), fade out at the calibrated
 active area and over the top of the picture where the Leap is weakest, and share one mood model:

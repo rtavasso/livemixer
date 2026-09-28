@@ -12,21 +12,30 @@
  * the motes are uploaded (bufferSubData) and drawn as instanced, additive streak sprites from
  * last frame's position to this one's into a half-float accumulation target (RGBA8 fallback) that
  * decays over `trail` seconds, then composited with the ghost frame (active area and weak top
- * band fade to black) and a tone map.
+ * band fade to black) and a tone map. `perspective` projects the motes' depth into perspective, size,
+ * atmosphere and depth of field; `shimmer` is the banking glint; `colorDepth` grades far motes
+ * toward dusk; `glow` adds a quarter-resolution bloom of the accumulation. All four at 0 draw the
+ * flat original look.
  */
 import { defineSimulation } from '../../core/types';
 import { hexToRgb } from '../../core/params';
-import { PingPong, bindScreen, pickFormat } from '../../gl/fbo';
+import { Fbo, PingPong, bindScreen, pickFormat } from '../../gl/fbo';
 import { Program } from '../../gl/program';
 import { drawQuad, quadProgram } from '../../gl/quad';
 import { LIVING_SIGNALS, areaUniform } from '../living';
 import { MurmurationState } from './flock';
-import { COMPOSITE_FS, DECAY_FS, MOTE_FS, MOTE_VS } from './shaders';
+import { BLUR_FS, COMPOSITE_FS, DECAY_FS, DOWNSAMPLE_FS, MOTE_FS, MOTE_VS } from './shaders';
 
 /** Soft edge of the ghost frame (uv). */
 const EDGE = .035;
 /** Tone-map exposure. */
 const EXPOSURE = 6;
+/** Colour depth: the middle distance, the far end, and the tint of a glint. */
+const ROSE: [number, number, number] = [.96, .6, .64];
+const DUSK: [number, number, number] = [.5, .42, 1];
+const GLINT: [number, number, number] = [1, .7, .62];
+/** Where the light comes from for the banking glint (screen direction, y up): the upper left. */
+const SUN: [number, number] = [-.55, .835];
 
 export default defineSimulation({
   id: 'murmuration',
@@ -41,6 +50,10 @@ export default defineSimulation({
     flow: { kind: 'number', default: .55, min: 0, max: 1, step: .05, label: 'Flow', description: '0 = a cohesive, clumped flock; 1 = motes follow the large folding currents (ribbons and sheets).' },
     attraction: { kind: 'number', default: 1, min: 0, max: 2, step: .05, label: 'Hand attraction', description: 'How strongly the hand draws the flock.' },
     trail: { kind: 'number', default: .1, min: .03, max: .6, step: .01, unit: 's', label: 'Trail', description: 'How long a mote’s streak persists.' },
+    perspective: { kind: 'number', default: .7, min: 0, max: 1, step: .05, label: 'Perspective', description: 'Perspective, size range, atmospheric fade and depth of field from each mote’s depth. 0 = flat.' },
+    shimmer: { kind: 'number', default: .6, min: 0, max: 1, step: .05, label: 'Shimmer', description: 'Banking glint: motes heading toward the light brighten, so waves run through a turning sheet.' },
+    colorDepth: { kind: 'number', default: .6, min: 0, max: 1, step: .05, label: 'Colour depth', description: 'Far motes shade toward dusky violet and glints take a rose tint. 0 = one colour.' },
+    glow: { kind: 'number', default: .2, min: 0, max: 1, step: .05, label: 'Glow', description: 'Soft bloom where the flock is dense. Keep it low on the glass: haze shows as light.' },
   },
   signals: LIVING_SIGNALS,
   create(ctx, initial) {
@@ -52,6 +65,15 @@ export default defineSimulation({
     const moteProgram = new Program(gl, MOTE_VS, MOTE_FS, 'murmuration.motes');
     const decayProgram = quadProgram(gl, DECAY_FS, 'murmuration.decay');
     const compositeProgram = quadProgram(gl, COMPOSITE_FS, 'murmuration.composite');
+    const downsampleProgram = quadProgram(gl, DOWNSAMPLE_FS, 'murmuration.downsample');
+    const blurProgram = quadProgram(gl, BLUR_FS, 'murmuration.blur');
+    const glowTargets = (w: number, h: number): [Fbo, Fbo] => {
+      const gw = Math.max(1, Math.round(w / 4)), gh = Math.max(1, Math.round(h / 4));
+      const a = new Fbo(gl, gw, gh, format, 'linear'), b = new Fbo(gl, gw, gh, format, 'linear');
+      a.clear(); b.clear();
+      return [a, b];
+    };
+    let [glowA, glowB] = glowTargets(ctx.width, ctx.height);
 
     const vao = gl.createVertexArray();
     const buffer = gl.createBuffer();
@@ -127,15 +149,31 @@ export default defineSimulation({
           .f1('u_maxStreak', .02 * accum.height)
           .f1('u_gain', gain)
           .f3('u_color', r, g, b)
-          .f3('u_cool', .62, .78, 1);
+          .f3('u_cool', .62, .78, 1)
+          .f3('u_rose', ROSE[0], ROSE[1], ROSE[2])
+          .f3('u_dusk', DUSK[0], DUSK[1], DUSK[2])
+          .f3('u_glint', GLINT[0], GLINT[1], GLINT[2])
+          .f2('u_sun', SUN[0], SUN[1])
+          .f2('u_centre', (area[0] + area[2]) / 2, (area[1] + area[3]) / 2)
+          .f1('u_depth', params.perspective)
+          .f1('u_shimmer', params.shimmer)
+          .f1('u_hue', params.colorDepth);
         gl.bindVertexArray(vao);
         gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, n);
         gl.bindVertexArray(null);
         gl.disable(gl.BLEND);
-        // 3. Composite to the screen.
+        // 3. Glow at quarter resolution (skipped when off).
+        if (params.glow > 0) {
+          glowA.bind();
+          downsampleProgram.use().texture('u_src', accum.write.texture, 0).f2('u_texel', 1 / accum.width, 1 / accum.height);
+          drawQuad(gl);
+          glowB.bind(); blurProgram.use().texture('u_src', glowA.texture, 0).f2('u_dir', 1 / glowA.width, 0); drawQuad(gl);
+          glowA.bind(); blurProgram.use().texture('u_src', glowB.texture, 0).f2('u_dir', 0, 1 / glowA.height); drawQuad(gl);
+        }
+        // 4. Composite to the screen.
         bindScreen(gl, frame.width, frame.height);
-        compositeProgram.use().texture('u_accum', accum.write.texture, 0)
-          .f1('u_exposure', EXPOSURE)
+        compositeProgram.use().texture('u_accum', accum.write.texture, 0).texture('u_glow', glowA.texture, 1)
+          .f1('u_exposure', EXPOSURE).f1('u_glowAmount', params.glow > 0 ? params.glow : 0).f1('u_hue', params.colorDepth)
           .f4('u_area', area[0], area[1], area[2], area[3]).f1('u_edge', EDGE);
         drawQuad(gl);
         accum.swap();
@@ -145,12 +183,15 @@ export default defineSimulation({
         accum.dispose();
         accum = new PingPong(gl, width, height, format);
         accum.clear();
+        glowA.dispose(); glowB.dispose();
+        [glowA, glowB] = glowTargets(width, height);
       },
       paramChanged(name, value) {
         if (name === 'count' && typeof value === 'number') state.setCount(value);
       },
       dispose() {
-        accum.dispose(); moteProgram.dispose(); decayProgram.dispose(); compositeProgram.dispose();
+        accum.dispose(); glowA.dispose(); glowB.dispose();
+        moteProgram.dispose(); decayProgram.dispose(); compositeProgram.dispose(); downsampleProgram.dispose(); blurProgram.dispose();
         gl.deleteBuffer(buffer); gl.deleteVertexArray(vao);
       },
     };
