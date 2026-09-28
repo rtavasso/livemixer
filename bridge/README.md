@@ -85,6 +85,22 @@ The bridge cannot be checked against live images here, so it is written to fail 
 
 **Fix:** install current Ultraleap tracking software from Ultraleap's download page for the original controller, <https://www.ultraleap.com/downloads/leap-controller/> (Windows: *Ultraleap Hyperion* v6.2.0, `tracking-software-windows-6.2.0.exe`, about 600 MB; the "Leap Motion Service 5.0.0-preview" this was built against is the *Gemini Developer Preview* zip on the same page). Uninstall the preview first, keep the *Software Development Kit* component ticked so `LeapC.dll` lands in `C:\Program Files\Ultraleap\LeapSDK`, enable *Allow Images* (and *Allow Background Apps*) in its control panel, and run with `--leapc` pointing at its library, `C:\Program Files\Ultraleap\LeapSDK\lib\x64\LeapC.dll` (that path is searched first anyway, then the old Core Services install, then `$LEAPC_DLL`). The binding uses only calls present in every LeapC since 4.x, reads the `LEAP_CONNECTION_MESSAGE` layout off `msg.size` (16 bytes on 5.0, 20 on Gemini with its `device_id`), takes `LeapRectilinearToPixelEx` when it exists, and rebuilds its rectification maps whenever the images' `matrix_version` changes or the calibration comes back as NaN (which it does until the service has sent it). Two things could still need a first-run check on real images and are one flag each: if the depth image stays empty with a hand over the device, the two cameras are in the other order and `--swap-cameras` fixes it (`leap_source.py --dump-images` tries both orders and says which one puts pixels in the box); and the rectified pair should show the hand on the same rows in both eyes (the PNGs make that obvious).
 
+### Keeping it running on an installation: `run-leap.sh` and the service watchdog
+
+Hyperion 6.2 has its own failure, seen on the macOS installation machine several times (2026-09-21, 2026-09-28): the service logs `run_device_tracker error receiving video frames` in `/var/log/ultraleap/tracker_log.txt`, tears down its device tracker, and from then on sends **nothing** to any client, neither tracking nor images, until the service is restarted or the controller is replugged. The controller still shows up on USB and a new bridge process gets nothing either. Restarting the service reopens the controller within a second (the log shows `Created TrackingRunner` about 0.2 s after `Starting ... libtrack_server`).
+
+`sh bridge/run-leap.sh` supervises all of this. It runs the bridge with `--max-restarts 0 --leap-timeout 8`, so 8 s without a stereo pair (the service streams even with the box empty, so silence means it stopped) makes the bridge exit with status 3. The script then restarts the service with `launchctl kickstart -k system/com.ultraleap.tracking.service` and relaunches the bridge; recovery takes about 8 s. After three restarts in a row that do not bring frames back (the controller has really gone from USB), it prints *replug the controller* and waits 30 s before trying again. A bridge that ran for two minutes counts as healthy and resets the count.
+
+**Once per machine** (macOS), let it restart the service without a password:
+
+```sh
+sudo sh bridge/install-leap-restart.sh       # writes /etc/sudoers.d/livemixer-leap; remove that file to undo
+```
+
+The rule allows your user exactly one command as root, the `launchctl kickstart` above, and is checked with `visudo` before it is installed. Without it the script still detects the stall and says *cannot restart the Ultraleap tracking service without a password*; replugging the controller then recovers it by hand. To check a machine: `sudo -n -l /bin/launchctl kickstart -k system/com.ultraleap.tracking.service` prints the command when the rule is in place, and `npm run inspect:leap -- --seconds 5` should report frames (about 40 per second with an empty box).
+
+On Windows the service is not a launchd job and `run-leap.sh` does not apply; restart the *Ultraleap Tracking Service* from Services, or replug.
+
 ### What to expect
 
 - **Depth noise.** A 40 mm baseline with 240 px of focal length resolves `Z² / (40 * 240)` mm per pixel of disparity: 4 mm at 200 mm, 9 mm at 300 mm, 17 mm at 400 mm. The matcher works to 1/16 pixel on textured skin, so expect roughly 5-10 mm of depth noise at 30 cm and more at the silhouette, where block matching smears the hand a few pixels wider. On the synthetic scene the median error is about 1 % and the 90th percentile 2-3 % at 200-400 mm.
