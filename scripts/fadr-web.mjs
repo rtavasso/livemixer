@@ -79,6 +79,50 @@ async function ready(page, pro) {
     15_000, pro ? 'Waiting for Pro mode; an existing Fadr Plus subscription is required…' : 'Selecting Basic mode…');
 }
 
+// Fadr builds the stem ZIP in the page and hands it to the browser as a blob download; saving that
+// download through automation intermittently crashed Chromium and Brave (StreamingZip), so the page's
+// most recent ZIP blob is kept and read back directly. main() disables browser downloads.
+function keepZipBlobs() {
+  if (window.__livemixerZips) return;
+  window.__livemixerZips = [];
+  const create = URL.createObjectURL.bind(URL);
+  URL.createObjectURL = object => {
+    const url = create(object);
+    if (object instanceof Blob && object.size > 22) {
+      window.__livemixerZips.push({ blob: object, at: Date.now() });
+      if (window.__livemixerZips.length > 4) window.__livemixerZips.shift();
+    }
+    return url;
+  };
+}
+
+async function latestZip(page, since) {
+  return page.evaluate(async since => {
+    for (const { blob, at } of [...(window.__livemixerZips ?? [])].reverse()) {
+      if (at < since) continue;
+      const head = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
+      if (head[0] === 0x50 && head[1] === 0x4b && head[2] === 3 && head[3] === 4) { window.__livemixerZip = blob; return blob.size; }
+    }
+    return 0;
+  }, since);
+}
+
+async function readZip(page, size) {
+  const chunks = [];
+  for (let offset = 0, step = 8 * 1024 * 1024; offset < size; offset += step) {
+    const base64 = await page.evaluate(([offset, step]) => new Promise((done, fail) => {
+      const reader = new FileReader();
+      reader.onload = () => done(String(reader.result).slice(String(reader.result).indexOf(',') + 1));
+      reader.onerror = () => fail(reader.error);
+      reader.readAsDataURL(window.__livemixerZip.slice(offset, offset + step));
+    }), [offset, step]);
+    chunks.push(Buffer.from(base64, 'base64'));
+  }
+  const bytes = Buffer.concat(chunks);
+  if (bytes.length !== size) throw new Error(`Read ${bytes.length} of ${size} ZIP bytes from the page`);
+  return bytes;
+}
+
 export async function splitPlaylist(page, manifestPath, { format = 'mp3', more = true, only, timeout = 20 * 60_000 } = {}) {
   if (!['mp3', 'wav'].includes(format)) throw new Error('Format must be mp3 or wav');
   manifestPath = resolve(manifestPath);
@@ -114,7 +158,7 @@ export async function splitPlaylist(page, manifestPath, { format = 'mp3', more =
           if (await search.count()) {
             await search.fill(id);
             const item = page.locator('.song-preview[title]').filter({ hasText: `[${id}]` });
-            await delay(1000);
+            for (let waited = 0; waited < 10_000 && !await item.count(); waited += 500) await delay(500);
             if (await item.count() === 1) await item.click();
             else if (await item.count() > 1) throw new Error('Multiple prior uploads match this track; resolve in Fadr');
             await search.fill('');
@@ -189,10 +233,13 @@ export async function splitPlaylist(page, manifestPath, { format = 'mp3', more =
         if (wav !== (format === 'wav')) await quality.click();
         await save(statePath, state);
         const start = menu.locator('button.context-menu-option').filter({ has: page.locator('.icon.download') });
-        const [download] = await Promise.all([page.waitForEvent('download', { timeout }), start.click()]);
-        if (!/\.zip$/i.test(download.suggestedFilename())) throw new Error(`Expected a stem ZIP, got ${download.suggestedFilename()}`);
+        await page.evaluate(keepZipBlobs);
+        const clicked = Date.now() - 1000;
+        await start.click();
+        let size = 0;
+        await until(async () => (size = await latestZip(page, clicked)) > 0, timeout, 'Waiting for Fadr to build the stem ZIP…');
         await mkdir(dirname(archive), { recursive: true });
-        await download.saveAs(`${archive}.partial`);
+        await writeFile(`${archive}.partial`, await readZip(page, size));
         await rename(`${archive}.partial`, archive);
         record.archive = relative(root, archive);
         await save(statePath, state);
@@ -236,9 +283,10 @@ async function main() {
   if (command === 'import' && !values.output) throw new Error('Import requires --output');
   if (!['browser', 'curl'].includes(values['upload-transport'])) throw new Error('Upload transport must be browser or curl');
   const context = await chromium.launchPersistentContext(resolve(values.profile), {
-    headless: false, acceptDownloads: true,
+    headless: false, acceptDownloads: false,
     ...(process.env.LIVEMIXER_BROWSER_EXECUTABLE ? { executablePath: process.env.LIVEMIXER_BROWSER_EXECUTABLE } : {}),
   });
+  await context.addInitScript(keepZipBlobs);
   const page = context.pages()[0] ?? await context.newPage();
   page.setDefaultTimeout(15_000);
   try {
