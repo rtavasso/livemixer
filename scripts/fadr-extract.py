@@ -3,10 +3,29 @@ import argparse
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import stat
 import tempfile
 import zipfile
+
+AUDIO = r"mp3|wav|flac|m4a"
+# Since 2026-09-28 Fadr may name stems "<source>.mp3-drums-kick.mp3" instead of "Kick - <song>.mp3".
+SUFFIXED = re.compile(rf"^(?P<source>.+\.(?:{AUDIO}))-(?P<stem>[a-z0-9]+(?:-[a-z0-9]+)*)\.(?P<ext>{AUDIO})$", re.IGNORECASE)
+SUBDIVIDED = ("vocals", "drums")
+
+
+def canonical_name(name):
+    """The "Role - <source>" name the rest of the pipeline reads; other names are returned unchanged."""
+    match = SUFFIXED.match(name)
+    if not match:
+        return name
+    stem = match["stem"].lower()
+    for parent in SUBDIVIDED:
+        if stem.startswith(parent + "-"):
+            stem = stem[len(parent) + 1:]
+            break
+    return f"{stem[:1].upper()}{stem[1:]} - {match['source']}"
 
 
 def sha256(path):
@@ -43,13 +62,14 @@ def extract(archive, output, roles=()):
                     raise ValueError("Unsafe path in ZIP")
                 if item.is_dir() or name.suffix.lower() not in {".mp3", ".wav", ".flac", ".m4a"} or "__MACOSX" in name.parts:
                     continue
-                if name.name.casefold() in names:
+                stem_name = canonical_name(name.name)
+                if stem_name.casefold() in names:
                     raise ValueError("Duplicate stem filenames in ZIP")
-                names.add(name.name.casefold())
+                names.add(stem_name.casefold())
                 total += item.file_size
                 if item.file_size > 512 * 1024**2 or total > 4 * 1024**3 or len(names) > 100:
                     raise ValueError("ZIP exceeds stem extraction limits")
-                selected.append((item, name.name))
+                selected.append((item, stem_name))
             if not selected:
                 raise ValueError("ZIP contains no audio stems")
             verify_roles([name for _, name in selected], roles)

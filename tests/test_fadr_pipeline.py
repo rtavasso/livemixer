@@ -35,6 +35,26 @@ class PipelineTests(unittest.TestCase):
         base = {'title': 'FORLORN', 'channel': 'Black Hibiscus', 'duration': 170}
         self.assertGreater(audio.match_score(track, {**base, 'channel': 'Black Hibiscus - Topic'}), audio.match_score(track, base))
 
+    def test_extract_renames_source_suffixed_stems(self):
+        # Fadr switched mid-batch from "Kick - Song.mp3" to "<source>.mp3-drums-kick.mp3".
+        source = 'Sports _ Drama King [27-0uBW2Tfq0eWV0Mq15O0hrN].mp3'
+        ids = ['vocals', 'vocals-vocals-lead', 'vocals-vocals-background', 'piano', 'guitar', 'pro-other',
+               'drums', 'drums-drums-other', 'drums-kick', 'drums-snare', 'bass', 'instrumental']
+        roles = ['Vocals', 'Lead Vocals', 'Background Vocals', 'Piano', 'Guitar', 'Melodies',
+                 'Drums', 'Other Drums', 'Kick', 'Snare', 'Bass', 'Instrumental']
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive, output = root / 'stems.zip', root / 'stems'
+            with zipfile.ZipFile(archive, 'w') as z:
+                for stem in ids:
+                    z.writestr(f'{source}-{stem}.mp3', stem.encode())
+            names = sorted(item['name'] for item in extractor.extract(archive, output, roles)['files'])
+            self.assertEqual(names, sorted(f'{role} - Sports _ Drama King [27-0uBW2Tfq0eWV0Mq15O0hrN].mp3' for role in
+                ['Vocals', 'Vocals-lead', 'Vocals-background', 'Piano', 'Guitar', 'Pro-other',
+                 'Drums', 'Drums-other', 'Kick', 'Snare', 'Bass', 'Instrumental']))
+            self.assertEqual((output / 'Kick - Sports _ Drama King [27-0uBW2Tfq0eWV0Mq15O0hrN].mp3').read_bytes(), b'drums-kick')
+            self.assertEqual(extractor.extract(archive, output, roles)['files'], extractor.extract(archive, output, roles)['files'])
+
     def test_extract_nested_stems_and_verify_resume(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
