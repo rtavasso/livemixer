@@ -22,6 +22,16 @@ LIVEMIXER_BROWSER_EXECUTABLE="/Applications/Brave Browser.app/Contents/MacOS/Bra
 
 The normal sign-in window has no automation connection. This does not change browser security settings or access another browser profile's cookies.
 
+The same works for the default profile (`.fadr/browser`, Playwright's Chrome for Testing), which is the recommended browser now (see below): open it without automation, sign in to Fadr with Google, quit it with ⌘Q, then run `split` without `--profile`:
+
+```sh
+open -na "$(node -e "console.log(require('playwright').chromium.executablePath().replace(/\/Contents\/MacOS\/.*/, ''))")" --args --user-data-dir="$PWD/.fadr/browser" --no-first-run https://fadr.com/login
+```
+
+If `split` waits for Pro mode and times out, that profile is signed in to an account without Fadr Plus: sign out there and sign in again.
+
+**Stem downloads (since 2026-09-28).** Fadr now builds the stem ZIP in the page and hands it to the browser as a blob download. Saving that download through automation crashed Brave and Chromium intermittently (crash key `StreamingZip`), losing the browser mid-batch. The split command therefore turns browser downloads off and reads Fadr's ZIP straight from the page (the newest blob with a ZIP signature), writing it to `archives/<id>.zip`. The same change renamed the files inside the ZIP to `<source>.mp3-drums-kick.mp3`; extraction stores them under the usual `Kick - <source>.mp3` names, so the Ableton import is unchanged. If a crash interrupts a song after upload, the next run finds it in the Fadr library (it waits up to 10 s for the search) instead of uploading it twice.
+
 If large browser uploads stall or reset, add `--upload-transport curl` to the split command. This sends the exact verified MP3 through `curl` for the storage PUT initiated by Fadr's upload control, using the same destination and request headers. Login, upload initiation, stem processing, and downloads still use Fadr's web interface. It requires `curl` on PATH, limits simultaneous file transfers to three, and retries interrupted storage transfers without retrying authorization failures.
 
 Pro is the default. The script requests every available **More Stems** subdivision and selects all stems for download as MP3. It refreshes Fadr’s download list after processing and checks that the additional vocal and drum stems are present before exporting. Add `--six-only` for the initial Pro set, or `--format wav` for WAV exports. Import with `--basic` for a Basic playlist. The Spotify embed importer rejects potentially truncated lists of 100 or more tracks.
@@ -47,6 +57,8 @@ The output layout is:
 The extraction step rejects unsafe paths, duplicate names, incomplete archives, and missing selected stem roles. It stages each song before publishing its folder and retains the ZIP. It does not convert stems to WAV or add them to a Live Mixer scene. The existing `prepare:fadr` command can prepare supported Pro exports afterward.
 
 `npm run test:fadr` covers matching, safe archive extraction and resumption, and a local browser fixture that exercises Pro subdivisions, selecting all stems, choosing MP3, downloading, and resuming. The fixture is not a live Fadr integration test; Fadr interface changes may require selector updates.
+
+**Adding songs to an existing batch.** `import` refuses to overwrite `playlist.local.json`. Import the playlist into a scratch folder, check that the tracks already processed keep their positions (track ids start with the playlist position), then copy the new `playlist.local.json` over the batch's (keep a backup). Every stage verifies completed songs by hash and processes only the new ones. Append the new tracks to `songs.csv` and their tempo and key to `tempo-key.json` before `fadr-ableton-import.py` and the set builder. A track with no clean YouTube source can be removed from `tracks` and noted under `skipped`; a hand-checked source can be pinned by setting its `selected` entry in `audio.local.json` (it must still pass the duration and version checks).
 
 ## Ableton mix with one group per song
 
