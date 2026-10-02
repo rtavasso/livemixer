@@ -158,12 +158,27 @@ class BridgeTests(Quiet):
         bridge.receive('owner', dict(type='controls', vocals=.5, space=1, stutter=0, gain=1), 4); bridge.tick(4)
         self.assertEqual(len(midi.messages), 9)
 
+    def test_levels_from_living_fx_reach_the_status_while_fresh(self):
+        # Live's meters (Main, RHYTHM, MELODIC) ride to the page so the simulations pulse with the audio.
+        values = (.8, .6, -1.)
+        packet = module.osc_packet('/livemixer/levels', *values)
+        levels = module.osc_levels(packet)
+        self.assertEqual(set(levels), {'main', 'rhythm', 'melodic'})
+        for key, value in zip(('main', 'rhythm', 'melodic'), values):
+            self.assertAlmostEqual(levels[key], value, places=5)
+        self.assertIsNone(module.osc_levels(module.osc_packet('/livemixer/levels', .5)), 'wrong arity')
+        self.assertIsNone(module.osc_state(packet), 'not a state packet')
+        bridge = module.Bridge(Midi(), UDP())
+        bridge.receive_levels(levels, 1)
+        self.assertEqual(bridge.status(1.5)['levels'], levels)
+        self.assertIsNone(bridge.status(3)['levels'])  # stale
+
     def test_status_reports_midi_owner_and_passes_state_through(self):
         class Port(Midi): name, is_open = 'IAC Driver LiveMixer', False
         midi = Port(); bridge = module.Bridge(midi, UDP()); first, second = object(), object()
         status = bridge.status(0, first)
         self.assertEqual(status, dict(type='status', live=False, active=False, state=None, owner=False,
-                                      midi=False, midiPort='IAC Driver LiveMixer'))
+                                      midi=False, midiPort='IAC Driver LiveMixer', levels=None))
         midi.is_open = True; bridge.receive(first, dict(type='controls', **module.DEFAULTS), 1)
         state = module.osc_state(state_packet(amount=-.25, bound=1)); bridge.receive_state(state, 1)
         self.assertEqual(state['amount'], -.25)

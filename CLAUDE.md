@@ -16,7 +16,8 @@ ableton.html  (src/ableton/main.ts, living.ts, link.ts; src/living/governor.ts +
  └ WebSocket 9001 → scripts/ableton-bridge.py
       ├ MIDI CC20 vocals / CC21 space / CC23 gain, channel 16 → IAC Driver "LiveMixer" (Mac) / loopMIDI (Windows)
       └ OSC UDP 7403 /fx/values (16 floats) → Max for Live "LiveMixer Living FX" (devices/…/living-fx.js) in Live
-           Living FX → UDP 7401 /livemixer/state (beat, playing, bound) → bridge → page → sim (beat follow)
+           Living FX → UDP 7401 /livemixer/state (beat, playing, vocal gain, bound) + /livemixer/levels (meters)
+             → bridge status → page → sim music message (beat follow, Murmuration pulses with the levels)
 ```
 
 - Music design: [docs/LIVING-MUSIC.md](docs/LIVING-MUSIC.md) (axes, fx contract, gesture table). Gesture design and

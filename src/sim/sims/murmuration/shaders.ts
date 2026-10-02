@@ -11,7 +11,7 @@ export const MOTE_VS = `${GLSL_HEADER}
 in vec4 a_mote;
 in vec2 a_prev;
 uniform vec2 u_px;
-uniform float u_size, u_gain, u_maxStreak;
+uniform float u_size, u_gain, u_maxStreak, u_shimmer, u_phase;
 uniform vec3 u_color, u_cool;
 out vec3 v_col;
 out vec2 v_local;
@@ -39,6 +39,11 @@ void main() {
   // Faint cool tint on the far motes and a few others.
   float cool = clamp(0.1 + 0.45 * (1.0 - z) + 0.3 * (h - 0.5), 0.0, 1.0) * 0.55;
   v_col = mix(u_color, u_cool, cool) * a_mote.w * (0.4 + 0.8 * z) * energy * u_gain;
+  // Music shimmer: a slow band of light drifting through the flock, each mote slightly out of step.
+  float wave = sin(a_mote.x * 7.0 + a_mote.y * 3.0 - u_phase + h * 2.5);
+  v_col *= 1.0 + u_shimmer * wave;
+  // The crest of the band is a touch whiter (non-negative: additive light must never subtract).
+  v_col = mix(v_col, vec3(max(v_col.r, max(v_col.g, v_col.b))), 0.3 * u_shimmer * max(wave, 0.0));
 }`;
 
 export const MOTE_FS = `${GLSL_HEADER}

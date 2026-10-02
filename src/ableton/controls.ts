@@ -20,12 +20,23 @@ export function smooth(previous: number, target: number, elapsedMs: number): num
   // repeats enabled indefinitely after a gesture has settled.
   return Math.abs(next - target) < .001 ? target : next;
 }
-/** The simulation-page message relaying Live's transport from a bridge status state, or null when unusable. */
-export function musicRelay(state: unknown): { direction: 'inbound'; message: { type: 'music'; beat: number; playing: boolean } } | null {
+/** Live's output meters as the bridge relays them (Living FX `/livemixer/levels`): 0..1, −1 when a group is absent. */
+export interface MusicLevels { main: number; rhythm: number; melodic: number }
+
+/**
+ * The simulation-page message relaying Live's transport (and, when the bridge has them, its output meters so the
+ * simulations can pulse with the audio) from a bridge status, or null when unusable.
+ */
+export function musicRelay(state: unknown, levels?: unknown): { direction: 'inbound'; message: { type: 'music'; beat: number; playing: boolean; levels?: MusicLevels } } | null {
   if (!state || typeof state !== 'object') return null;
   const { beat, playing } = state as { beat?: unknown; playing?: unknown };
   if (typeof beat !== 'number' || !Number.isFinite(beat)) return null;
-  return { direction: 'inbound', message: { type: 'music', beat, playing: Boolean(playing) } };
+  const message: { type: 'music'; beat: number; playing: boolean; levels?: MusicLevels } = { type: 'music', beat, playing: Boolean(playing) };
+  const l = levels as Partial<MusicLevels> | null | undefined;
+  if (l && typeof l === 'object' && [l.main, l.rhythm, l.melodic].every(v => typeof v === 'number' && Number.isFinite(v))) {
+    message.levels = { main: l.main as number, rhythm: l.rhythm as number, melodic: l.melodic as number };
+  }
+  return { direction: 'inbound', message };
 }
 
 /** What the controls page shows for a bridge status message. Every field may be absent (an older bridge). */

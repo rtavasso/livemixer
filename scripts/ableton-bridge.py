@@ -112,6 +112,22 @@ def osc_state(packet):
         return None
 
 
+def osc_levels(packet):
+    """Decode /livemixer/levels from Living FX: Live's output meters for Main, RHYTHM and MELODIC (0..1, -1 when that
+    group is not in the set). The simulations pulse with these; the bridge passes them on in status()["levels"]."""
+    try:
+        end = packet.index(0); address = packet[:end].decode(); offset = (end + 4) & ~3
+        end = packet.index(0, offset); tags = packet[offset:end].decode(); offset = (end + 4) & ~3
+        if address != "/livemixer/levels" or len(tags) != 4 or tags[0] != "," or any(t not in "if" for t in tags[1:]): return None
+        values = []
+        for tag in tags[1:]:
+            values.append(float(struct.unpack_from(">" + tag, packet, offset)[0])); offset += 4
+        if not all(math.isfinite(v) for v in values): return None
+        return dict(zip(("main", "rhythm", "melodic"), (max(-1., min(1., v)) for v in values)))
+    except (ValueError, UnicodeError, struct.error):
+        return None
+
+
 def match_port(ports, name):
     """The one output called `name`. Windows appends a device index ("liveMixer 6") that shifts as devices come and go."""
     matches = [p for p in ports if p == name] or [p for p in ports if re.sub(r" \d+$", "", p) == name]
@@ -185,6 +201,7 @@ class Bridge:
         self.last_controls = 0.
         self.value = self.home.copy()
         self.state, self.last_state = None, 0.
+        self.levels, self.last_levels = None, 0.
         self.last_resend = None
         self.fx, self.last_fx = None, 0.
 
@@ -246,6 +263,10 @@ class Bridge:
         if not was_live and self.live(now):
             self.last_midi.clear(); self.send_mix()
 
+    def receive_levels(self, levels, now):
+        """A /livemixer/levels packet: kept until it goes stale, like the state."""
+        self.levels, self.last_levels = levels, now
+
     def tick(self, now):
         poll = getattr(self.midi, "poll", None)
         if poll is not None and poll(): self.last_midi.clear()  # port (re)opened: tell Live everything again
@@ -267,7 +288,8 @@ class Bridge:
         return {"type": "status", "live": self.live(now),
                 "active": self.owner is not None, "state": self.state if fresh else None,
                 "owner": client is not None and self.owner is client,
-                "midi": bool(getattr(self.midi, "is_open", True)), "midiPort": getattr(self.midi, "name", None)}
+                "midi": bool(getattr(self.midi, "is_open", True)), "midiPort": getattr(self.midi, "name", None),
+                "levels": self.levels if self.levels is not None and now - self.last_levels < TIMEOUT else None}
 
 
 def install_signal_handlers(loop, stop):
@@ -330,9 +352,11 @@ async def run(port, midi_port, fail_safe="living"):
     class StatusReceiver(asyncio.DatagramProtocol):
         def datagram_received(self, data, addr):
             if addr[0] != "127.0.0.1": return
-            state = osc_state(data)
-            if state is None: return
-            try: bridge.receive_state(state, time.monotonic())
+            try:
+                state = osc_state(data)
+                if state is not None: bridge.receive_state(state, time.monotonic()); return
+                levels = osc_levels(data)
+                if levels is not None: bridge.receive_levels(levels, time.monotonic())
             except Exception as error: LOG.every("state", f"status packet failed: {error!r}")
 
         def error_received(self, error):

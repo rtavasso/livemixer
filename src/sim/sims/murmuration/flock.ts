@@ -22,6 +22,11 @@
  *     fist (`grip`) pulls it into a small, dense, brighter ball; a palm turned up lifts the halo's
  *     centre above the hand, turned down settles it below (`palmUp`). Both arrive smoothed.
  *
+ * Music (Live's output levels, when relayed) never enters the dynamics: a rhythm onset brightens
+ * the motes and contracts their drawn positions toward the flock's centre (or the trusted hand) for
+ * a breath, and melodic energy drives a slow shimmer in the shader. The simulated flock, its
+ * agitation and so the mood and the published signals are exactly what they are without music.
+ *
  * Fear is driven by the hand's speed near the flock (the threat), not by the flock's own
  * turbulence, so the tearing impulse cannot excite itself: flock agitation enters the mood only at
  * a weight that stays below the startle level on its own.
@@ -63,8 +68,17 @@ export interface MurmurationParams {
   gripTighten: number;
   /** How far (picture heights) a palm turned fully up lifts the halo above the hand, or fully down sinks it below. */
   palmLift: number;
+  /** How strongly a rhythm onset brightens the motes and draws the flock in for a breath (0 = off). */
+  musicPulse?: number;
+  /** How strongly melodic energy makes the motes shimmer (0 = off). */
+  musicShimmer?: number;
 }
-export const DEFAULT_MURMURATION: MurmurationParams = { flow: .55, attraction: 1, gripTighten: .55, palmLift: .11 };
+export const DEFAULT_MURMURATION: MurmurationParams = { flow: .55, attraction: 1, gripTighten: .55, palmLift: .11, musicPulse: 1, musicShimmer: 1 };
+
+/** Largest fraction of the distance to the breath centre a full onset draws a mote in (at `musicPulse` 1). */
+export const MUSIC_BREATH = .045;
+/** Extra brightness of a full onset, and of full sustained rhythm energy (at `musicPulse` 1). */
+export const MUSIC_GLOW_ONSET = .6, MUSIC_GLOW_ENERGY = .15;
 
 /** A hand's smoothed shape for the halo: `grip` 0 open … 1 fist, `palmUp` 1 up … −1 down. */
 export interface HandShape { grip: number; palmUp: number }
@@ -99,7 +113,7 @@ export class Flock {
   private readonly flowY = new Float32Array((FLOW_COLS + 1) * (FLOW_ROWS + 1));
 
   /** Statistics of the last step. */
-  stats = { agitation: 0, closeShare: 0, nearShare: 0, meanSpeed: 0, disorder: 0, excess: 0 };
+  stats = { agitation: 0, closeShare: 0, nearShare: 0, meanSpeed: 0, disorder: 0, excess: 0, cx: 0, cy: 0 };
 
   constructor(count: number, aspect: number, seed = 7) {
     this.n = Math.max(1, Math.floor(count));
@@ -247,7 +261,7 @@ export class Flock {
     const closeR = primaryIndex >= 0 ? CLOSE_RADII * hR[primaryIndex] : 0, closeR2 = closeR * closeR;
     const threatR2 = THREAT_RADIUS * THREAT_RADIUS;
     let closeCount = 0, nearCount = 0;
-    let disorder = 0, speedSum = 0;
+    let disorder = 0, speedSum = 0, sumX = 0, sumY = 0;
 
     const R2 = R_NEIGHBOUR * R_NEIGHBOUR, S2 = R_SEPARATE * R_SEPARATE;
     const nb = this.nb, cd = this.cellData, cellList = this.cellList;
@@ -395,6 +409,7 @@ export class Flock {
       if (nxp < -.05) { nxp = -.05; vx[i] = Math.abs(vxi); } else if (nxp > aspect + .05) { nxp = aspect + .05; vx[i] = -Math.abs(vxi); }
       if (nyp < -.05) { nyp = -.05; vy[i] = Math.abs(vyi); } else if (nyp > 1.05) { nyp = 1.05; vy[i] = -Math.abs(vyi); }
       px[i] = nxp; py[i] = nyp;
+      sumX += nxp; sumY += nyp;
       // Depth follows the stream function (coherent tilt of the folds) plus a per-mote offset.
       // Held in a halo, depth follows the angle around the hand instead: a slowly turning tilted ring.
       const zFlow = .5 + .38 * ps + .18 * (hash[i] - .5);
@@ -419,6 +434,7 @@ export class Flock {
     this.stats.closeShare = primaryIndex >= 0 ? closeCount / n : 0;
     this.stats.nearShare = primaryIndex >= 0 ? nearCount / n : 0;
     this.stats.meanSpeed = meanSpeed;
+    this.stats.cx = sumX / n; this.stats.cy = sumY / n;
   }
   /** Cached neighbourhood sums (dx, dy, vx, vy, sepx, sepy, count, density estimate) per mote, refreshed every NB_STRIDE steps. */
   private readonly nb: Float32Array;
@@ -430,11 +446,14 @@ export class Flock {
   private readonly hGlow = new Float32Array(4); private readonly hW = new Float32Array(4);
   private readonly hCY = new Float32Array(4); private readonly hGrip = new Float32Array(4); private readonly hSettle = new Float32Array(4);
 
-  /** Pack for drawing: uv x, uv y, depth, brightness per mote. */
-  pack(out: Float32Array) {
+  /**
+   * Pack for drawing: uv x, uv y, depth, brightness per mote. `breath` (0..1) draws each mote that
+   * fraction of the way toward (`cx`, `cy`, uniform units); drawing only, the flock is untouched.
+   */
+  pack(out: Float32Array, breath = 0, cx = 0, cy = 0) {
     const { n, px, py, pz, bright, aspect } = this;
-    const ia = 1 / aspect;
-    for (let i = 0, o = 0; i < n; i++, o += 4) { out[o] = px[i] * ia; out[o + 1] = py[i]; out[o + 2] = pz[i]; out[o + 3] = bright[i]; }
+    const ia = 1 / aspect, keep = 1 - breath, bx = cx * breath, by = cy * breath;
+    for (let i = 0, o = 0; i < n; i++, o += 4) { out[o] = (px[i] * keep + bx) * ia; out[o + 1] = py[i] * keep + by; out[o + 2] = pz[i]; out[o + 3] = bright[i]; }
   }
 }
 
@@ -452,6 +471,14 @@ export class MurmurationState {
   /** 0..1 how frightening the hand is right now (speed near the flock). */
   threat = 0;
   pulse = 0;
+  /** Music, for drawing only: extra brightness (0 = none), breath contraction (0..1) and its centre (uniform units), shimmer depth. */
+  musicGlow = 0;
+  musicBreath = 0;
+  breathX = 0;
+  breathY = .5;
+  shimmer = 0;
+  private readonly rhythmF = new Follower(0, .3, .8);
+  private readonly melodicF = new Follower(0, .6, 1.5);
   private readonly closenessF = new Follower(0, 1, 1.5);
   private readonly agitationF = new Follower(0, .15, .25);
   private reach = 0;
@@ -496,6 +523,23 @@ export class MurmurationState {
     else this.reach = approach(this.reach, 0, dt, 2.5);
     this.closenessF.update(primary ? clamp01(this.flock.stats.closeShare / HALO_SHARE) : 0, dt);
     this.agitationF.update(this.flock.stats.agitation, dt);
+    this.updateMusic(input, params, primary, mood.boldness, dt);
+  }
+
+  /** The music's share of the picture: never fed back into the flock or the signals. */
+  private updateMusic(input: SimInput, params: MurmurationParams, primary: PictureHand | null, boldness: number, dt: number) {
+    const dyn = input.music?.dynamics ?? null;
+    const onset = dyn ? clamp01(dyn.onset) : 0;
+    const rhythm = this.rhythmF.update(dyn ? clamp01(dyn.energy.rhythm) : 0, dt);
+    const melodic = this.melodicF.update(dyn ? clamp01(dyn.energy.melodic) : 0, dt);
+    const pulse = Math.max(0, params.musicPulse ?? 0);
+    this.musicGlow = pulse * (MUSIC_GLOW_ONSET * onset + MUSIC_GLOW_ENERGY * rhythm);
+    this.musicBreath = Math.min(.2, pulse * MUSIC_BREATH * onset);
+    this.shimmer = Math.max(0, params.musicShimmer ?? 0) * melodic;
+    // The flock breathes around its own centre, or around the hand it trusts (its halo then breathes).
+    const f = this.flock, toward = primary ? clamp01(boldness) * topFade(primary.y) : 0;
+    this.breathX = f.stats.cx + (primary ? (primary.x * f.aspect - f.stats.cx) * toward : 0);
+    this.breathY = f.stats.cy + (primary ? (primary.y - f.stats.cy) * toward : 0);
   }
 
   private updateShapes(hands: readonly PictureHand[], dt: number) {

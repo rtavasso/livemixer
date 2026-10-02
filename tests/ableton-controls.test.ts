@@ -31,6 +31,10 @@ describe('Ableton controls', () => {
     expect(parseInbound(relay!.message)).toEqual(relay!.message);
     expect(musicRelay({ beat: 0, playing: 0 })!.message.playing).toBe(false);
     expect(musicRelay(null)).toBeNull();
+    // Live's meters ride along when the bridge has them, so the simulations can pulse with the audio.
+    expect(musicRelay({ beat: 4, playing: 1 }, { main: .8, rhythm: .6, melodic: -1 })!.message.levels).toEqual({ main: .8, rhythm: .6, melodic: -1 });
+    expect(musicRelay({ beat: 4, playing: 1 }, null)!.message.levels).toBeUndefined();
+    expect(musicRelay({ beat: 4, playing: 1 }, { main: NaN, rhythm: .6, melodic: .2 })!.message.levels).toBeUndefined();
     expect(musicRelay({ beat: NaN, playing: 1 })).toBeNull();
   });
 });

@@ -180,7 +180,17 @@ test('reports the song position for the simulation page', () => {
   const set = liveSet(2, []); const d = load(set);
   d.ctx.init(); set.song.current_song_time = 12.5; d.tick(120);
   // amount = the first song's Vocal Presence gain as Live has it (.3 in this set); bound: set found
-  assert.deepEqual(d.out.filter(a => a[0] === 2).at(-1), [2, '/livemixer/state', 0, 0, 0, 12.5, 1, .3, 1]);
+  assert.deepEqual(d.out.filter(a => a[0] === 2 && a[1] === '/livemixer/state').at(-1), [2, '/livemixer/state', 0, 0, 0, 12.5, 1, .3, 1]);
+});
+
+test('reports the output meters of Main, RHYTHM and MELODIC so the simulations can pulse with the audio', () => {
+  const set = liveSet(2, [], { gestures: true }); const d = load(set);
+  set.master.output_meter_level = .8; set.byName('RHYTHM')[0].output_meter_level = .6; set.byName('MELODIC')[0].output_meter_level = .4;
+  d.ctx.init(); d.tick(120);
+  assert.deepEqual(d.out.filter(a => a[0] === 2 && a[1] === '/livemixer/levels').at(-1), [2, '/livemixer/levels', .8, .6, .4]);
+  const plain = liveSet(1, []); const p = load(plain); plain.master.output_meter_level = .5;
+  p.ctx.init(); p.tick(120);
+  assert.deepEqual(p.out.filter(a => a[0] === 2 && a[1] === '/livemixer/levels').at(-1), [2, '/livemixer/levels', .5, -1, -1], 'no gesture groups: Main only');
 });
 
 test('a wall clock stepping backwards never stalls the state reports', () => {

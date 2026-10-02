@@ -15,6 +15,8 @@
 // so the simulation page can follow the beat.
 autowatch=0;inlets=1;outlets=3;
 var song=null,refs=null,mix=null,mirror=[],zones=[],task=null,label='',last={},applied='';
+// Live's output meters (Main, RHYTHM, MELODIC) for the simulations: /livemixer/levels on UDP 7401 with each state.
+var meters=null;
 var manual=[0,0,0,0],balance=.5,quiet=0,oscOwned=0,lastValues=0,lastTick=0,lastState=0;
 // Hand gestures (/fx/values 5..14, docs/superpowers/specs/2026-10-02-hand-gesture-audio-design.md): muffle R/M,
 // tilt R/M, level R/M, freeze, bloom, span, whoosh. They need a set built with --gestures (RHYTHM / MELODIC groups).
@@ -42,6 +44,7 @@ var pslot={};
 function param(d,name){if(!d)return null;var ps=ids(d.get('parameters')),k=pslot[name];
   if(k!==undefined&&k<ps.length&&nameof(ps[k])===name)return ref(ps[k]);
   for(var i=0;i<ps.length;i++)if(nameof(ps[i])===name){pslot[name]=i;return ref(ps[i]);}return null;}
+function meter(t){if(!t)return -1;var v=Number(scalar(t,'output_meter_level'));return v===v?Math.max(0,Math.min(1,v)):-1;}
 function named(t,name){if(!t)return null;var ds=ids(t.get('devices'));for(var i=0;i<ds.length;i++)if(nameof(ds[i])===name)return api(ds[i]);return null;}
 function mixer(t){return api(ids(t.get('mixer_device'))[0]);}
 function sends(t){return ids(mixer(t).get('sends'));}
@@ -126,6 +129,7 @@ function init(){t0=clock();try{
   // Gesture devices: on the RHYTHM / MELODIC groups by class, on Main by name (it has two Utilities and two Auto Filters).
   lap('cues');
   var halves=[tracks('RHYTHM')[0],tracks('MELODIC')[0]];gref=null;
+  meters={main:new LiveAPI(null,'live_set master_track'),rhythm:halves[0]||null,melodic:halves[1]||null};
   if(halves[0]&&halves[1]){
     var main=new LiveAPI(null,'live_set master_track'),fz=named(main,'Freeze');
     gref={muffle:[],lo:[],hi:[],level:[],frozen:param(fz,'Frozen'),mix:param(fz,'Dry Wet'),whoosh:param(named(main,'Whoosh'),'Frequency'),lfoAmount:param(named(main,'Whoosh'),'LFO Amount'),lfoRate:param(named(main,'Whoosh'),'LFO Frequency'),span:param(named(main,'Span'),'Stereo Width')};
@@ -170,7 +174,9 @@ function tick(){try{
   // The first song's Vocal Presence gain (CC20's target) is read once per tick: mirrored to every other song, and
   // reported in the state's "amount" slot (raw Utility gain, -1 when there is none) so the page can show what Live has.
   var g=mirror.length?Number(scalar(mirror[0].a,'value')):-1;
-  if(now-lastState>=100){lastState=now;outlet(2,'/livemixer/state',0,0,0,t,playing,g,refs?1:0);}
+  if(now-lastState>=100){lastState=now;outlet(2,'/livemixer/state',0,0,0,t,playing,g,refs?1:0);
+    // Three meter reads per report (never one per song), so the simulations can pulse with the audio itself.
+    if(meters)outlet(2,'/livemixer/levels',meter(meters.main),meter(meters.rhythm),meter(meters.melodic));}
   for(var i=1;i<mirror.length;i++)put(mirror[i],g);
   if(!refs)return;
   if(oscOwned&&now-lastValues>1500&&!athome()){var e=Math.exp(-dt/.8);for(var k=1;k<4;k++){manual[k]*=e;if(manual[k]<.002)manual[k]=0;}balance=.5+(balance-.5)*e;if(Math.abs(balance-.5)<.002)balance=.5;

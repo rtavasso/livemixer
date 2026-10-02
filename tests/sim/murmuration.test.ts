@@ -3,6 +3,7 @@ import type { SimInput } from '../../src/sim/core/types';
 import type { HandState } from '../../src/sim/input/types';
 import { CRUISE, DEFAULT_MURMURATION, Flock, MurmurationState } from '../../src/sim/sims/murmuration/flock';
 import type { Vec3 } from '../../src/sim/core/types';
+import { MusicClockEstimator, type MusicClock } from '../../src/sim/core/music';
 
 const ASPECT = 16 / 9, DT = 1 / 60;
 
@@ -207,5 +208,98 @@ describe('murmuration flock', { timeout: 60_000 }, () => {
     expect(d.mood.boldness).toBeGreaterThan(.5);
     expect(Array.from(d.flock.px)).toEqual(Array.from(c.flock.px));
     expect(d.signals()).toEqual(c.signals());
+  });
+});
+
+describe('murmuration and the music levels', { timeout: 60_000 }, () => {
+  /** A clock at `t` s: 120 bpm, with a kick on every beat in the rhythm level when `levels`. */
+  function musicAt(est: MusicClockEstimator, t: number, levels: boolean) {
+    const ms = t * 1000;
+    // Reports at ~10 Hz, as Live sends them.
+    if (Math.floor(ms / 100) !== Math.floor((ms - DT * 1000) / 100) || t === 0) {
+      const beat = t * 2, phase = beat - Math.floor(beat);
+      est.report(beat, true, ms, 120, levels ? { main: .6, rhythm: phase < .15 ? .85 : .45, melodic: .5 } : undefined);
+    }
+    return est.sample(ms);
+  }
+  const withMusic = (time: number, h: HandState | null, music: MusicClock | null): SimInput => ({ ...input(time, h), music });
+
+  /** Spread of the drawn motes about their centroid (uv units). */
+  function drawnSpread(s: MurmurationState) {
+    const out = new Float32Array(s.flock.n * 4);
+    s.flock.pack(out, s.musicBreath, s.breathX, s.breathY);
+    let mx = 0, my = 0;
+    for (let i = 0; i < s.flock.n; i++) { mx += out[i * 4]; my += out[i * 4 + 1]; }
+    mx /= s.flock.n; my /= s.flock.n;
+    let d = 0;
+    for (let i = 0; i < s.flock.n; i++) d += Math.hypot(out[i * 4] - mx, out[i * 4 + 1] - my);
+    return d / s.flock.n;
+  }
+
+  it('pulses brighter and breathes in on each rhythm hit with nobody in the box', () => {
+    const s = new MurmurationState(1500, ASPECT), est = new MusicClockEstimator();
+    let glowMax = 0, glowMin = Infinity, breathMax = 0, spreadMin = Infinity, spreadMax = 0, onsets = 0, wasHigh = false;
+    for (let k = 0; k < 600; k++) {
+      const t = k * DT;
+      s.step(withMusic(t, null, musicAt(est, t, true)), DEFAULT_MURMURATION);
+      if (t < 2) continue;
+      glowMax = Math.max(glowMax, s.musicGlow); glowMin = Math.min(glowMin, s.musicGlow);
+      breathMax = Math.max(breathMax, s.musicBreath);
+      const spread = drawnSpread(s);
+      spreadMin = Math.min(spreadMin, spread); spreadMax = Math.max(spreadMax, spread);
+      const high = s.musicGlow > .4;
+      if (high && !wasHigh) onsets++;
+      wasHigh = high;
+    }
+    // One pulse per beat (120 bpm over 8 s: ~16), dropping back between beats.
+    expect(onsets).toBeGreaterThanOrEqual(12);
+    expect(onsets).toBeLessThanOrEqual(20);
+    expect(glowMax).toBeGreaterThan(.4);
+    expect(glowMin).toBeLessThan(.25);
+    expect(breathMax).toBeGreaterThan(.02);
+    expect(breathMax).toBeLessThanOrEqual(.2);
+    expect(spreadMax - spreadMin).toBeGreaterThan(0);
+    // The melodic parts set the shimmer.
+    expect(s.shimmer).toBeGreaterThan(.5);
+    checkFlock(s.flock);
+  });
+
+  it('never feeds the music into the flock: positions, agitation and signals are identical', () => {
+    const quiet = new MurmurationState(1500, ASPECT), loud = new MurmurationState(1500, ASPECT);
+    const eq = new MusicClockEstimator(), el = new MusicClockEstimator();
+    const h = hand(.5, .5);
+    for (let k = 0; k < 900; k++) {
+      const t = k * DT, who = t > 5 && t < 12 ? h : null;
+      quiet.step(withMusic(t, who, musicAt(eq, t, false)), DEFAULT_MURMURATION);
+      loud.step(withMusic(t, who, musicAt(el, t, true)), DEFAULT_MURMURATION);
+    }
+    expect(loud.musicGlow).toBeGreaterThan(0);
+    expect(quiet.musicGlow).toBe(0);
+    expect(Array.from(loud.flock.px)).toEqual(Array.from(quiet.flock.px));
+    expect(loud.flock.stats.agitation).toBe(quiet.flock.stats.agitation);
+    expect(loud.signals()).toEqual(quiet.signals());
+    expect(loud.mood.fear).toBe(quiet.mood.fear);
+    expect(loud.mood.boldness).toBe(quiet.mood.boldness);
+  });
+
+  it('with no music, or the music tunables at zero, draws exactly as before', () => {
+    const s = new MurmurationState(1000, ASPECT);
+    run(s, 0, 2, () => null);
+    expect(s.musicGlow).toBe(0); expect(s.musicBreath).toBe(0); expect(s.shimmer).toBe(0);
+    const a = new Float32Array(s.flock.n * 4), b = new Float32Array(s.flock.n * 4);
+    s.flock.pack(a); s.flock.pack(b, s.musicBreath, s.breathX, s.breathY);
+    expect(Array.from(b)).toEqual(Array.from(a));
+    const off = { ...DEFAULT_MURMURATION, musicPulse: 0, musicShimmer: 0 }, est = new MusicClockEstimator();
+    const z = new MurmurationState(1000, ASPECT);
+    for (let k = 0; k < 300; k++) z.step(withMusic(k * DT, null, musicAt(est, k * DT, true)), off);
+    expect(z.musicGlow).toBe(0); expect(z.musicBreath).toBe(0); expect(z.shimmer).toBe(0);
+  });
+
+  it('breathes a trusted halo around the hand', () => {
+    const s = gather(0, 0, 1500), est = new MusicClockEstimator();
+    const h = hand(.5, .5);
+    for (let k = 0; k < 120; k++) { const t = 19 + k * DT; s.step(withMusic(t, h, musicAt(est, t, true)), DEFAULT_MURMURATION); }
+    expect(s.breathX).toBeCloseTo(.5 * ASPECT, 1);
+    expect(s.breathY).toBeCloseTo(.5, 1);
   });
 });

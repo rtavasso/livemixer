@@ -129,7 +129,7 @@ const link = new BridgeLink({
     vocalsLive.textContent = view.vocalsInLive === null ? '' : `Vocals in Live: ${view.vocalsInLive ? 'on' : 'off'}`;
     const state = message.state;
     // Relay Live's transport to the simulation page (it estimates tempo from successive beats).
-    const music = musicRelay(state);
+    const music = musicRelay(state, message.levels);
     if (music) channel.postMessage(music);
     if (state) {
       element('cycle').textContent = state.repeat ? `Quick stutter · ${Math.ceil(state.onLeft * 4)} slices left` : state.offLeft > 0 ? `Dry · ${Math.ceil(state.offLeft)} beats until ready` : core.value.stutter > 0 ? 'Waiting for the next beat' : 'Repeat is off';

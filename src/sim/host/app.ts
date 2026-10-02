@@ -157,7 +157,7 @@ export class SimHost {
     this.bus.onInbound(message => {
       if (message.type === 'set-param') this.setParam(message.name, message.value);
       else if (message.type === 'set-params') for (const [name, value] of Object.entries(message.values)) this.setParam(name, value);
-      else if (message.type === 'music') this.music.report(message.beat, message.playing, this.now(), message.bpm);
+      else if (message.type === 'music') this.music.report(message.beat, message.playing, this.now(), message.bpm, message.levels);
       else if (message.type === 'select-sim') { if (!this.selectSimulation(message.id)) this.bus.publishStatus('warning', `Unknown simulation "${message.id}".`); }
     });
     this.configureTelemetry();

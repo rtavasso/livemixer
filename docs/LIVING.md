@@ -8,7 +8,7 @@ Music side: [LIVING-MUSIC.md](LIVING-MUSIC.md).
 |---|---|
 | **Tide** (`tide`) | An upright sheet of dark water that glows like plankton where it is disturbed, home to a school of luminous eels. A still hand draws them in; a splash scatters them. |
 | **Lantern** (`lantern`) | One translucent jellyfish that swims in time with the music, comes to a still hand and drapes its tentacles over it; a poke makes it flinch, fast motion sends it away. |
-| **Murmuration** (`murmuration`) | Thousands of motes of light flocking in folding ribbons; a gentle hand gathers an orbiting halo, stillness tightens it into a ring, fast motion tears it apart. |
+| **Murmuration** (`murmuration`) | Thousands of motes of light flocking in folding ribbons; a gentle hand gathers an orbiting halo, stillness tightens it into a ring, fast motion tears it apart. With Live's levels relayed it pulses with the music, hand or no hand: each rhythm hit brightens the motes and draws them in for a breath (toward the flock's centre, or the trusted hand's halo), and the melodic parts run a slow shimmer through them (`musicPulse`, `musicShimmer`; 0 = off). Drawing only: the flock, its agitation and its signals never hear the music, so it cannot feed back into itself. |
 
 All three are emissive light on black (black is invisible in the ghost), fade out at the calibrated
 active area and over the top of the picture where the Leap is weakest, and share one mood model:
@@ -86,7 +86,8 @@ for a fist, hold **U** / **D** for palm up / down.
 - `SimulationDefinition.hologramFrame: 'wall'` selects `HOLOGRAM_WALL_MAPPING` for a hologram-calibrated
   source. `SimContext.activeArea` carries the calibrated active area; `SimInput.music` carries Live's
   transport (song position in beats, estimated tempo) relayed as the inbound telemetry message
-  `{type: 'music', beat, playing, bpm?}`.
+  `{type: 'music', beat, playing, bpm?, levels?}`; with `levels` (Live's output meters) it also carries
+  smoothed `dynamics` (envelope, auto-gained `energy`, rhythm `onset`; see SIMULATIONS.md).
 - Rotation: `src/sim/host/rotation.ts` (pure, tested).
 - Try without the box: `sim.html?source=pointer&sim=lantern` — hover is in front of the picture, press
   pushes through it.

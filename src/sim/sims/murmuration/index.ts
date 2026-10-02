@@ -8,7 +8,9 @@
  * tears the ribbons apart; they re-form over several seconds. Pushing through the picture draws
  * the flock in harder and lights the motes near the hand. Closing the hand draws the halo into a
  * small, dense, brighter ball; turning the palm up lifts it off the hand, turning it down settles
- * it below.
+ * it below. With Live's output levels relayed, each rhythm hit brightens the motes and draws the
+ * flock in for a breath, and the melodic parts set a slow shimmer running through it (drawing
+ * only: the flock and its signals never hear the music, so it cannot feed back into itself).
  *
  * The flock is simulated on the CPU (`flock.ts`: uniform grid, O(n), deterministic). Each frame
  * the motes are uploaded (bufferSubData) and drawn as instanced, additive streak sprites from
@@ -44,6 +46,8 @@ export default defineSimulation({
     attraction: { kind: 'number', default: 1, min: 0, max: 2, step: .05, label: 'Hand attraction', description: 'How strongly the hand draws the flock.' },
     gripTighten: { kind: 'number', default: .55, min: 0, max: .8, step: .05, label: 'Fist tightens', description: 'How far a closing fist draws the gathered halo into a small, dense, brighter ball (0 = no effect).' },
     palmLift: { kind: 'number', default: .11, min: 0, max: .25, step: .01, label: 'Palm lift', description: 'How far (picture heights) a palm turned up lifts the halo above the hand, or turned down settles it below.' },
+    musicPulse: { kind: 'number', default: 1, min: 0, max: 2, step: .05, label: 'Music pulse', description: 'How strongly each rhythm hit in Live brightens the motes and draws the flock in for a breath (0 = off). Needs the levels relayed from Live.' },
+    musicShimmer: { kind: 'number', default: 1, min: 0, max: 2, step: .05, label: 'Music shimmer', description: 'How strongly the melodic parts in Live set a slow shimmer running through the motes (0 = off).' },
     trail: { kind: 'number', default: .1, min: .03, max: .6, step: .01, unit: 's', label: 'Trail', description: 'How long a mote’s streak persists.' },
   },
   signals: LIVING_SIGNALS,
@@ -99,7 +103,7 @@ export default defineSimulation({
         if (current.length !== n * 4) allocate();
         // Interleave (x, y, depth, brightness, previous x, previous y); the previous is last frame's.
         for (let i = 0; i < n; i++) { packed[i * 6 + 4] = current[i * 4]; packed[i * 6 + 5] = current[i * 4 + 1]; }
-        state.flock.pack(current);
+        state.flock.pack(current, state.musicBreath, state.breathX, state.breathY);
         // A streak spans at most one 60 Hz frame of motion, so a slow frame never stretches motes into bright rods.
         const span = Math.min(1, (1 / 60) / Math.max(dt, 1e-4));
         for (let i = 0; i < n; i++) {
@@ -124,14 +128,16 @@ export default defineSimulation({
         gl.enable(gl.BLEND); gl.blendEquation(gl.FUNC_ADD); gl.blendFunc(gl.ONE, gl.ONE);
         const [r, g, b] = hexToRgb(params.color);
         const pulse = state.pulse;
-        const gain = params.brightness * (1 - decay) * (1 + .18 * pulse);
+        const gain = params.brightness * (1 - decay) * (1 + .18 * pulse) * (1 + state.musicGlow);
         moteProgram.use()
           .f2('u_px', accum.width, accum.height)
           .f1('u_size', params.moteSize * ctx.height / 720)
           .f1('u_maxStreak', .02 * accum.height)
           .f1('u_gain', gain)
           .f3('u_color', r, g, b)
-          .f3('u_cool', .62, .78, 1);
+          .f3('u_cool', .62, .78, 1)
+          .f1('u_shimmer', .35 * state.shimmer)
+          .f1('u_phase', (frame.time * 1.3) % (Math.PI * 2));
         gl.bindVertexArray(vao);
         gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, n);
         gl.bindVertexArray(null);
