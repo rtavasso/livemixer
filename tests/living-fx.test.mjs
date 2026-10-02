@@ -23,7 +23,7 @@ function liveSet(songs, cues, { gestures = false } = {}) {
   const half = (name) => track(name, [device('AutoFilter', 'Muffle', [['Frequency', 135]]), device('Eq8', 'Tilt', [['1 Gain A', 0], ['4 Gain A', 0]]),
     device('StereoGain', 'Level', [['Gain', 0]])]);
   if (gestures) tracks.unshift(half('RHYTHM'), half('MELODIC'));
-  const master = make({ name: 'Main', devices: gestures ? [device('Reverb', 'Space - CC21', [['Dry/Wet', 0]]), device('AutoFilter', 'Whoosh', [['Frequency', 135]]),
+  const master = make({ name: 'Main', devices: gestures ? [device('Reverb', 'Space - CC21', [['Dry/Wet', 0]]), device('AutoFilter', 'Whoosh', [['Frequency', 135], ['LFO Amount', 0], ['LFO Frequency', .6], ['LFO Waveform', 2], ['LFO Sync', 1], ['LFO Stereo Mode', 0], ['LFO Spin', .5]]),
     device('Spectral', 'Freeze', [['Frozen', 0], ['Dry Wet', 0], ['Fade In', .6]]), device('StereoGain', 'Span', [['Stereo Width', 1]])] : [] });
   const song = make({ tracks, cue_points: cues.map(([time, name]) => make({ time, name })), current_song_time: 0, is_playing: 1, tempo: 120 });
   const value = (track, dev, name) => tracks.find(t => t.name === track)?.devices.find(d => d.name === dev)?.parameters.find(q => q.name === name)?.value
@@ -40,10 +40,12 @@ function load(set) {
     get(prop) { return ref(this.o[prop]); }
     set(prop, v) { calls.set++; this.o[prop] = v; }
   }
-  class Task { constructor(fn) { this.fn = fn; task = this; } repeat() {} cancel() { task = null; } }
+  // repeat() is the device's update loop; schedule(ms) a one-off (setup retry), recorded so tests can run it.
+  const scheduled = [];
+  class Task { constructor(fn) { this.fn = fn; } repeat() { task = this; } schedule(ms) { scheduled.push({ ms, fn: this.fn }); } cancel() { if (task === this) task = null; } }
   const ctx = { LiveAPI, Task, outlet: (...a) => out.push(a), arrayfromargs: (a) => Array.prototype.slice.call(a), error: () => {}, post: () => {}, Date: { now: () => clock } };
   vm.createContext(ctx); vm.runInContext(source, ctx);
-  return { ctx, out, calls, tick: (ms = 40) => { clock += ms; task?.fn(); }, advance: (ms) => { clock += ms; } };
+  return { ctx, out, calls, scheduled, tick: (ms = 40) => { clock += ms; task?.fn(); }, advance: (ms) => { clock += ms; } };
 }
 
 test('drives every song group and mirrors the vocal gain', () => {
@@ -109,13 +111,19 @@ test('mirrors the vocal gain in Live 11, where Utility calls it Gain', () => {
 test('drives the gesture devices of a --gestures set, per half', () => {
   const set = liveSet(2, [], { gestures: true }); const d = load(set);
   d.ctx.init();
-  assert.match(d.out.filter(a => a[0] === 0 && a[1] === 'set').at(-1)[2], /gestures 10\/10/);
+  assert.match(d.out.filter(a => a[0] === 0 && a[1] === 'set').at(-1)[2], /gestures 12\/12/);
   //                 flicker dub dive halo bal | muffleR muffleM tiltR tiltM levelR levelM freeze bloom span whoosh
   d.ctx.values(0, 0, 0, 0, .5,                 1, 0,      0,   1,    0,     1,     0,     0,    1,   0);
   assert.equal(set.value('RHYTHM', 'Muffle', 'Frequency'), 70);   // fist on the rhythm half: low-pass ~450 Hz
   assert.equal(set.value('MELODIC', 'Muffle', 'Frequency'), 135); // open
-  assert.deepEqual([set.value('RHYTHM', 'Tilt', '1 Gain A'), set.value('RHYTHM', 'Tilt', '4 Gain A')], [5, -5]);   // palm down: weight
-  assert.deepEqual([set.value('MELODIC', 'Tilt', '1 Gain A'), set.value('MELODIC', 'Tilt', '4 Gain A')], [-2, 6]); // palm up: air
+  assert.deepEqual([set.value('RHYTHM', 'Tilt', '1 Gain A'), set.value('RHYTHM', 'Tilt', '4 Gain A')], [3, 0]);  // palm down: a little weight
+  assert.deepEqual([set.value('MELODIC', 'Tilt', '1 Gain A'), set.value('MELODIC', 'Tilt', '4 Gain A')], [0, 3]); // palm up: a little air
+  // The palms are heard as space and time, not tone: palm down sinks the drums into the dub echo (send A),
+  // palm up lifts the textures into the halo reverb (send B); the other sends stay dry.
+  const send = (track, n) => set.byName(track)[0].mixer_device.sends[n].value;
+  assert.equal(send('02 Snare', 0), d.ctx.sendlevel(.8)); assert.equal(send('02 Snare', 1), 0);
+  assert.ok(send('TEXTURE FX', 1) >= d.ctx.sendlevel(.8), 'palm up lifts the textures (the wide span adds to it)'); assert.equal(send('TEXTURE FX', 0), 0);
+  assert.equal(send('01 Kick', 0), 0, 'never the kick');
   assert.ok(Math.abs(set.value('RHYTHM', 'Level', 'Gain') - -10 / 35) < 1e-9);
   assert.ok(Math.abs(set.value('MELODIC', 'Level', 'Gain') - 6 / 35) < 1e-9);
   assert.ok(Math.abs(set.value(null, 'Span', 'Stereo Width') - Math.sqrt(1.8)) < 1e-9);  // 180 %
@@ -123,6 +131,21 @@ test('drives the gesture devices of a --gestures set, per half', () => {
   d.ctx.values(0, 0, 0, 0, .5);  // an old page without gesture values: home
   assert.equal(set.value('RHYTHM', 'Muffle', 'Frequency'), 135);
   assert.equal(set.value(null, 'Span', 'Stereo Width'), 1);
+});
+
+test('a turbulent scene is heard: swarm flutters and spins the mix through Whoosh', () => {
+  const set = liveSet(1, [], { gestures: true }); const d = load(set);
+  d.ctx.init();
+  const whoosh = (name) => set.value(null, 'Whoosh', name);
+  assert.deepEqual([whoosh('LFO Waveform'), whoosh('LFO Sync'), whoosh('LFO Stereo Mode'), whoosh('LFO Spin')], [0, 0, 1, .25]);  // sine, free, spinning
+  assert.equal(whoosh('LFO Amount'), 0);
+  const swarm = (x) => d.ctx.values(0, 0, 0, 0, .5, 0, 0, .5, .5, .5, .5, 0, 0, .5, 0, x);
+  swarm(1);
+  assert.equal(whoosh('LFO Amount'), 16); assert.equal(whoosh('Frequency'), 113);
+  assert.ok(Math.abs(whoosh('LFO Frequency') - .95) < 1e-9);  // ~7.5 Hz
+  swarm(.5); assert.equal(whoosh('LFO Amount'), 8);
+  d.ctx.values(0, 0, 0, 0, .5, 0, 0, .5, .5, .5, .5, 0, 0, .5, 0);  // a page without swarm: calm
+  assert.equal(whoosh('LFO Amount'), 0); assert.equal(whoosh('Frequency'), 135);
 });
 
 test('freeze holds the moment, then fades out and unfreezes', () => {
@@ -148,7 +171,7 @@ test('FX QUIET holds the gestures at home', () => {
 test('reports the song position for the simulation page', () => {
   const set = liveSet(2, []); const d = load(set);
   d.ctx.init(); set.song.current_song_time = 12.5; d.tick(120);
-  assert.deepEqual(d.out.filter(a => a[0] === 2).at(-1), [2, '/livemixer/state', 0, 0, 0, 12.5, 1, 0, 0]);
+  assert.deepEqual(d.out.filter(a => a[0] === 2).at(-1), [2, '/livemixer/state', 0, 0, 0, 12.5, 1, 0, 1]);  // bound: set found
 });
 
 test('FX QUIET holds home until the next non-SONG cue and eases back after', () => {
@@ -173,5 +196,6 @@ test('eases home when the bridge goes silent and restores group volumes on reset
 test('refuses a set without TEXTURE FX groups', () => {
   const d = load({ objects: new Map(), song: { id: 1, tracks: [], cue_points: [] }, byName: () => [] });
   d.ctx.init();
-  assert.match(d.out.filter(a => a[0] === 0 && a[1] === 'set').at(-1)[2], /Setup: No TEXTURE FX/);
+  assert.match(d.out.filter(a => a[0] === 0 && a[1] === 'set').at(-1)[2], /Setup: No TEXTURE FX.*retrying in 5 s/);
+  assert.deepEqual(d.scheduled.map(s => s.ms), [5000], 'an unattended show retries setup instead of staying dead');
 });

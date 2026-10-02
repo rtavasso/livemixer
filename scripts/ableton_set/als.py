@@ -220,6 +220,13 @@ class LiveSet:
             chain.append(device)
             yield device
 
+    def set_loop(self, start, end):
+        """Turn on Live's Arrangement loop from `start` to `end` (beats)."""
+        transport = self.live_set.find("Transport")
+        transport.find("LoopOn").set("Value", "true")
+        transport.find("LoopStart").set("Value", repr(float(start)))
+        transport.find("LoopLength").set("Value", repr(float(end - start)))
+
     def write(self, output):
         locators = self.live_set.find("Locators/Locators")
         ordered = sorted(locators, key=lambda l: float(l.find("Time").get("Value")))
@@ -306,7 +313,7 @@ def quiet_zones(plan):
 
 
 def write_mix(plan, envelopes, rendered, output, colors, unfold=False, living=None, templates=TEMPLATES, retimed=None,
-              gestures=None):
+              gestures=None, loop=True):
     """Write a planned mix. `rendered` is one (stems [(name, path)], frames, rate) per song.
 
     `living`: a `Living` to add the installation's effects, or None for a plain stem set.
@@ -397,4 +404,7 @@ def write_mix(plan, envelopes, rendered, output, colors, unfold=False, living=No
         for start, end in (retimed.zones if retimed is not None else quiet_zones(plan)):
             live.add_locator(start, "FX QUIET")
             live.add_locator(end, "FX ON")
+    if loop:
+        # An unattended show must not stop after the last song: loop the whole Arrangement back to the first.
+        live.set_loop(0.0, max(retimed.clip_ends if retimed is not None else plan.clip_ends))
     live.write(output)

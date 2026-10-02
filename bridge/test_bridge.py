@@ -12,12 +12,15 @@ fixture through the real zod schema in ``tests/sim/bridge-fixture.test.ts``.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import math
 import os
+import socket
 import subprocess
 import sys
+import threading
 import time
 import unittest
 
@@ -2075,6 +2078,240 @@ class BackgroundModelTests(unittest.TestCase):
         result = analyzer.analyze(db.DepthFrame(frame, 1.0))
         self.assertEqual(int(result.stats["pixels"]), 16)
         self.assertEqual(len(result.blobs), 1)
+
+
+# ---- the server's resilience: bad frames, stalled sources, stalled clients ---- #
+
+
+class FlakySource(db.FrameSource):
+    """A source that can be 'unplugged': while it is, read() blocks for ``stall_s`` and raises, like LeapStereoSource's stall watchdog."""
+
+    name = "flaky"
+
+    def __init__(self, stall_s: float = 0.2) -> None:
+        self.inner = synthetic()
+        self.stall_s = stall_s
+        self.unplugged = False
+        self.starts: list[float] = []
+        self.stuck = False
+
+    @property
+    def needs_hard_exit(self) -> bool:
+        return self.stuck
+
+    def start(self) -> None:
+        self.starts.append(time.monotonic())
+
+    def read(self) -> db.DepthFrame:
+        if self.unplugged:
+            time.sleep(self.stall_s)
+            raise RuntimeError(f"no frames for {self.stall_s:.1f} s")
+        return self.inner.read()
+
+
+class ExplodingAnalyzer:
+    """Wraps a real analyzer; raises while ``failing``."""
+
+    def __init__(self) -> None:
+        self.inner = make_analyzer()
+        self.failing = False
+        self.calls = 0
+
+    def analyze(self, frame: db.DepthFrame) -> db.AnalysisResult:
+        self.calls += 1
+        if self.failing:
+            raise ValueError("boom")
+        return self.inner.analyze(frame)
+
+
+def make_server(source: db.FrameSource, analyzer: object | None = None, **kw: object) -> db.BridgeServer:
+    hello = db.hello_message(source.name, db.BoxConfig(near_m=NEAR, far_m=FAR), None, (8, 6))
+    return db.BridgeServer(source, analyzer or make_analyzer(), hello, "127.0.0.1", 0, **kw)  # type: ignore[arg-type]
+
+
+class ServerResilienceTests(unittest.TestCase):
+    def test_an_analyzer_exception_skips_the_frame(self) -> None:
+        analyzer = ExplodingAnalyzer()
+        server = make_server(synthetic(), analyzer, analysis_fail_exit_s=0.5)  # type: ignore[arg-type]
+
+        async def scenario() -> None:
+            self.assertTrue(await server.pump_once())
+            self.assertEqual(server.seq, 1)
+            analyzer.failing = True
+            with self.assertLogs("depth_bridge", level="ERROR") as logs:
+                for _ in range(5):
+                    self.assertTrue(await server.pump_once(), "the source is fine: no restart")
+            self.assertEqual(server.seq, 1, "failed frames are skipped, not numbered")
+            self.assertEqual(len(logs.output), 1, "a streak of failures is logged once, then at most every 10 s")
+            self.assertIn("Traceback", logs.output[0], "the first one with its traceback")
+            analyzer.failing = False
+            self.assertTrue(await server.pump_once())
+            self.assertEqual(server.seq, 2)
+            analyzer.failing = True
+            with self.assertRaises(db.AnalysisFailing):  # failing continuously for longer than analysis_fail_exit_s: exit so a supervisor restarts
+                with self.assertLogs("depth_bridge", level="ERROR"):
+                    while True:
+                        await server.pump_once()
+                        await asyncio.sleep(0.02)
+
+        asyncio.run(scenario())
+
+    def test_a_stalled_source_is_restarted_promptly_and_forever(self) -> None:
+        source = FlakySource(stall_s=0.2)
+        server = make_server(source, restart_backoff=(0.05, 0.1))  # max_restarts None: never give up
+
+        async def scenario() -> None:
+            pump = asyncio.ensure_future(server._pump())
+            await asyncio.sleep(0.2)
+            seq = server.seq
+            self.assertGreater(seq, 0)
+            source.unplugged = True
+            unplugged_at = time.monotonic()
+            await asyncio.sleep(2.0)
+            starts = [t for t in source.starts if t > unplugged_at]
+            self.assertGreaterEqual(len(starts), 5, "retried every stall + backoff, and still retrying")
+            gaps = np.diff([unplugged_at, *starts])
+            self.assertLess(float(gaps.max()), 0.2 + 0.1 + 0.15, "each retry comes after the stall time plus at most the longest backoff")
+            self.assertLess(starts[0] - unplugged_at, 0.2 + 0.05 + 0.15)
+            self.assertFalse(pump.done(), "the pump keeps running")
+            source.unplugged = False
+            await asyncio.sleep(0.5)
+            self.assertGreater(server.seq, seq, "frames flow again once the source is back")
+            self.assertEqual(server._source_log.count, 0, "the failure streak is over")
+            source.stuck = True  # a native thread stuck inside the source: only a fresh process helps
+            source.unplugged = True
+            with self.assertRaises(db.SourceGaveUp):
+                await asyncio.wait_for(pump, 2.0)
+
+        with self.assertLogs("depth_bridge", level="INFO") as logs:
+            asyncio.run(scenario())
+        errors = [line for line in logs.output if "source flaky failed" in line]
+        self.assertLessEqual(len(errors), 2, "a long outage is logged once, then at most once a minute")
+        self.assertTrue(any("delivering frames again" in line for line in logs.output))
+
+    def test_max_restarts_still_hands_over_to_a_fresh_process(self) -> None:
+        source = FlakySource(stall_s=0.05)
+        source.unplugged = True
+        server = make_server(source, restart_backoff=(0.01, 0.01), max_restarts=2)
+        with self.assertLogs("depth_bridge", level="ERROR"):
+            with self.assertRaises(db.SourceGaveUp):
+                asyncio.run(asyncio.wait_for(server._pump(), 5.0))
+        self.assertEqual(len(source.starts), 2)
+
+    def test_a_hung_read_gives_up_instead_of_waiting_forever(self) -> None:
+        release = threading.Event()
+
+        class Hung(db.FrameSource):
+            name = "hung"
+
+            def read(self) -> db.DepthFrame:
+                release.wait(5.0)
+                raise RuntimeError("released")
+
+        server = make_server(Hung(), read_timeout_s=0.2)
+        started = time.monotonic()
+        try:
+            with self.assertLogs("depth_bridge", level="ERROR"):
+                with self.assertRaises(db.SourceGaveUp):
+                    asyncio.run(server.pump_once())
+        finally:
+            release.set()
+        self.assertLess(time.monotonic() - started, 2.0, "asyncio.run does not wait for the hung reader thread")
+        self.assertTrue(server.read_hung)
+
+    def test_sigterm_stops_like_ctrl_c_and_repeats_are_ignored(self) -> None:
+        import signal
+        saved = {s: signal.getsignal(s) for s in db.STOP_SIGNALS}
+        try:
+            db.install_stop_signals()
+            with self.assertRaises(KeyboardInterrupt):
+                signal.raise_signal(signal.SIGTERM)
+            signal.raise_signal(signal.SIGTERM)  # forwarded twice (run-leap.sh and uv): ignored during the clean-up
+            signal.raise_signal(signal.SIGINT)
+        finally:
+            for s, handler in saved.items():
+                signal.signal(s, handler)
+
+    def test_broadcast_skips_a_client_that_is_not_reading(self) -> None:
+        sent: list[list[object]] = []
+
+        class Transport:
+            def __init__(self, size: int) -> None:
+                self.size = size
+
+            def get_write_buffer_size(self) -> int:
+                return self.size
+
+        class Client:
+            def __init__(self, size: int) -> None:
+                self.transport = Transport(size)
+
+        server = make_server(synthetic(), client_buffer_limit=1000)
+        server._broadcast = lambda clients, message: sent.append(list(clients))  # type: ignore[method-assign]
+        good, stalled = Client(0), Client(5000)
+        server._clients.update({good, stalled})
+        with self.assertLogs("depth_bridge", level="WARNING") as logs:
+            for _ in range(3):
+                server.broadcast(db.status_message("info", "x"))
+        self.assertEqual(sent, [[good]] * 3)
+        self.assertEqual(server.dropped, 3)
+        self.assertEqual(len(logs.output), 1, "logged once a minute at most")
+        stalled.transport.size = 10
+        server.broadcast(db.status_message("info", "x"))
+        self.assertEqual(len(sent[-1]), 2, "a client that drained gets frames again")
+
+    def test_a_stalled_websocket_client_does_not_block_the_frame_loop(self) -> None:
+        """End to end: a client that stops reading never stalls the pump; its queue stays bounded; a reading client keeps up."""
+        from websockets.asyncio.client import connect
+
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        limit = 64 * 1024
+        server = make_server(synthetic(), client_buffer_limit=limit)
+        server.port = port
+        received = 0
+        peak = 0
+
+        async def scenario() -> None:
+            nonlocal received, peak
+            run = asyncio.ensure_future(server.run())
+            for _ in range(50):
+                await asyncio.sleep(0.05)
+                try:
+                    reader, writer = await asyncio.open_connection("127.0.0.1", port, limit=1024)
+                    break
+                except OSError:
+                    continue
+            sock = writer.get_extra_info("socket")
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            writer.write(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                         b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+            await writer.drain()
+            self.assertIn(b"101", await reader.readline())
+            stalled_port = sock.getsockname()[1]  # from here on the stalled client never reads again
+            async with connect(f"ws://127.0.0.1:{port}", max_size=None) as good:
+                await good.recv()  # hello
+                seq0 = server.seq
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline:
+                    await asyncio.wait_for(good.recv(), 1.0)
+                    received += 1
+                    for ws in list(server._clients):
+                        if ws.remote_address[1] == stalled_port:
+                            peak = max(peak, db._write_buffer_size(ws))
+                self.assertGreater(server.seq - seq0, 50, "the pump kept going")
+            writer.transport.abort()
+            run.cancel()
+            try:
+                await run
+            except asyncio.CancelledError:
+                pass
+
+        asyncio.run(scenario())
+        self.assertGreater(received, 50, "the reading client keeps getting frames")
+        self.assertGreater(server.dropped, 0, "frames were dropped for the stalled client")
+        self.assertLess(peak, limit + 256 * 1024, "the stalled client's queue stays bounded")
 
 
 if __name__ == "__main__":

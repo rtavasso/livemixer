@@ -43,23 +43,27 @@ for a fist, hold **U** / **D** for palm up / down.
 
 ## Run the show
 
-1. **Leap bridge** (box empty for its first seconds so the background, including the beamsplitter's
-   reflection, is learned): `sh bridge/run-leap.sh`. The box is 20-55 cm above the controller; the
-   picture spans about 25-46 cm.
-2. **Vite**: `npm run dev`.
-3. **Simulation page**: `http://127.0.0.1:4178/sim.html?source=depth&sim=tide&overlay=0`, fullscreen with **F**.
-   - One creature all night: pick `sim=tide`, `lantern` or `murmuration`.
-   - Rotate on a timer: add `&rotate=20` (minutes) and optionally `&rotation=tide,lantern,murmuration`.
-     A change waits until the box has been empty for four seconds, then fades through black; a hand
-     arriving mid-fade cancels it.
-4. **Hologram calibration** (once per setup, and whenever the box has been moved): press **X** (or **H** → *Calibrate hologram…*), size the active area to the visible picture, then touch the nine X's and do the
+1. **Start everything**: `npm run show` (see [SHOW.md](SHOW.md)). That one command starts and
+   supervises the page server, the Ableton bridge, the Leap bridge and the two Chrome windows; it also
+   covers the Mac setup, logs and what recovers by itself. Keep the box empty for the first seconds so the
+   Leap bridge learns the background, including the beamsplitter's reflection. The box is 20-55 cm above
+   the controller; the picture spans about 25-46 cm.
+   - One creature all night: `LIVEMIXER_SIM=tide`, `lantern` or `murmuration`.
+   - Rotate on a timer: `LIVEMIXER_SIM_PARAMS='rotate=20'` (minutes), optionally with
+     `&rotation=tide,lantern,murmuration`. A change waits until the box has been empty for four seconds,
+     then fades through black; a hand arriving mid-fade cancels it.
+   - By hand instead (development): `sh bridge/run-leap.sh`, `npm run dev`, and
+     `http://127.0.0.1:4178/sim.html?source=depth&sim=tide&overlay=0`, fullscreen with **F**.
+2. **Hologram calibration** (once per setup, and whenever the box has been moved): press **X** (or **H** → *Calibrate hologram…*), size the active area to the visible picture, then touch the nine X's and do the
    pull-back capture. Living simulations read the calibration through the upright *wall* frame (the
    picture plane at sim depth 0.5), so pushing a hand *through* the picture is kept as `reach`; Basin and
    Shallows keep the top-down *floor* frame. Switching simulations switches the frame automatically.
-5. **Attendant check** at the start of each session: open the calibration's verify step and hold a
+   Calibrate in the show's own simulation window: the calibration is stored per browser profile and
+   address, so one made on the dev server (port 4178) does not carry over to the show (port 4179).
+3. **Attendant check** at the start of each session: open the calibration's verify step and hold a
    fingertip on the picture; the marker should sit under it. Recalibrate if it is off by more than the
    width of a finger.
-6. **Music**: see [LIVING-MUSIC.md](LIVING-MUSIC.md) (bridge, controls page in Living mode, Live set).
+4. **Music**: the show starts the bridge and opens the controls page in Living mode; the Live set and its devices are in [LIVING-MUSIC.md](LIVING-MUSIC.md).
    The controls page also relays Live's beat to the simulation page, so the idle glimmer and Lantern's
    swimming follow the music; without it they breathe on their own.
 

@@ -80,6 +80,14 @@ class MixXmlTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
+    def test_arrangement_loops_the_whole_set(self):
+        # An unattended show must never stop after the last song.
+        transport = self.live_set.find("Transport")
+        self.assertEqual(transport.find("LoopOn").get("Value"), "true")
+        self.assertEqual(float(transport.find("LoopStart").get("Value")), 0.0)
+        clips = [float(c.find("CurrentEnd").get("Value")) for c in self.live_set.iter("AudioClip")]
+        self.assertAlmostEqual(float(transport.find("LoopLength").get("Value")), max(clips), places=6)
+
     def test_pointee_ids_unique_and_below_next(self):
         ids = [int(e.get("Id")) for e in self.live_set.iter()
                if "Id" in e.attrib and (e.tag.endswith("Target") or e.tag == "Pointee")]

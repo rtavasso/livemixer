@@ -42,6 +42,13 @@ URL parameters fix a configuration for an installation launch:
 
 Settings persist in `localStorage` under `livemixer-sim-settings`; URL parameters override and are then persisted.
 
+**Unattended running.** The page keeps telemetry alive through the failures a long show meets:
+
+- *Page hidden or window covered*: rendering pauses (no `requestAnimationFrame`), but the input source stays connected and a background tick (30 Hz, plus one per arriving source frame, since Chrome throttles hidden-page timers to 1 Hz) keeps stepping the simulation and publishing signals and telemetry. Only deactivating the player stops the host.
+- *Simulation failure*: its signals are cleared at once (telemetry carries `signals: {}`, so the controls fall back to input presence) and the simulation is recreated every 5 s.
+- *WebGL context lost*: signals cleared; if the browser has not restored the context within 10 s the host builds a new canvas; if that fails, or the new canvas is lost within a minute, the page reloads and restores its simulation and source from the URL and `localStorage`.
+- *Depth bridge / Leap socket*: reconnects forever with backoff (0.5 → 8 s); a socket that is open but delivers no frame for 5 s is dropped and reconnected.
+
 ## Coordinate spaces
 
 Three frames exist and only one of them is ever seen by a simulation.

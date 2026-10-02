@@ -22,9 +22,13 @@ export class SimulationPlayer {
     else return;
     event.preventDefault();
   };
-  private visibility = () => {
-    if (this.active && !document.hidden) this.host.start(); else this.host.stop();
-  };
+  /**
+   * Only activation starts and stops the host. A hidden page keeps its input source and telemetry
+   * running (the host stops rendering by itself when rAF stops), so the music never notices.
+   */
+  private applyActive() {
+    if (this.active) this.host.start(); else this.host.stop();
+  }
   constructor(root: HTMLElement, video: HTMLVideoElement, overlayRoot: HTMLElement, readonly settings: SettingsStore, options: HostOptions & { keyboardRoot?: HTMLElement | Document } = {}) {
     this.host = new SimHost(root, video, settings, undefined, options);
     this.overlay = new Overlay(overlayRoot, this.host, video);
@@ -34,11 +38,9 @@ export class SimulationPlayer {
     this.host.canvas.tabIndex = 0;
     this.keyboardRoot = options.keyboardRoot ?? root;
     this.keyboardRoot.addEventListener('keydown', this.keydown as EventListener);
-    document.addEventListener('visibilitychange', this.visibility);
   }
-  setActive(active: boolean) { this.active = active; this.visibility(); }
+  setActive(active: boolean) { this.active = active; this.applyActive(); }
   dispose() {
-    document.removeEventListener('visibilitychange', this.visibility);
     this.keyboardRoot.removeEventListener('keydown', this.keydown as EventListener);
     this.hologram.dispose(); this.overlay.dispose(); this.host.dispose();
   }

@@ -1,5 +1,10 @@
 # Hand gestures in the music: design
 
+Revised after listening, 2026-10-02: palm up / down became the halo reverb / dub echo sends (with only ±3 dB of
+shelf colour), because as EQ they sounded like the fist; a `swarm` value (the simulation's turbulence → Whoosh's
+LFO flutter) was added; the release bloom swells the halo sends, not Main's Space reverb (CC21 owns it). The
+current behaviour is documented in [LIVING-MUSIC.md](../../LIVING-MUSIC.md#hand-gestures).
+
 Status: accepted, 2026-10-02 (one hand conducts everything; two hands split halves with a meaningful span; every gesture at full strength). Builds on the living installation
 ([2026-09-27](2026-09-27-living-installation-design.md), [LIVING-MUSIC.md](../../LIVING-MUSIC.md)).
 

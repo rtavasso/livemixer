@@ -158,6 +158,7 @@ def build(folders, output, args):
     templates = LIVE11_TEMPLATES if args.live == 11 else TEMPLATES
     write_mix(plan, envelopes, [(stems, frames, rate) for _, stems, frames, rate in rendered], output, COLORS, args.unfold,
               living=None if args.plain else Living(templates), templates=templates, retimed=retimed,
+              loop=not args.no_loop,
               gestures=Gestures() if args.gestures else None)
 
     report = []
@@ -197,6 +198,8 @@ def main():
     parser.add_argument("-o", "--output", help="set to write (default: <stems>/../Stem Set.als)")
     parser.add_argument("--tempo-key", help="tempo and key per song folder (default: <stems>/../tempo-key.json)")
     parser.add_argument("--overlap-bars", type=int, default=16, help="length of each transition in bars")
+    parser.add_argument("--no-loop", action="store_true",
+                        help="leave Live's Arrangement loop off (by default it loops the whole set, so a show never stops)")
     parser.add_argument("--natural-speed", action="store_true",
                         help="play every song unwarped at its own speed; Live's tempo steps to each song's at the end "
                              "of its overlap instead of ramping, so a wrong tempo estimate never bends the audio")

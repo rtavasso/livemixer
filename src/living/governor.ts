@@ -39,6 +39,9 @@ export interface GovernorConfig {
   arrangementCeiling: number;
   depthCeiling: number;
   spaceCeiling: number;
+  /** Swarm (scene turbulence) rise / fall time constants (s). */
+  swarmRise: number;
+  swarmFall: number;
 }
 
 export const DEFAULT_GOVERNOR: GovernorConfig = {
@@ -46,6 +49,7 @@ export const DEFAULT_GOVERNOR: GovernorConfig = {
   gateLow: .15, gateHigh: .5, vocalRise: .4, vocalRelease: 2.5,
   arrangementTau: 1.5, depthTau: .8, spaceRise: 2.5, spaceFall: 3,
   arrangementCeiling: 1, depthCeiling: 1, spaceCeiling: 1,
+  swarmRise: .08, swarmFall: .5,
 };
 
 export const HOME: Readonly<Axes> = Object.freeze({ vocals: 0, arrangement: .5, depth: 0, space: 0, allowance: DEFAULT_GOVERNOR.baseAllowance });
@@ -67,6 +71,11 @@ export class Governor {
   readonly config: GovernorConfig;
   private axes: Axes;
   private agitation = 0;
+  /**
+   * The scene's turbulence as a sound of its own (fx `swarm`): fast attack, gentle release, at full strength and not
+   * gated by the hand, so a flock still swirling after the hand leaves is heard swirling. Home on release.
+   */
+  swarm = 0;
 
   constructor(config: Partial<GovernorConfig> = {}) {
     this.config = { ...DEFAULT_GOVERNOR, ...config };
@@ -80,7 +89,7 @@ export class Governor {
   get value(): Axes { return { ...this.axes }; }
 
   /** Return to home at once (the caller has released Live, which fades on its side). */
-  release(): Axes { this.axes = this.home(); this.agitation = 0; return this.value; }
+  release(): Axes { this.axes = this.home(); this.agitation = 0; this.swarm = 0; return this.value; }
 
   /** Advance by dtSeconds toward the state the signals ask for. Missing or invalid signals count as absent. */
   step(signals: LivingSignals | null | undefined, dtSeconds: number): Axes {
@@ -92,6 +101,9 @@ export class Governor {
     const lift = .5 + (read(signals, 'lift', .5) - .5) * presence;
     const closeness = read(signals, 'closeness', 0) * presence;
     this.agitation = approach(this.agitation, read(signals, 'agitation', 0) * presence, dt, c.agitationTau);
+    const turbulence = read(signals, 'agitation', 0);
+    this.swarm = approach(this.swarm, turbulence, dt, turbulence > this.swarm ? c.swarmRise : c.swarmFall);
+    if (this.swarm < 2e-3) this.swarm = 0;
 
     const base = unit(c.baseAllowance);
     const allowance = unit((base + (1 - base) * closeness) * (1 - unit(c.agitationPull) * this.agitation));
@@ -132,13 +144,13 @@ export interface LiveMapping {
 }
 export const DEFAULT_MAPPING: LiveMapping = { mainSpace: .5, diveCeiling: .8, haloCeiling: .6, dubCeiling: .3 };
 
-/** Hand-gesture values (src/living/hands.ts), in the bridge's /fx/values order after the first five. */
-export const GESTURE_KEYS = ['muffleRhythm', 'muffleMelodic', 'tiltRhythm', 'tiltMelodic', 'levelRhythm', 'levelMelodic', 'freeze', 'bloom', 'span', 'whoosh'] as const;
+/** Hand-gesture values (src/living/hands.ts) and the scene's swarm (Governor.swarm), in the bridge's /fx/values order after the first five. */
+export const GESTURE_KEYS = ['muffleRhythm', 'muffleMelodic', 'tiltRhythm', 'tiltMelodic', 'levelRhythm', 'levelMelodic', 'freeze', 'bloom', 'span', 'whoosh', 'swarm'] as const;
 export type GestureKey = typeof GESTURE_KEYS[number];
 export type GestureFx = Record<GestureKey, number>;
 /** Home: open, flat, unity level, unfrozen, normal width. */
 export const GESTURE_HOME: Readonly<GestureFx> = Object.freeze({
-  muffleRhythm: 0, muffleMelodic: 0, tiltRhythm: .5, tiltMelodic: .5, levelRhythm: .5, levelMelodic: .5, freeze: 0, bloom: 0, span: .5, whoosh: 0,
+  muffleRhythm: 0, muffleMelodic: 0, tiltRhythm: .5, tiltMelodic: .5, levelRhythm: .5, levelMelodic: .5, freeze: 0, bloom: 0, span: .5, whoosh: 0, swarm: 0,
 });
 
 export interface LiveFx extends GestureFx { flicker: number; dub: number; dive: number; halo: number; balance: number }

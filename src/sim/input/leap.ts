@@ -14,6 +14,7 @@
  * Use LEAP_MAPPING (which turns "toward the display" into a push).
  */
 import { z } from 'zod';
+import { SILENT_SOCKET_MS } from './depth';
 import { ClockMapper } from './protocol';
 import { skeletonCapsules, type Skeleton, type SkeletonFinger } from './skeleton';
 import type { Capsule, HandObservation, InputFrame, InputSource, InputSourceStatus } from './types';
@@ -151,6 +152,7 @@ export class LeapSource implements InputSource {
   readonly id = 'leap' as const;
   readonly frameDescription = 'Leap box: x → your right, y → up, z → toward you (mm ranges in settings)';
   private socket?: WebSocket; private running = false; private generation = 0; private retryMs = 500; private timer?: ReturnType<typeof setTimeout>;
+  private watchdog?: ReturnType<typeof setInterval>; private lastFrameAtMs = 0;
   private readonly clock = new ClockMapper();
   private state: InputSourceStatus = { state: 'idle', message: 'Leap Motion disconnected.' };
   private sequence = 0; private lastFrameId = -1;
@@ -171,6 +173,11 @@ export class LeapSource implements InputSource {
     let socket: WebSocket;
     try { socket = new WebSocket(this.url); } catch (error) { this.state = { state: 'error', message: `Invalid Leap URL: ${String(error)}` }; return; }
     this.socket = socket;
+    // The service streams frames at device rate even with no hand in view, so silence means a wedged service or socket.
+    this.lastFrameAtMs = this.now();
+    this.watchdog = setInterval(() => {
+      if (this.now() - this.lastFrameAtMs > SILENT_SOCKET_MS) this.drop(generation, `No frames from the Leap service for ${SILENT_SOCKET_MS / 1000} s. Reconnecting`);
+    }, 1000);
     socket.onopen = () => {
       if (generation !== this.generation) return;
       this.retryMs = 500; this.received = 0; this.lastFrameId = -1; this.clock.reset();
@@ -184,7 +191,7 @@ export class LeapSource implements InputSource {
       const frame = parseLeapMessage(event.data);
       if (!frame) return;
       if (frame.id <= this.lastFrameId) return;
-      this.lastFrameId = frame.id; this.received++;
+      this.lastFrameId = frame.id; this.received++; this.lastFrameAtMs = receivedAtMs;
       let observedAtMs = Math.min(this.clock.observe(frame.timestamp / 1e6, receivedAtMs), receivedAtMs);
       // A service clock that stalls or runs slow would make frames look ever later; re-base rather than drop them.
       if (receivedAtMs - observedAtMs > 200) { this.clock.reset(); observedAtMs = Math.min(this.clock.observe(frame.timestamp / 1e6, receivedAtMs), receivedAtMs); }
@@ -197,19 +204,28 @@ export class LeapSource implements InputSource {
       if (this.received === 1) this.state = { state: 'running', message: 'Leap tracking. Hold a hand above the device.' };
     };
     socket.onerror = () => { if (generation === this.generation) this.state = { state: 'error', message: `Leap service not reachable at ${this.url}. Enable "Allow Web Apps" in the Leap Motion control panel. Retrying…` }; };
-    socket.onclose = () => {
-      if (generation !== this.generation || !this.running) return;
-      this.state = { state: 'error', message: `Leap service disconnected. Reconnecting in ${(this.retryMs / 1000).toFixed(1)} s…` };
-      this.timer = setTimeout(() => this.connect(generation), this.retryMs);
-      this.retryMs = Math.min(8000, this.retryMs * 2);
-    };
+    socket.onclose = () => this.drop(generation, 'Leap service disconnected. Reconnecting');
+  }
+
+  /** Abandon the current socket (without waiting for a close handshake a hung peer may never finish) and reconnect with backoff. */
+  private drop(generation: number, reason: string) {
+    if (generation !== this.generation || !this.running) return;
+    this.closeSocket(); this.palmMm = null;
+    this.state = { state: 'error', message: `${reason} in ${(this.retryMs / 1000).toFixed(1)} s…` };
+    this.timer = setTimeout(() => this.connect(generation), this.retryMs);
+    this.retryMs = Math.min(8000, this.retryMs * 2);
+  }
+
+  private closeSocket() {
+    if (this.watchdog) clearInterval(this.watchdog); this.watchdog = undefined;
+    if (this.socket) { this.socket.onopen = null; this.socket.onclose = null; this.socket.onmessage = null; this.socket.onerror = null; try { this.socket.close(); } catch { /* already closed */ } }
+    this.socket = undefined;
   }
 
   stop() {
     this.generation++; this.running = false;
     if (this.timer) clearTimeout(this.timer); this.timer = undefined;
-    if (this.socket) { this.socket.onclose = null; this.socket.onmessage = null; this.socket.onerror = null; try { this.socket.close(); } catch { /* already closed */ } }
-    this.socket = undefined; this.palmMm = null;
+    this.closeSocket(); this.palmMm = null;
     this.state = { state: 'idle', message: 'Leap Motion disconnected.' };
   }
 }

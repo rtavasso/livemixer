@@ -77,6 +77,20 @@ describe('living governor', () => {
     expect(home).toEqual(HOME);
   });
 
+  it('hears a turbulent scene as swarm: fast up, gentle down, even after the hand leaves', () => {
+    const g = new Governor();
+    for (let i = 0; i < 6; i++) g.step({ presence: 1, agitation: 1 }, .05);  // 0.3 s of a scattering flock
+    expect(g.swarm).toBeGreaterThan(.95);
+    g.step({ presence: 0, agitation: .8 }, .05);  // the hand has gone, the motes still swirl
+    expect(g.swarm).toBeGreaterThan(.75);
+    for (let i = 0; i < 10; i++) g.step({ presence: 0, agitation: 0 }, .05);
+    expect(g.swarm).toBeGreaterThan(.2); expect(g.swarm).toBeLessThan(.5);  // ~0.5 s release
+    for (let i = 0; i < 100; i++) g.step({ presence: 0, agitation: 0 }, .05);
+    expect(g.swarm).toBe(0);
+    g.step({ presence: 1, agitation: 1 }, 1); g.release(); expect(g.swarm).toBe(0);
+    expect(toLiveControls(g.value, {}, { swarm: .7 }).fx.swarm).toBe(.7);
+    expect(toLiveControls(g.value).fx.swarm).toBe(GESTURE_HOME.swarm);
+  });
   it('release returns home at once', () => {
     const g = new Governor();
     run(g, patient, 10);
@@ -119,9 +133,9 @@ describe('living governor', () => {
   });
 
   it('carries the hand-gesture values, home when missing or invalid', () => {
-    expect(GESTURE_KEYS).toEqual(['muffleRhythm', 'muffleMelodic', 'tiltRhythm', 'tiltMelodic', 'levelRhythm', 'levelMelodic', 'freeze', 'bloom', 'span', 'whoosh']);
-    expect(GESTURE_HOME).toEqual({ muffleRhythm: 0, muffleMelodic: 0, tiltRhythm: .5, tiltMelodic: .5, levelRhythm: .5, levelMelodic: .5, freeze: 0, bloom: 0, span: .5, whoosh: 0 });
-    const gestures = { muffleRhythm: .1, muffleMelodic: .2, tiltRhythm: .3, tiltMelodic: .4, levelRhythm: .6, levelMelodic: .7, freeze: 1, bloom: .8, span: .9, whoosh: .05 };
+    expect(GESTURE_KEYS).toEqual(['muffleRhythm', 'muffleMelodic', 'tiltRhythm', 'tiltMelodic', 'levelRhythm', 'levelMelodic', 'freeze', 'bloom', 'span', 'whoosh', 'swarm']);
+    expect(GESTURE_HOME).toEqual({ muffleRhythm: 0, muffleMelodic: 0, tiltRhythm: .5, tiltMelodic: .5, levelRhythm: .5, levelMelodic: .5, freeze: 0, bloom: 0, span: .5, whoosh: 0, swarm: 0 });
+    const gestures = { muffleRhythm: .1, muffleMelodic: .2, tiltRhythm: .3, tiltMelodic: .4, levelRhythm: .6, levelMelodic: .7, freeze: 1, bloom: .8, span: .9, whoosh: .05, swarm: .45 };
     const live = toLiveControls(HOME, {}, gestures);
     expect(live.fx).toEqual({ flicker: 0, dub: 0, dive: 0, halo: 0, balance: .5, ...gestures });
     expect(Object.keys(live.fx).slice(5)).toEqual([...GESTURE_KEYS]);

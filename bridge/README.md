@@ -38,7 +38,7 @@ python bridge/depth_bridge.py --source realsense --near 0.45 --far 1.1 --roi 0.2
 
 Streams Z16 depth at 640x480 @ 30 fps (`--resolution`, `--fps`). `--decimation 2` halves the resolution in the camera SDK, which is cheaper and less noisy; the ROI is in fractions so nothing else changes. Hole filling is off by default (`--hole-filling` to enable) because filled holes invent depth where the sensor saw nothing, which reads as phantom matter inside the box.
 
-If `pyrealsense2` is missing the bridge exits with a message saying so. If the camera drops out at runtime the bridge sends a `status` message with `level: "error"` to every client, then restarts the source with backoff and keeps serving.
+If `pyrealsense2` is missing the bridge exits with a message saying so. If the camera drops out at runtime the bridge sends a `status` message with `level: "error"` to every client, then restarts the source after a 1-2 s pause and keeps serving (*Running unattended* below).
 
 ## Leap Motion Controller as a depth camera
 
@@ -81,7 +81,7 @@ What the browser receives (`hello.skeleton: true` announces it; plain depth came
 
 The machine this was developed on runs "Leap Motion Service 5.0.0-preview" (the January 2021 Core Services build). With it, every LeapC client behaves the same way: it connects, receives the Connection, Device and Policy events, is granted the images policy (`0x2`) and then `LeapPollConnection` **never returns** again: no tracking, no images, whatever the timeout, allocator, window focus or host language. The service's own visualizer shows frames, so the device is fine; the client path of that build is broken.
 
-The bridge cannot be checked against live images here, so it is written to fail loudly rather than hang: the poll runs on its own daemon thread; if no image arrives within 3 s a warning names this stall and the fix; after 20 s `read()` raises, the server sends a `status` error to the browser and retries with backoff; the process stays responsive (the `hello` still goes out to new clients) and, because a thread stuck inside LeapC keeps the interpreter from exiting normally, the CLI hard-exits when it ends.
+The bridge cannot be checked against live images here, so it is written to fail loudly rather than hang: the poll runs on its own daemon thread; if no image arrives within 3 s a warning names this stall and the fix (at most once a minute); after `--stall-restart` seconds (default 5) `read()` raises, the server sends a `status` error to the browser and reopens the connection; a poll thread that never comes back is never reused: the bridge exits so `run-leap.sh` starts a fresh process; the process stays responsive (the `hello` still goes out to new clients) and, because a thread stuck inside LeapC keeps the interpreter from exiting normally, the CLI hard-exits when it ends.
 
 **Fix:** install current Ultraleap tracking software from Ultraleap's download page for the original controller, <https://www.ultraleap.com/downloads/leap-controller/> (Windows: *Ultraleap Hyperion* v6.2.0, `tracking-software-windows-6.2.0.exe`, about 600 MB; the "Leap Motion Service 5.0.0-preview" this was built against is the *Gemini Developer Preview* zip on the same page). Uninstall the preview first, keep the *Software Development Kit* component ticked so `LeapC.dll` lands in `C:\Program Files\Ultraleap\LeapSDK`, enable *Allow Images* (and *Allow Background Apps*) in its control panel, and run with `--leapc` pointing at its library, `C:\Program Files\Ultraleap\LeapSDK\lib\x64\LeapC.dll` (that path is searched first anyway, then the old Core Services install, then `$LEAPC_DLL`). The binding uses only calls present in every LeapC since 4.x, reads the `LEAP_CONNECTION_MESSAGE` layout off `msg.size` (16 bytes on 5.0, 20 on Gemini with its `device_id`), takes `LeapRectilinearToPixelEx` when it exists, and rebuilds its rectification maps whenever the images' `matrix_version` changes or the calibration comes back as NaN (which it does until the service has sent it). Two things could still need a first-run check on real images and are one flag each: if the depth image stays empty with a hand over the device, the two cameras are in the other order and `--swap-cameras` fixes it (`leap_source.py --dump-images` tries both orders and says which one puts pixels in the box); and the rectified pair should show the hand on the same rows in both eyes (the PNGs make that obvious).
 
@@ -123,6 +123,22 @@ If what you actually want is height above the device to be *up* and reaching ove
 | `--swap-cameras` | Exchange the cameras before matching (the skeleton's reference camera follows). |
 | `--leap-orient MODE` | Rotate or flip the depth image before analysis (default `none`); the skeleton is reoriented with it. |
 | `--leap-hand-frame MODE` | How the hand skeleton maps onto the depth image: `auto` (default, detected against the scan) or a convention name `u±x_v±z_ref±` / `u±z_v±x_ref±`. |
+| `--leap-state PATH` | Save the fitted alignment and the locked hand frame here (JSON) and start the next run from them instead of learning again; with it, `auto` means "what was learned, else learn" and an explicit `--leap-align`/`--leap-hand-frame` value wins. The hand frame is reused only under the same `--swap-cameras`/`--leap-orient`. Default off; `run-leap.sh` uses `bridge/.leap-state.json` (gitignored). |
+| `--relearn` | Ignore the `--leap-state` file and learn both again (the file is overwritten once they are). Use it after swapping the controller. |
+| `--stall-restart S` | Reopen the LeapC connection after S seconds without a stereo image (default 5). |
+
+### Running unattended (`bridge/run-leap.sh`)
+
+`sh bridge/run-leap.sh [flags]` runs the installation's bridge and relaunches it whenever it exits, until Ctrl-C, SIGTERM or SIGHUP (it is POSIX sh: macOS `/bin/sh`, Linux, Git Bash; every line it prints is timestamped). What each failure does:
+
+- **Controller unplugged, service restarted, images stall:** after `--stall-restart` seconds (5) without an image the bridge reopens its LeapC connection, then again every ~6 s; it logs the outage once and then at most once a minute. After `--max-restarts 3` failed reopenings (~25 s) it exits with status 3, because the service sometimes re-enumerates the camera in a way only a new process recovers from; the script relaunches at once and, while the controller stays away, says so once a minute. Once the controller is back, frames should return at the next reopening (~6 s) or, if only a fresh process gets them, the next relaunch (~25 s); neither was checked against real hardware yet.
+- **A LeapC call that never returns** (the poll thread or a `read()` stuck for `4 x --stall-restart`, at least 30 s): exit with status 3 at once (hard exit, the stuck thread cannot be joined), relaunched.
+- **An exception in the analysis:** that frame is skipped (logged with its traceback the first time, then at most every 10 s); if every frame fails for 30 s the bridge exits with status 4 and is relaunched.
+- **A browser that stops reading** (a laptop that went to sleep on Wi-Fi): its frames are dropped once more than 1 MiB is queued for it, until it drains or the WebSocket keepalive closes it; the capture and the other clients never wait for it.
+- **Any other crash:** relaunched after 2 s; a crash within 10 s of starting (port in use, missing package) backs off 2, 4, 8 ... 30 s.
+- **Ctrl-C / SIGTERM:** the bridge closes the controller and the script stops (exit 0).
+
+What it learns is kept across relaunches: the empty scene in `bridge/.background.npy` and the camera alignment and hand frame in `bridge/.leap-state.json`. Delete the first, or pass `--relearn` for the second, to learn again.
 
 ### Tuning the stereo: what the real frames showed
 

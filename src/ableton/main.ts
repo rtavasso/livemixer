@@ -1,8 +1,9 @@
 import './style.css';
 import { names, defaults, musicRelay, normalize, smooth, stutterCount, type Control, type Controls, type Source } from './controls';
 import { BROADCAST_CHANNEL_NAME, type TelemetryFrame, type TelemetrySchema } from '../sim/telemetry/types';
-import { HandCombiner } from '../living/hands';
-import { AXES, CONTRACT_SIGNALS, Governor, isLivingSchema, toLiveControls, type Axis, type LiveFx, type LivingSignals } from '../living/governor';
+import { AXES, CONTRACT_SIGNALS, isLivingSchema, type Axis, type LiveFx, type LivingSignals } from '../living/governor';
+import { LivingDriver } from './living';
+import { BridgeLink, initialWanted, WANTED_KEY, type LinkState, type SocketLike } from './link';
 
 const labels: Record<Control, string> = { vocals: 'Vocal presence', space: 'Reverb', stutter: 'Beat repeat', gain: 'Mix gain' };
 const descriptions: Record<Control, string> = { vocals: 'Silence to full vocals', space: 'Dry to 20% wet', stutter: '1/16-note slices · up to one beat · 4+ beats dry', gain: '−12 dB to unity' };
@@ -20,12 +21,18 @@ const channel = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
 const element = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const route: Record<Control, string> = { vocals: 'input.presence', space: 'input.activity', stutter: 'input.activity', gain: 'constant' };
 try { const saved = JSON.parse(localStorage.getItem('livemixer-ableton-routes') ?? '{}'); for (const name of names) if (typeof saved[name] === 'string') route[name] = saved[name]; } catch { /* use defaults */ }
-let value: Controls = { ...defaults }, socket: WebSocket | null = null, schema: TelemetrySchema | null = null;
+let value: Controls = { ...defaults }, schema: TelemetrySchema | null = null;
 let frame: TelemetryFrame | null = null, lastFrame = 0, lastUpdate = performance.now(), lastSchemaId = '';
-let stale = false, fx: LiveFx | null = null, modeChosen = false;
-const governor = new Governor(), hands = new HandCombiner();
+// `silent`: Living mode released Live after a long stall and sends nothing until fresh input returns.
+let stale = false, silent = false, fx: LiveFx | null = null, modeChosen = false;
+const living = new LivingDriver();
+let storedWanted: string | null = null;
+try { storedWanted = localStorage.getItem(WANTED_KEY); } catch { /* storage unavailable */ }
+// A show launcher opens ableton.html?connect=1; otherwise the operator's last Connect / Disconnect survives a reload.
+const connectAtLoad = initialWanted(location.search, storedWanted);
 const mode = element<HTMLSelectElement>('mode');
-mode.value = 'manual';
+// Unattended start: Living (at home, vocals off) until the simulation's schema says otherwise, never the manual defaults.
+mode.value = connectAtLoad ? 'living' : 'manual';
 const status = element('status');
 
 function drawValues() {
@@ -46,7 +53,7 @@ function sources() {
   }
 }
 function drawLiving(signals: LivingSignals) {
-  const axes = governor.value;
+  const axes = living.governor.value;
   for (const axis of AXES) setMeter(`axis-${axis}`, axes[axis]);
   for (const key of CONTRACT_SIGNALS) setMeter(`signal-${key}`, signals[key]);
 }
@@ -56,40 +63,48 @@ function setMeter(id: string, amount: number | undefined) {
   element<HTMLOutputElement>(`${id}-value`).value = valid ? `${Math.round(amount * 100)}%` : '—';
 }
 function send() {
-  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(fx ? { type: 'controls', ...value, fx } : { type: 'controls', ...value }));
+  if (!silent) link.send(fx ? { type: 'controls', ...value, fx } : { type: 'controls', ...value });
 }
+// Release & reset keeps the current mode (and automatic choice, if the operator never picked one): Living resumes from home.
 function reset() {
-  modeChosen = true; mode.value = 'manual'; value = { ...defaults }; fx = null; governor.release(); hands.release(); updateMode(); drawValues();
-  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'release' }));
+  if (mode.value !== 'living') value = { ...defaults };
+  fx = null; stale = false; silent = false; living.reset(); updateMode(); drawValues();
+  link.send({ type: 'release' });
 }
 function updateMode() {
   document.querySelectorAll<HTMLElement>('.route').forEach(el => { el.hidden = mode.value !== 'simulation'; });
   element('living').hidden = mode.value !== 'living';
   for (const name of names) element<HTMLInputElement>(name).disabled = mode.value === 'living' || (mode.value === 'simulation' && route[name] !== 'constant');
-  if (mode.value !== 'living') { fx = null; governor.release(); hands.release(); }
+  if (mode.value !== 'living') { fx = null; silent = false; living.reset(); }
 }
-function livingSignals(current: TelemetryFrame): LivingSignals {
-  const signals: LivingSignals = {};
-  for (const key of CONTRACT_SIGNALS) signals[key] = current.sim.signals[key];
-  if (!Number.isFinite(signals.presence)) signals.presence = current.input.presence;
-  return signals;
+function updateLiving(now: number) {
+  // Stale or absent input never cuts or blasts: the driver keeps stepping with nobody present (a smooth fade to the
+  // instrumental home) and releases Live only once, after a long stall. See src/ableton/living.ts.
+  const result = living.step(frame, lastFrame, now, (now - lastUpdate) / 1000);
+  const message = result.message;
+  if (message?.type === 'controls') {
+    silent = false;
+    value = { vocals: message.vocals, space: message.space, stutter: message.stutter, gain: message.gain }; fx = message.fx;
+  } else {
+    if (message?.type === 'release') link.send(message);
+    silent = true; fx = null; value = { vocals: 0, space: 0, stutter: 0, gain: 1 };
+  }
+  drawLiving(result.signals);
+  const title = schema?.sim.title ?? frame?.sim.id ?? 'Simulation';
+  const after = result.released ? 'released to the bridge until input returns' : 'drifting home';
+  element('simulation').textContent =
+    result.state === 'fresh' ? `${title} · living${isLivingSchema(frame!.sim.signals) ? '' : ' · missing contract signals, holding home'}`
+    : result.state === 'input-stale' ? `${title} · ${frame!.input.sourceAgeMs < 0 ? 'hand input not connected yet' : 'hand input stalled'} · ${after}`
+    : `Waiting for the simulation · ${after}`;
 }
 function update(now = performance.now()) {
-  if (mode.value === 'simulation' || mode.value === 'living') {
+  if (mode.value === 'living') updateLiving(now);
+  else if (mode.value === 'simulation') {
     if (!frame || now - lastFrame > 750 || frame.input.sourceAgeMs > 750) {
-      if (!stale && socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'release' }));
+      if (!stale) link.send({ type: 'release' });
       stale = true;
-      value = { ...defaults }; fx = null; governor.release(); hands.release();
-      if (mode.value === 'living') drawLiving({});
+      value = { ...defaults }; fx = null;
       element('simulation').textContent = 'Waiting for fresh simulation input…';
-    } else if (mode.value === 'living') {
-      stale = false;
-      const signals = livingSignals(frame);
-      const dt = (now - lastUpdate) / 1000;
-      const live = toLiveControls(governor.step(signals, dt), {}, hands.step(frame.input.hands, dt));
-      value = { vocals: live.vocals, space: live.space, stutter: live.stutter, gain: live.gain }; fx = live.fx;
-      drawLiving(signals);
-      element('simulation').textContent = `${schema?.sim.title ?? frame.sim.id} · living${isLivingSchema(frame.sim.signals) ? '' : ' · missing contract signals, holding home'}`;
     } else {
       stale = false;
       for (const name of names) {
@@ -111,22 +126,36 @@ function update(now = performance.now()) {
 for (const name of names) {
   element<HTMLInputElement>(name).addEventListener('input', event => { value[name] = Number((event.target as HTMLInputElement).value); drawValues(); send(); });
   element<HTMLSelectElement>(`${name}-source`).addEventListener('change', event => {
-    route[name] = (event.target as HTMLSelectElement).value; localStorage.setItem('livemixer-ableton-routes', JSON.stringify(route)); updateMode();
+    route[name] = (event.target as HTMLSelectElement).value;
+    try { localStorage.setItem('livemixer-ableton-routes', JSON.stringify(route)); } catch { /* storage unavailable */ }
+    updateMode();
   });
 }
-mode.addEventListener('change', () => { modeChosen = true; updateMode(); update(); });
+mode.addEventListener('change', () => { modeChosen = true; stale = false; updateMode(); update(); });
 element('release').addEventListener('click', reset);
-element('connect').addEventListener('click', () => {
-  if (socket) { socket.close(); socket = null; return; }
-  status.textContent = 'Connecting…';
-  const connection = new WebSocket('ws://127.0.0.1:9001'); socket = connection;
-  connection.onopen = () => { element('connect').textContent = 'Disconnect'; send(); };
-  connection.onmessage = event => {
-    const message = JSON.parse(event.data);
-    if (message.type === 'error') { status.textContent = message.message; return; }
-    if (message.type !== 'status') return;
+// Once wanted (Connect, ?connect=1 or the stored choice), a dropped bridge (restarted, or briefly down) is retried
+// every 2 s until it is back, so the vocals and effects never go silently dead; Disconnect stops that.
+let linkState: LinkState = 'disconnected', everOpen = false;
+const link = new BridgeLink({
+  open: () => new WebSocket('ws://127.0.0.1:9001') as unknown as SocketLike,
+  onState: state => {
+    const previous = linkState; linkState = state;
+    status.dataset.ready = 'false';
+    element('connect').textContent = state === 'disconnected' ? 'Connect to Live' : 'Disconnect';
+    if (state === 'open') { everOpen = true; status.textContent = 'Bridge connected · waiting for Live device'; }
+    else if (state === 'disconnected') status.textContent = 'Disconnected';
+    else if (state === 'reconnecting' || previous === 'reconnecting') {
+      status.textContent = everOpen ? 'Bridge restarting · reconnecting…' : 'Bridge not running · retrying every 2 s (uv run scripts/ableton-bridge.py)';
+    } else status.textContent = 'Connecting…';
+  },
+  onOpen: () => send(),
+  onMessage: data => {
+    let message: any;
+    try { message = JSON.parse(String(data)); } catch { return; }
+    if (message?.type === 'error') { status.textContent = String(message.message); return; }
+    if (message?.type !== 'status') return;
     status.textContent = message.live ? 'Live connected' : 'Bridge connected · waiting for Live device';
-    status.dataset.ready = String(message.live);
+    status.dataset.ready = String(Boolean(message.live));
     const state = message.state;
     // Relay Live's transport to the simulation page (it estimates tempo from successive beats).
     const music = musicRelay(state);
@@ -136,9 +165,12 @@ element('connect').addEventListener('click', () => {
       const bar = Math.floor(state.beat / 4) + 1, beat = Math.floor(state.beat % 4) + 1;
       element('clock').textContent = state.playing ? `Playing · ${bar}.${beat} · ${state.beat < 308 ? 'Back To Us' : 'Ladders'}` : 'Stopped in Ableton';
     }
-  };
-  connection.onclose = () => { if (socket === connection) socket = null; status.textContent = 'Disconnected'; status.dataset.ready = 'false'; element('connect').textContent = 'Connect to Live'; };
-  connection.onerror = () => { status.textContent = 'Start the local Live bridge to connect.'; };
+  },
+});
+element('connect').addEventListener('click', () => {
+  const wanted = !link.wanted;
+  try { localStorage.setItem(WANTED_KEY, wanted ? '1' : '0'); } catch { /* storage unavailable */ }
+  if (wanted) link.start(); else link.stop();
 });
 channel.onmessage = event => {
   if (event.data?.direction !== 'outbound') return;
@@ -155,6 +187,7 @@ channel.onmessage = event => {
   }
 };
 channel.postMessage({ direction: 'inbound', message: { type: 'get-schema' } });
-window.addEventListener('pagehide', () => { if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'release' })); socket?.close(); channel.close(); });
+window.addEventListener('pagehide', () => { link.send({ type: 'release' }); link.stop(); channel.close(); });
 setInterval(() => update(), 100);
 sources(); updateMode(); drawValues();
+if (connectAtLoad) link.start();

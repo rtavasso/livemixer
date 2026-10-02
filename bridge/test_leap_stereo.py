@@ -13,6 +13,7 @@ the fisheye stand-in for the raw cameras (rectifier + matcher), then through
 """
 from __future__ import annotations
 
+import atexit
 import base64
 import contextlib
 import ctypes as C
@@ -647,17 +648,45 @@ class LeapBindingTests(unittest.TestCase):
             src.read()  # before start()
         src._thread = threading.Thread(target=lambda: time.sleep(3.0), daemon=True)  # stands in for a poll thread that never returns
         src._thread.start()
+        lsrc.LeapStereoSource._stall_logged_at = None
         started = time.perf_counter()
         with self.assertLogs("leap_source", level="WARNING") as logs:
             with self.assertRaises(RuntimeError) as ctx:
                 src.read()
         self.assertLess(time.perf_counter() - started, 2.0)
-        self.assertIn("5.0.0-preview", str(ctx.exception))
-        self.assertTrue(any("5.0.0-preview" in line for line in logs.output))
+        self.assertIn("no stereo images from LeapC", str(ctx.exception))
+        self.assertIn("policy=not granted", str(ctx.exception))
+        self.assertTrue(any("5.0.0-preview" in line for line in logs.output), "the long explanation is logged")
+        # An unplugged controller stalls on every restart: the explanation is logged at most once a minute.
+        with self.assertNoLogs("leap_source", level="WARNING"):
+            with self.assertRaises(RuntimeError):
+                src.read()
         self.assertIn("policy=not granted", src.state())
         src._thread = None
         src.stop()
         self.assertFalse(src.needs_hard_exit)
+
+    def test_stall_restart_defaults_to_five_seconds_and_a_stuck_poll_thread_is_not_reused(self) -> None:
+        src = lsrc.LeapStereoSource(view=VIEW)
+        self.assertEqual((src.restart_after, src.stall_after), (5.0, 3.0))
+        self.assertEqual(lsrc.LeapStereoSource(view=VIEW, restart_after=2.0).stall_after, 2.0, "the stall is logged no later than the restart")
+        with self.assertRaises(ValueError):
+            lsrc.LeapStereoSource(view=VIEW, restart_after=0.0)
+        args = db.build_parser().parse_args(["--source", "leap", "--stall-restart", "7.5"])
+        args.near, args.far = db.resolve_range(args)
+        self.assertEqual(db.make_source(args).restart_after, 7.5, "--stall-restart reaches the source")
+        self.assertEqual(db.build_parser().parse_args(["--source", "leap"]).stall_restart, 5.0)
+        stuck = threading.Event()
+        src._thread = threading.Thread(target=stuck.wait, daemon=True)  # a LeapPollConnection that never returns
+        src._thread.start()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "fresh process"):
+                src.start()
+            self.assertTrue(src.needs_hard_exit, "the server and CLI then exit so run-leap.sh starts a new process")
+        finally:
+            stuck.set()
+            src._thread.join(1.0)
+            atexit.unregister(lsrc._hard_exit_at_shutdown)  # the test process must still exit normally
 
     def test_injected_stereo_pair_goes_through_the_live_pipeline(self) -> None:
         """Everything after LeapPollConnection, with the fisheye stand-in answering for LeapRectilinearToPixel."""
@@ -1345,6 +1374,80 @@ class DistanceSimulationTests(unittest.TestCase):
         self.assertGreater(truth.box[1], 450.0, "the box stretches to hold the farther hand")
         core = truth.hand & (truth.depth > 0)
         self.assertAlmostEqual(float(np.median(truth.depth[core])), z_far, delta=25.0)
+
+
+class LearnedStateTests(unittest.TestCase):
+    """--leap-state: the alignment and hand frame one run learned are where the next run starts."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, ".leap-state.json")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def bridge_source(self, *extra: str, source: str = "leap-synthetic") -> object:
+        args = db.build_parser().parse_args(["--source", source, "--leap-state", self.path, *extra])
+        args.near, args.far = db.resolve_range(args)
+        return db.make_source(args)
+
+    def test_a_locked_hand_frame_is_saved_and_reused(self) -> None:
+        truth = TRUTHS[1]
+        src = lsrc.LeapSyntheticSource(VIEW, paced=False, hand_frame="auto", true_frame=truth, state_file=self.path)  # a scene whose truth is not the default
+        for t in np.arange(0.5, 4.0, 0.25):
+            src.frame_at(float(t))
+            if src.projector.locked:
+                break
+        self.assertTrue(src.projector.locked)
+        with open(self.path, encoding="utf-8") as fh:
+            saved = json.load(fh)
+        self.assertEqual(saved["hand_frame"]["name"], truth)
+        self.assertEqual((saved["hand_frame"]["swap"], saved["hand_frame"]["orient"]), (False, "none"))
+        # The next run starts locked on it ...
+        with self.assertLogs("leap_source", level="INFO") as logs:
+            again = self.bridge_source()
+        self.assertEqual(again.projector.describe(), f"{truth} (fixed)")
+        self.assertTrue(any("reused" in line for line in logs.output))
+        # ... unless told otherwise.
+        self.assertIsNotNone(self.bridge_source("--relearn").projector.detector, "--relearn detects it again")
+        self.assertEqual(self.bridge_source("--leap-hand-frame", TRUTHS[2]).projector.describe(), f"{TRUTHS[2]} (fixed)", "an explicit flag wins")
+        self.assertIsNotNone(self.bridge_source("--swap-cameras").projector.detector, "learned under another camera order: not reused")
+        self.assertIsNotNone(db.make_source(db.build_parser().parse_args(["--source", "leap-synthetic", "--near", "0.1", "--far", "0.45"])).projector.detector,
+                             "without --leap-state nothing is read")
+
+    def test_a_fitted_alignment_is_saved_and_reused(self) -> None:
+        fit = ls.AlignmentFit(ls.CameraAlignment(0.31, -0.52), 412, 1.8, 0.2)
+        lsrc.remember_alignment(self.path, fit)
+        lsrc.save_learned_state(self.path, hand_frame={"name": TRUTHS[0], "swap": False, "orient": "none"})
+        with open(self.path, encoding="utf-8") as fh:
+            saved = json.load(fh)
+        self.assertEqual(saved["alignment"]["pitch"], 0.31, "updates merge into the file")
+        self.assertEqual(saved["hand_frame"]["name"], TRUTHS[0])
+        src = self.bridge_source(source="leap")
+        self.assertIsInstance(src, lsrc.LeapStereoSource)
+        self.assertEqual((src.alignment.pitch, src.alignment.roll), (0.31, -0.52))
+        self.assertIsNone(src.align_estimator, "nothing to fit at start-up")
+        self.assertEqual(src.projector, None)
+        self.assertEqual(src.hand_frame, TRUTHS[0])
+        self.assertIsNotNone(self.bridge_source("--relearn", source="leap").align_estimator)
+        self.assertEqual(self.bridge_source("--leap-align", "none", source="leap").alignment, ls.CameraAlignment())
+        # The live source writes what it fits.
+        os.remove(self.path)
+        live = lsrc.LeapStereoSource(view=VIEW, state_file=self.path)
+        live.align_estimator = type("Fitted", (), {"done": False, "observe": lambda self, left, right: fit})()  # type: ignore[assignment]
+        live._observe_alignment(np.zeros((4, 4), np.uint8), np.zeros((4, 4), np.uint8))
+        self.assertEqual(lsrc.resolve_learned(self.path, "auto", "auto", False, "none"), ("0.31,-0.52", "auto"))
+
+    def test_a_damaged_state_file_is_ignored(self) -> None:
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        with self.assertLogs("leap_source", level="WARNING"):
+            self.assertEqual(lsrc.resolve_learned(self.path, "auto", "auto", False, "none"), ("auto", "auto"))
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"alignment": {"pitch": 45.0, "roll": 0.0}, "hand_frame": {"name": "sideways", "swap": False, "orient": "none"}}, fh)
+        with self.assertLogs("leap_source", level="INFO"):
+            self.assertEqual(lsrc.resolve_learned(self.path, "auto", "auto", False, "none"), ("auto", "auto"))
+        self.assertEqual(lsrc.resolve_learned(None, "auto", "auto", False, "none"), ("auto", "auto"))
 
 
 class ParserDefaultTests(unittest.TestCase):
