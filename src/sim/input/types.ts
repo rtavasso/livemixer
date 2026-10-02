@@ -55,6 +55,8 @@ export interface HandObservation {
   openness?: number;
   /** 0 = apart, 1 = thumb and index touching. Only landmark sources know this. */
   pinch?: number;
+  /** Unit vector pointing out of the palm, source frame. Only skeleton sources that know the palm's facing. */
+  palmNormal?: Vec3;
   /** Optional point set (landmarks, contour samples) in the source frame. */
   points?: Vec3[];
   /** Optional solid shape of the hand (skeleton sources). Omit when only a position is known. */
@@ -99,6 +101,10 @@ export interface HandState {
   radius: number;
   openness: number;
   pinch: number;
+  /** Unit vector out of the palm in sim space (y up), smoothed; null when the source cannot tell. */
+  palmNormal: Vec3 | null;
+  /** How far the palm faces up: 1 palm up, −1 palm down, 0 sideways or unknown (the y of `palmNormal`). */
+  palmUp: number;
   confidence: number;
   /** Milliseconds since this hand first became present. */
   ageMs: number;

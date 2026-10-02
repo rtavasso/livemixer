@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_TRACKER_SETTINGS, HandTracker, OneEuro } from '../../src/sim/input/conditioning';
 import { detectGestures, emptyGestureMemory, type GestureEvent } from '../../src/sim/input/gestures';
-import { calibrateMapping, IMAGE_MAPPING, mapBox, mapOccupancy, mapPoint, SCREEN_MAPPING, spaceMappingSchema, stableCapture } from '../../src/sim/input/mapping';
+import { calibrateMapping, IMAGE_MAPPING, LEAP_MAPPING, mapBox, mapDirection, mapOccupancy, mapPoint, SCREEN_MAPPING, spaceMappingSchema, stableCapture } from '../../src/sim/input/mapping';
 import { bridgeFrameToInput, ClockMapper, decodeOccupancy, encodeOccupancy, parseBridgeMessage } from '../../src/sim/input/protocol';
 import { InputRecorder, parseRecording, ReplaySource } from '../../src/sim/input/replay';
 import { SyntheticSource } from '../../src/sim/input/synthetic';
@@ -23,6 +23,13 @@ describe('space mapping', () => {
     expect(mapPoint(m, { x: 0, y: 0, z: 2 }).x).toBe(1);
     const box = mapBox(m, { min: { x: 0, y: 0, z: .2 }, max: { x: 1, y: 1, z: .8 } });
     expect(box.min).toEqual({ x: 0, y: 0, z: 0 }); expect(box.max).toEqual({ x: 1, y: 1, z: 1 });
+  });
+  it('maps a palm direction like positions: image-up becomes sim-up, a mirrored axis flips', () => {
+    const near = (a: { x: number; y: number; z: number }, b: { x: number; y: number; z: number }) => [a.x - b.x, a.y - b.y, a.z - b.z].forEach(d => expect(Math.abs(d)).toBeLessThan(1e-9));
+    near(mapDirection(IMAGE_MAPPING, { x: 0, y: -1, z: 0 }), { x: 0, y: 1, z: 0 });   // image y grows down
+    near(mapDirection(IMAGE_MAPPING, { x: 1, y: 0, z: 0 }), { x: -1, y: 0, z: 0 });   // x mirrored
+    near(mapDirection(LEAP_MAPPING, { x: 0, y: 0, z: 1 }), { x: 0, y: 0, z: -1 });    // z interval reversed
+    const d = mapDirection(SCREEN_MAPPING, { x: .6, y: 0, z: .8 }); expect(Math.hypot(d.x, d.y, d.z)).toBeCloseTo(1, 9);
   });
   it('rejects a degenerate interval', () => { expect(() => spaceMappingSchema.parse({ ...SCREEN_MAPPING, x: { from: 'x', low: .5, high: .5, mirror: false } })).toThrow(); });
   it('resamples occupancy into sim orientation', () => {
@@ -121,6 +128,17 @@ describe('hand tracker', () => {
     for (let at = 1216; at <= 1400; at += 16) state = t.tick(at); // no observations: still present, velocity decays
     expect(state.hands).toHaveLength(1); expect(state.hands[0].velocity.x).toBeLessThan(.3);
   });
+  it('reports the palm facing in sim space as palmUp, smoothed, and 0 when the source cannot tell', () => {
+    const at = (n: number, palmNormal?: { x: number; y: number; z: number }): InputFrame => ({ source: 'depth', sequence: n, observedAtMs: n * 33, receivedAtMs: n * 33, hands: [{ id: 1, position: { x: .5, y: .5, z: .5 }, confidence: 1, palmNormal }] });
+    const t = new HandTracker(IMAGE_MAPPING);
+    for (let n = 0; n < 12; n++) t.ingest(at(n, { x: 0, y: -1, z: 0 }));  // pointing up the camera image
+    let h = t.tick(12 * 33).hands[0]; expect(h.palmUp).toBeCloseTo(1, 3); expect(h.palmNormal!.y).toBeCloseTo(1, 3);
+    for (let n = 12; n < 40; n++) t.ingest(at(n, { x: 0, y: 1, z: 0 }));  // turned over
+    h = t.tick(40 * 33).hands[0]; expect(h.palmUp).toBeLessThan(-.99);
+    const blind = new HandTracker(IMAGE_MAPPING);
+    for (let n = 0; n < 12; n++) blind.ingest(at(n));
+    h = blind.tick(12 * 33).hands[0]; expect(h.palmNormal).toBeNull(); expect(h.palmUp).toBe(0);
+  });
   it('never promotes a hand seen only once', () => {
     const t = new HandTracker(SCREEN_MAPPING);
     t.ingest(frame(0, 0, .5, .5));
@@ -135,7 +153,7 @@ describe('hand tracker', () => {
 });
 
 describe('gestures', () => {
-  const hand = (over: Partial<HandState>): HandState => ({ id: 1, position: { x: .5, y: .5, z: .2 }, velocity: { x: 0, y: 0, z: 0 }, speed: 0, extent: { min: { x: .4, y: .4, z: .2 }, max: { x: .6, y: .6, z: .2 } }, radius: .1, openness: 1, pinch: 0, confidence: 1, ageMs: 0, staleMs: 0, push: .2, points: [], capsules: [], ...over });
+  const hand = (over: Partial<HandState>): HandState => ({ id: 1, position: { x: .5, y: .5, z: .2 }, velocity: { x: 0, y: 0, z: 0 }, speed: 0, extent: { min: { x: .4, y: .4, z: .2 }, max: { x: .6, y: .6, z: .2 } }, radius: .1, openness: 1, pinch: 0, palmNormal: null, palmUp: 0, confidence: 1, ageMs: 0, staleMs: 0, push: .2, points: [], capsules: [], ...over });
   const run = (script: (t: number) => HandState[] | null, untilMs: number, stepMs = 16) => {
     let memory = emptyGestureMemory(); const events: GestureEvent[] = [];
     for (let t = 0; t <= untilMs; t += stepMs) { const r = detectGestures(memory, script(t) ?? [], t); memory = r.memory; events.push(...r.events); }
@@ -165,6 +183,13 @@ describe('gestures', () => {
     const types = run(script, 1000).map(e => e.type).filter(t => t !== 'hold');
     expect(types).toEqual(['enter', 'grab', 'release']);
   });
+  it('palm up and down use hysteresis and need a palm normal', () => {
+    const facing = (up: number) => hand({ palmUp: up, palmNormal: { x: 0, y: up, z: Math.sqrt(1 - up * up) } });
+    // up, wobble inside the band (no re-fire), sideways, down, back inside the band, down stays down
+    const script = (t: number) => [facing(t < 200 ? 0 : t < 400 ? .8 : t < 500 ? .4 : t < 600 ? .7 : t < 700 ? .1 : t < 900 ? -.9 : t < 1000 ? -.4 : -.8)];
+    expect(run(script, 1100).map(e => e.type).filter(t => t.startsWith('palm'))).toEqual(['palmUp', 'palmDown']);
+    expect(run(() => [hand({ palmUp: .9 })], 300).some(e => e.type.startsWith('palm'))).toBe(false);
+  });
 });
 
 describe('bridge protocol', () => {
@@ -182,6 +207,9 @@ describe('bridge protocol', () => {
       expect(input.hands[0].position).toEqual({ x: .2, y: .3, z: .4 }); expect(input.hands[0].extent?.max).toEqual({ x: .3, y: .4, z: .5 });
       expect(Array.from(input.occupancy!.data)).toEqual([1, 2, 3, 4]); expect(input.stats).toEqual({ pixels: 120 });
     }
+    const palm = parseBridgeMessage(JSON.stringify({ type: 'frame', seq: 4, t: 13, hands: [{ id: 2, pos: [.5, .5, .5], palmNormal: [0, -1, 0] }] }));
+    if (palm.type === 'frame') expect(bridgeFrameToInput(palm, 0, 0, null).hands[0].palmNormal).toEqual({ x: 0, y: -1, z: 0 });
+    expect(() => parseBridgeMessage(JSON.stringify({ type: 'frame', seq: 5, t: 13, hands: [{ id: 2, pos: [.5, .5, .5], palmNormal: [0, -2, 0] }] }))).toThrow();
   });
   it('round-trips occupancy and rejects a size mismatch', () => {
     const grid = { width: 3, height: 2, data: new Uint8Array([0, 128, 255, 7, 8, 9]) };

@@ -79,7 +79,7 @@ def synthetic(**kw: object) -> db.SyntheticSource:
 
 HELLO_REQUIRED, HELLO_OPTIONAL = {"type", "version", "source", "box"}, {"fps", "occupancy", "voxels", "surface", "skeleton", "frame"}
 FRAME_REQUIRED, FRAME_OPTIONAL = {"type", "seq", "t", "hands"}, {"occupancy", "voxels", "surface", "stats"}
-HAND_REQUIRED, HAND_OPTIONAL = {"id", "pos"}, {"conf", "extent", "openness", "pinch", "points", "skeleton"}
+HAND_REQUIRED, HAND_OPTIONAL = {"id", "pos"}, {"conf", "extent", "openness", "pinch", "points", "skeleton", "palmNormal"}
 SKELETON_REQUIRED, SKELETON_OPTIONAL = {"type", "palm", "wrist", "fingers"}, {"elbow", "palmWidth", "armWidth"}
 FINGER_KEYS = {"joints", "width", "extended"}
 TRACKED_HAND_KEYS = {"id", "pos", "conf", "extent", "openness", "pinch", "points", "skeleton"}
@@ -679,13 +679,28 @@ class TrackedHandTests(ProtocolAssertions):
         self.assertEqual(db.normalize_tracked_hand(hand, self.ROI, NEAR_MM, FAR_MM, sample_points=0).points, (), "--points 0 drops them")
         self.assertEqual(db.normalize_tracked_hand(tracked_hand(confidence=0.9), self.ROI, NEAR_MM, FAR_MM).conf, 0.9)
 
+    def test_palm_normal_rides_the_same_box_and_reaches_the_wire(self) -> None:
+        import dataclasses
+        palm = (319.5, 239.5, float(depth_at(0.3)))
+        hand = dataclasses.replace(tracked_hand(palm=palm), palm_normal_tip=np.array([palm[0], palm[1] + 24.0, palm[2]]))
+        sk = db.normalize_tracked_hand(hand, self.ROI, NEAR_MM, FAR_MM)
+        self.assertIsNotNone(sk.palm_normal)
+        for got, want in zip(sk.palm_normal, (0.0, 1.0, 0.0)):  # 24 px down the image: +v in the box
+            self.assertAlmostEqual(got, want, places=6)
+        m = db.tracked_hand_message(sk)
+        self.assertEqual(m["palmNormal"], [0.0, 1.0, 0.0])
+        self.assert_hand(m)
+        plain = db.normalize_tracked_hand(tracked_hand(palm=palm), self.ROI, NEAR_MM, FAR_MM)
+        self.assertIsNone(plain.palm_normal)
+        self.assertNotIn("palmNormal", db.tracked_hand_message(plain), "sources without a palm normal send no key")
+
     def test_joints_are_not_clamped_but_pos_and_extent_are(self) -> None:
         hand = tracked_hand(palm=(159.5, 119.5, float(depth_at(0.0))))  # the ROI's top-left corner: fingers leave it upward
         sk = db.normalize_tracked_hand(hand, self.ROI, NEAR_MM, FAR_MM)
         self.assertLess(float(sk.joints[:, 1].min()), 0.0)
         self.assertAlmostEqual(sk.pos[0], 0.0, places=6)
         m = db.tracked_hand_message(sk)
-        self.assertEqual(set(m), TRACKED_HAND_KEYS)
+        self.assertEqual(set(m) - {"palmNormal"}, TRACKED_HAND_KEYS)
         self.assert_hand(m)
         self.assertEqual(m["pos"], [0.0, 0.0, 0.0])
         self.assertEqual(m["extent"][0], [0.0, 0.0, 0.0], "clamped like pos")
@@ -703,7 +718,7 @@ class TrackedHandTests(ProtocolAssertions):
         m = db.frame_message(3, 1.0, result)
         self.assert_frame(m, (8, 6), (8, 6, 4), (8, 6))
         h = m["hands"][0]
-        self.assertEqual(set(h), TRACKED_HAND_KEYS)
+        self.assertEqual(set(h) - {"palmNormal"}, TRACKED_HAND_KEYS)
         self.assertEqual(h["id"], 1)
         for got, want in zip(h["pos"], (scripted.x, scripted.y, scripted.z)):
             self.assertAlmostEqual(got, want, delta=1e-3)
@@ -1453,7 +1468,7 @@ class DumpCliTests(ProtocolAssertions):
             self.assertEqual(frame["seq"], seq)
             self.assertEqual(len(frame["hands"]), 1, "the script starts with one hand present")  # type: ignore[arg-type]
             hand = frame["hands"][0]  # type: ignore[index]
-            self.assertEqual(set(hand), TRACKED_HAND_KEYS)
+            self.assertEqual(set(hand) - {"palmNormal"}, TRACKED_HAND_KEYS)
             self.assertEqual(len(hand["skeleton"]["fingers"]), 5)
             self.assertEqual(frame["stats"]["trackedHands"], 1.0)  # type: ignore[index]
         ts = [f["t"] for f in frames]
@@ -1557,7 +1572,7 @@ class DumpCliTests(ProtocolAssertions):
             hands = frame["hands"]
             assert isinstance(hands, list)
             self.assertEqual(len(hands), 1, "the script starts with the hand present")
-            self.assertEqual(set(hands[0]), TRACKED_HAND_KEYS)
+            self.assertEqual(set(hands[0]) - {"palmNormal"}, TRACKED_HAND_KEYS)
             self.assertEqual(hands[0]["skeleton"]["palm"], hands[0]["pos"], "pos is the palm")
             stats = frame["stats"]
             assert isinstance(stats, dict)
@@ -1981,7 +1996,7 @@ class UprightDumpTests(ProtocolAssertions):
             hands = frame["hands"]
             assert isinstance(hands, list)
             self.assertEqual(len(hands), 1, "the script starts with the hand present, at the centre of the box")
-            self.assertEqual(set(hands[0]), TRACKED_HAND_KEYS)
+            self.assertEqual(set(hands[0]) - {"palmNormal"}, TRACKED_HAND_KEYS)
             self.assertEqual(hands[0]["skeleton"]["palm"], hands[0]["pos"])
             _, v, _ = hands[0]["pos"]
             self.assertAlmostEqual(v, 0.75, delta=0.03, msg="600 mm up in a 400-1200 mm height range")

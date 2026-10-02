@@ -500,7 +500,7 @@ export class SimHost {
       type: 'schema', v: 1,
       sim: { id: this.definition.id, title: this.definition.title, description: this.definition.description, params: this.definition.params, signals: this.definition.signals },
       sims: SIMULATIONS.map(s => ({ id: s.id, title: s.title })),
-      input: { hand: ['id', 'x', 'y', 'z', 'vx', 'vy', 'vz', 'speed', 'radius', 'openness', 'pinch', 'push', 'ageMs', 'staleMs', 'solid'], gestures: GESTURE_TYPES, sources: SOURCE_IDS },
+      input: { hand: ['id', 'x', 'y', 'z', 'vx', 'vy', 'vz', 'speed', 'radius', 'openness', 'pinch', 'palmUp', 'push', 'ageMs', 'staleMs', 'solid'], gestures: GESTURE_TYPES, sources: SOURCE_IDS },
     };
   }
 
@@ -531,6 +531,6 @@ export class SimHost {
 }
 
 function handTelemetry(h: HandState): HandTelemetry {
-  return { id: h.id, x: round(h.position.x), y: round(h.position.y), z: round(h.position.z), vx: round(h.velocity.x), vy: round(h.velocity.y), vz: round(h.velocity.z), speed: round(h.speed), radius: round(h.radius), openness: round(h.openness), pinch: round(h.pinch), push: round(h.push), ageMs: Math.round(h.ageMs), staleMs: Math.round(h.staleMs), solid: h.capsules.length };
+  return { id: h.id, x: round(h.position.x), y: round(h.position.y), z: round(h.position.z), vx: round(h.velocity.x), vy: round(h.velocity.y), vz: round(h.velocity.z), speed: round(h.speed), radius: round(h.radius), openness: round(h.openness), pinch: round(h.pinch), palmUp: round(h.palmUp), push: round(h.push), ageMs: Math.round(h.ageMs), staleMs: Math.round(h.staleMs), solid: h.capsules.length };
 }
 const round = (v: number) => Math.round(v * 1000) / 1000;

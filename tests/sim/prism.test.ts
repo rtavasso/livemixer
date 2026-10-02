@@ -431,7 +431,7 @@ describe('segment budget', () => {
 
 /** A tracked hand in sim space with a solid shape. */
 function handState(id: number, position: Vec3, capsules: Capsule[]): HandState {
-  return { id, position, velocity: { x: 0, y: 0, z: 0 }, speed: 0, extent: { min: position, max: position }, radius: .05, openness: 1, pinch: 0, confidence: 1, ageMs: 0, staleMs: 0, push: position.z, points: [], capsules };
+  return { id, position, velocity: { x: 0, y: 0, z: 0 }, speed: 0, extent: { min: position, max: position }, radius: .05, openness: 1, pinch: 0, palmNormal: null, palmUp: 0, confidence: 1, ageMs: 0, staleMs: 0, push: position.z, points: [], capsules };
 }
 const emptySignals = (): RawSignals => ({ spread: 0, hue: 0, brightness: 0, reflected: 0, incidence: 0, inside: 0, occluded: 0 });
 const noGlass: TraceOptions = { spectrum: buildSpectrum(8), glassA: 1.5, glassB: 0, bounces: 2, minEnergy: 1e-6, bounds: [-1, -1, 3, 1] };

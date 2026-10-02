@@ -17,7 +17,7 @@ import {
 const hand = (id: number, x: number, y: number, extra: Partial<HandState> = {}): HandState => ({
   id, position: { x, y, z: .3 }, velocity: { x: 0, y: 0, z: 0 }, speed: 0,
   extent: { min: { x: x - .05, y: y - .05, z: .3 }, max: { x: x + .05, y: y + .05, z: .3 } }, radius: .05,
-  openness: 1, pinch: 0, confidence: 1, ageMs: 0, staleMs: 0, push: 0, points: [], capsules: [], ...extra,
+  openness: 1, pinch: 0, palmNormal: null, palmUp: 0, confidence: 1, ageMs: 0, staleMs: 0, push: 0, points: [], capsules: [], ...extra,
 });
 const params = { brushSize: .045, brightness: 1, saturation: .55, hue: .07, depthFade: 0 };
 

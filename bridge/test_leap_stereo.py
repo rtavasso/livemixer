@@ -1456,7 +1456,8 @@ class DumpCliTests(ProtocolAssertions):
             self.assertEqual(frame["stats"]["trackedHands"], 1.0)  # type: ignore[index]
             self.assertEqual(len(frame["hands"]), 1, "the script starts with the hand above the device")  # type: ignore[arg-type]
             hand = frame["hands"][0]  # type: ignore[index]
-            self.assertEqual(set(hand), TRACKED_HAND_KEYS)
+            self.assertEqual(set(hand), TRACKED_HAND_KEYS | {"palmNormal"}, "Leap hands carry the palm normal")
+            self.assertAlmostEqual(sum(c * c for c in hand["palmNormal"]), 1.0, places=3)
             self.assertEqual(hand["skeleton"]["type"], "right")
             self.assertEqual(hand["openness"], 0.0, "a fist")
             self.assertFalse(any(f["extended"] for f in hand["skeleton"]["fingers"]))

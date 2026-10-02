@@ -154,7 +154,15 @@ function affineCapsule(a: Affine3, c: Capsule): Capsule { return { a: applyAffin
 
 /** A source-frame observation in the hologram frame (unclamped; the mapping clamps). */
 export function rectifyObservation(a: Affine3, o: HandObservation): HandObservation {
-  return { ...o, position: applyAffine(a, o.position), extent: o.extent ? affineBox(a, o.extent) : undefined, points: o.points?.map(p => applyAffine(a, p)), capsules: o.capsules?.map(c => affineCapsule(a, c)) };
+  return { ...o, position: applyAffine(a, o.position), extent: o.extent ? affineBox(a, o.extent) : undefined, points: o.points?.map(p => applyAffine(a, p)), capsules: o.capsules?.map(c => affineCapsule(a, c)), palmNormal: o.palmNormal ? affineDirection(a, o.palmNormal) : undefined };
+}
+
+/** A direction (the palm's facing is a displacement out of the palm) through the affine's linear part, renormalised. */
+function affineDirection(a: Affine3, d: Vec3): Vec3 {
+  const { m } = a;
+  const v = { x: m[0] * d.x + m[1] * d.y + m[2] * d.z, y: m[3] * d.x + m[4] * d.y + m[5] * d.z, z: m[6] * d.x + m[7] * d.y + m[8] * d.z };
+  const n = Math.hypot(v.x, v.y, v.z) || 1;
+  return { x: v.x / n, y: v.y / n, z: v.z / n };
 }
 
 /**

@@ -5,7 +5,7 @@ import type { HandState } from '../../src/sim/input/types';
 
 const hand = (z: number, extra: Partial<HandState> = {}): HandState => ({
   id: 1, position: { x: .4, y: .6, z }, velocity: { x: 0, y: 0, z: 0 }, speed: 0,
-  extent: { min: { x: .35, y: .55, z }, max: { x: .45, y: .65, z } }, radius: .05, openness: 1, pinch: 0, confidence: 1,
+  extent: { min: { x: .35, y: .55, z }, max: { x: .45, y: .65, z } }, radius: .05, openness: 1, pinch: 0, palmNormal: null, palmUp: 0, confidence: 1,
   ageMs: 1000, staleMs: 0, push: z, points: [], capsules: [], ...extra,
 });
 

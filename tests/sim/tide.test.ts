@@ -21,7 +21,7 @@ function meanDistance(school: School, x: number, y: number) {
 
 const handState = (x: number, y: number, z: number, extra: Partial<HandState> = {}): HandState => ({
   id: 1, position: { x, y, z }, velocity: { x: 0, y: 0, z: 0 }, speed: 0,
-  extent: { min: { x: x - .05, y: y - .05, z }, max: { x: x + .05, y: y + .05, z } }, radius: .05, openness: 1, pinch: 0, confidence: 1,
+  extent: { min: { x: x - .05, y: y - .05, z }, max: { x: x + .05, y: y + .05, z } }, radius: .05, openness: 1, pinch: 0, palmNormal: null, palmUp: 0, confidence: 1,
   ageMs: 1000, staleMs: 0, push: z, points: [], capsules: [], ...extra,
 });
 

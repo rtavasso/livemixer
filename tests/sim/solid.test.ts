@@ -47,7 +47,7 @@ describe('capsule mapping and packing', () => {
     expect(c.a.x).toBe(0); expect(c.b.x).toBe(1); expect(c.radius).toBeCloseTo(.1, 9);
   });
   it('packs hands into world-unit capsules with a bounding sphere, and spheres for shapeless hands', () => {
-    const base: HandState = { id: 1, position: { x: .5, y: .5, z: .5 }, velocity: { x: 0, y: 0, z: 0 }, speed: 0, extent: { min: { x: .4, y: .4, z: .5 }, max: { x: .6, y: .6, z: .5 } }, radius: .05, openness: 1, pinch: 0, confidence: 1, ageMs: 0, staleMs: 0, push: .5, points: [], capsules: [] };
+    const base: HandState = { id: 1, position: { x: .5, y: .5, z: .5 }, velocity: { x: 0, y: 0, z: 0 }, speed: 0, extent: { min: { x: .4, y: .4, z: .5 }, max: { x: .6, y: .6, z: .5 } }, radius: .05, openness: 1, pinch: 0, palmNormal: null, palmUp: 0, confidence: 1, ageMs: 0, staleMs: 0, push: .5, points: [], capsules: [] };
     const solid: HandState = { ...base, id: 2, capsules: [{ a: { x: .1, y: .5, z: .2 }, b: { x: .3, y: .5, z: .2 }, radius: .02 }, { a: { x: .3, y: .5, z: .2 }, b: { x: .3, y: .7, z: .2 }, radius: .01 }] };
     const packed = packHands([base, solid], 2, 1, createPackedHands());
     expect(packed.count).toBe(3); expect(packed.boundCount).toBe(2);

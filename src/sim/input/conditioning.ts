@@ -32,6 +32,8 @@ export const trackerSettingsSchema = z.object({
   derivativeCutoff: z.number().positive().default(1),
   /** Time constant for the velocity estimate (seconds). */
   velocityTau: z.number().positive().default(.06),
+  /** Time constant for smoothing the palm's facing (seconds). */
+  palmTau: z.number().positive().default(.08),
   /** Presence rise / fall time constants (seconds). */
   presenceRiseTau: z.number().positive().default(.08),
   presenceFallTau: z.number().positive().default(.6),
@@ -82,6 +84,19 @@ export class OneEuro {
   get value() { return this.x; }
 }
 
+/**
+ * Low-pass a direction as a raw vector, normalised only when read (`unitOrNull`), so a palm turned
+ * straight over still converges instead of renormalising back to where it started each step.
+ */
+function blendDirection(a: Vec3, b: Vec3, k: number): Vec3 {
+  return { x: a.x + k * (b.x - a.x), y: a.y + k * (b.y - a.y), z: a.z + k * (b.z - a.z) };
+}
+function unitOrNull(v: Vec3 | null): Vec3 | null {
+  if (!v) return null;
+  const n = Math.hypot(v.x, v.y, v.z);
+  return n > 1e-6 ? { x: v.x / n, y: v.y / n, z: v.z / n } : null;
+}
+
 interface Track {
   id: number;
   firstSeenMs: number;
@@ -96,6 +111,8 @@ interface Track {
   extent: Box3;
   openness: number;
   pinch: number;
+  /** Smoothed palm normal as a raw (not unit) vector, sim space; null until a source reports one. */
+  palmNormal: Vec3 | null;
   confidence: number;
   push: number;
   points: Vec3[];
@@ -176,7 +193,7 @@ export class HandTracker {
     let track = this.tracks.get(o.id);
     if (!track) {
       const mk = () => new OneEuro(s.minCutoff, s.beta, s.derivativeCutoff);
-      track = { id: o.id, firstSeenMs: now, lastSeenMs: now, present: false, filters: [mk(), mk(), mk()], pushFilter: new OneEuro(4, .1, 1), position: { ...o.position }, velocity: { x: 0, y: 0, z: 0 }, extent: defaultExtent(o.position), openness: o.openness ?? 1, pinch: o.pinch ?? 0, confidence: o.confidence, push: o.position.z, points: o.points ?? [], capsules: o.capsules ?? [], rawPosition: { ...o.position }, lastFilterMs: now, intervalMs: 33 };
+      track = { id: o.id, firstSeenMs: now, lastSeenMs: now, present: false, filters: [mk(), mk(), mk()], pushFilter: new OneEuro(4, .1, 1), position: { ...o.position }, velocity: { x: 0, y: 0, z: 0 }, extent: defaultExtent(o.position), openness: o.openness ?? 1, pinch: o.pinch ?? 0, palmNormal: o.palmNormal ?? null, confidence: o.confidence, push: o.position.z, points: o.points ?? [], capsules: o.capsules ?? [], rawPosition: { ...o.position }, lastFilterMs: now, intervalMs: 33 };
       track.filters.forEach((f, i) => f.reset([o.position.x, o.position.y, o.position.z][i]));
       track.pushFilter.reset(o.position.z);
       this.tracks.set(o.id, track);
@@ -192,6 +209,7 @@ export class HandTracker {
       track.settleUntilMs = now + s.teleportSettleMs;
       track.extent = o.extent ?? defaultExtent(o.position);
       track.openness = o.openness ?? track.openness; track.pinch = o.pinch ?? track.pinch; track.confidence = o.confidence;
+      track.palmNormal = o.palmNormal ?? track.palmNormal;
       track.points = o.points ?? track.points; track.capsules = o.capsules ?? track.capsules; track.rawPosition = o.position;
       track.lastSeenMs = now; track.lastFilterMs = now;
       return;
@@ -209,6 +227,7 @@ export class HandTracker {
     track.extent = o.extent ?? defaultExtent(position);
     track.openness = o.openness ?? track.openness;
     track.pinch = o.pinch ?? track.pinch;
+    if (o.palmNormal) track.palmNormal = track.palmNormal ? blendDirection(track.palmNormal, o.palmNormal, 1 - Math.exp(-dt / s.palmTau)) : o.palmNormal;
     track.confidence = o.confidence;
     track.points = o.points ?? track.points;
     track.capsules = o.capsules ?? track.capsules; track.rawPosition = o.position;
@@ -242,7 +261,8 @@ export class HandTracker {
       // The solid shape rides on the smoothed position: shift every raw capsule by (smoothed − raw).
       const dx = t.position.x - t.rawPosition.x, dy = t.position.y - t.rawPosition.y, dz = t.position.z - t.rawPosition.z;
       const capsules = t.capsules.length ? t.capsules.map(c => ({ a: { x: c.a.x + dx, y: c.a.y + dy, z: c.a.z + dz }, b: { x: c.b.x + dx, y: c.b.y + dy, z: c.b.z + dz }, radius: c.radius })) : [];
-      hands.push({ id, position: t.position, velocity: t.velocity, speed, extent: t.extent, radius: Math.max(.02, Math.max(ex, ey) / 2), openness: t.openness, pinch: t.pinch, confidence: t.confidence, ageMs: now - t.firstSeenMs, staleMs: sinceSeen, push: t.push, points: t.points, capsules });
+      const palm = unitOrNull(t.palmNormal);
+      hands.push({ id, position: t.position, velocity: t.velocity, speed, extent: t.extent, radius: Math.max(.02, Math.max(ex, ey) / 2), openness: t.openness, pinch: t.pinch, palmNormal: palm, palmUp: palm ? palm.y : 0, confidence: t.confidence, ageMs: now - t.firstSeenMs, staleMs: sinceSeen, push: t.push, points: t.points, capsules });
     }
     hands.sort((a, b) => b.ageMs - a.ageMs || a.id - b.id);
     const target = hands.length ? 1 : 0;

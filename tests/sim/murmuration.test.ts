@@ -8,7 +8,7 @@ const ASPECT = 16 / 9, DT = 1 / 60;
 const hand = (x: number, y: number, vx = 0, vy = 0, z = .3): HandState => ({
   id: 1, position: { x, y, z }, velocity: { x: vx, y: vy, z: 0 }, speed: Math.sqrt(vx * vx + vy * vy),
   extent: { min: { x: x - .05, y: y - .05, z }, max: { x: x + .05, y: y + .05, z } }, radius: .05,
-  openness: 1, pinch: 0, confidence: 1, ageMs: 1000, staleMs: 0, push: z, points: [], capsules: [],
+  openness: 1, pinch: 0, palmNormal: null, palmUp: 0, confidence: 1, ageMs: 1000, staleMs: 0, push: z, points: [], capsules: [],
 });
 
 function input(time: number, h: HandState | null): SimInput {

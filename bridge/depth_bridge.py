@@ -189,6 +189,10 @@ class TrackedHand:
     grab_strength: float = 0.0
     pinch_strength: float = 0.0
     has_elbow: bool = True
+    #: ``(u, v, depth)`` of the point ``PALM_NORMAL_MM`` out from the palm along the tracker's palm
+    #: normal, projected like ``joints`` so any mirroring or reorientation applies to it too; None when
+    #: the source has no palm normal.
+    palm_normal_tip: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if self.type not in HAND_TYPES:
@@ -799,6 +803,8 @@ class SkeletonHand:
     pinch: float
     has_elbow: bool
     points: tuple[Vec3, ...]
+    #: Unit vector out of the palm in box axes (u right, v down, w away), or None when unknown.
+    palm_normal: Vec3 | None = None
 
     @property
     def pos(self) -> Vec3:
@@ -931,6 +937,17 @@ def normalize_tracked_hand(
             depth_of_part[WIDTH_FINGERS + f] = hand.finger(f)[:, 2].mean()
         widths = upright.width_to_u(hand.widths_px, depth_of_part)
     palm = joints[JOINT_PALM]
+    palm_normal: Vec3 | None = None
+    if hand.palm_normal_tip is not None:
+        tip = np.asarray(hand.palm_normal_tip, dtype=np.float64)
+        if upright is None:
+            out = np.array([(tip[0] + 0.5 - x0) / rw, (tip[1] + 0.5 - y0) / rh, (tip[2] - near_mm) / (far_mm - near_mm)])
+        else:
+            out = np.array([float(np.asarray(c).reshape(-1)[0]) for c in upright.unit_from_pixels(tip[[0]], tip[[1]], tip[[2]])])
+        d = out - palm
+        n = float(np.linalg.norm(d))
+        if np.isfinite(n) and n > 1e-9:
+            palm_normal = (float(d[0] / n), float(d[1] / n), float(d[2] / n))
     tips = [joints[finger_joint(f, JOINTS_PER_FINGER - 1)] for f in range(N_FINGERS)]
     points: tuple[Vec3, ...] = tuple((float(p[0]), float(p[1]), float(p[2])) for p in (palm, *tips)) if sample_points > 0 else ()
     return SkeletonHand(
@@ -938,7 +955,7 @@ def normalize_tracked_hand(
         conf=min(1.0, max(MIN_TRACKED_CONF, float(hand.confidence))),
         openness=min(1.0, max(0.0, 1.0 - float(hand.grab_strength))),
         pinch=min(1.0, max(0.0, float(hand.pinch_strength))),
-        has_elbow=bool(hand.has_elbow), points=points,
+        has_elbow=bool(hand.has_elbow), points=points, palm_normal=palm_normal,
     )
 
 
@@ -1702,7 +1719,7 @@ def skeleton_message(hand: SkeletonHand) -> dict[str, Any]:
 
 def tracked_hand_message(hand: SkeletonHand) -> dict[str, Any]:
     """A ``hands[]`` entry for a tracked hand: ``pos`` is the palm (clamped), ``extent`` spans every joint."""
-    return {
+    msg = {
         "id": int(hand.id),
         "pos": _vec(hand.pos),
         "conf": _unit(hand.conf),
@@ -1712,6 +1729,9 @@ def tracked_hand_message(hand: SkeletonHand) -> dict[str, Any]:
         "points": [_vec(p) for p in hand.points[:MAX_POINTS]],
         "skeleton": skeleton_message(hand),
     }
+    if hand.palm_normal is not None:
+        msg["palmNormal"] = [round(min(1.0, max(-1.0, c)), 4) for c in hand.palm_normal]
+    return msg
 
 
 def blob_hand_message(b: Blob) -> dict[str, Any]:

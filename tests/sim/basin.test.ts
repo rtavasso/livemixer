@@ -20,7 +20,7 @@ const SURFACE = .35;
 const hand = (id: number, x: number, z: number, y = .6, extra: Partial<HandState> = {}): HandState => ({
   id, position: { x, y, z }, velocity: { x: 0, y: 0, z: 0 }, speed: 0,
   extent: { min: { x: x - .04, y: y - .06, z }, max: { x: x + .04, y: y + .06, z } },
-  radius: .06, openness: 1, pinch: 0, confidence: 1, ageMs: 100, staleMs: 0, push: z, points: [], capsules: [], ...extra,
+  radius: .06, openness: 1, pinch: 0, palmNormal: null, palmUp: 0, confidence: 1, ageMs: 100, staleMs: 0, push: z, points: [], capsules: [], ...extra,
 });
 /** The same hand moving vertically at `vy` (uniform units/s; negative = coming down). */
 const falling = (id: number, x: number, z: number, y: number, vy: number) => hand(id, x, z, y, { velocity: { x: 0, y: vy, z: 0 } });

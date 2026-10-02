@@ -350,6 +350,7 @@ MAX_TRACKED_HANDS = 16                       # an event claiming more is garbage
 MAX_JOINT_DISTANCE_MM = 3000.0               # the controller tracks to ~80 cm; anything farther is not a hand
 HAND_TYPE_NAMES = {0: "left", 1: "right"}
 FOREARM_STUB_MM = 70.0                       # how much forearm is kept past the wrist before projecting
+PALM_NORMAL_MM = 50.0                        # how far out of the palm the normal is sampled before projecting
 #: Where the rectification maps come from: ``LeapRectilinearToPixel`` (what the service computes, exact) or the 64x64
 #: distortion lattice attached to every image event (:class:`leap_stereo.GridCalibration`; the same answer in the
 #: centre of the sensor, a few pixels off towards its edges, but built without a per-point call into LeapC).
@@ -677,7 +678,10 @@ class HandProjector:
     def to_image_hand(self, hand: DeviceHand, frame: HandFrame | None = None) -> TrackedHand | None:
         joints = hand.joints.copy()
         joints[JOINT_ELBOW] = trim_forearm(joints[JOINT_WRIST], joints[JOINT_ELBOW])
-        image = self.project(joints, frame)
+        # The palm normal rides along as one more point, so it is mirrored and reoriented exactly like the hand.
+        normal_tip = joints[JOINT_PALM] + PALM_NORMAL_MM * np.asarray(hand.palm_normal, dtype=np.float64)
+        projected = self.project(np.vstack([joints, normal_tip]), frame)
+        image, tip = projected[:-1], projected[-1]
         if not np.isfinite(image).all() or (image[:, 2] <= 0).any():
             return None  # part of the hand below the device plane: not a hand this camera can see
         depth_of_part = np.empty(N_WIDTHS, dtype=np.float64)
@@ -689,6 +693,7 @@ class HandProjector:
         return TrackedHand(
             id=hand.id, type=hand.type, joints=image, widths_px=widths_px, extended=hand.extended.copy(),
             confidence=hand.confidence, grab_strength=hand.grab_strength, pinch_strength=hand.pinch_strength, has_elbow=True,
+            palm_normal_tip=tip if np.isfinite(tip).all() and tip[2] > 0 else None,
         )
 
     def resolve(self, hands: Sequence[DeviceHand], depth: np.ndarray) -> tuple[TrackedHand, ...]:
