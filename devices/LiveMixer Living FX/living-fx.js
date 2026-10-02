@@ -16,6 +16,9 @@
 autowatch=0;inlets=1;outlets=3;
 var song=null,refs=null,mix=null,mirror=[],zones=[],task=null,label='',last={},applied='';
 var manual=[0,0,0,0],balance=.5,quiet=0,oscOwned=0,lastValues=0,lastTick=0,lastState=0;
+// Hand gestures (/fx/values 5..14, docs/superpowers/specs/2026-10-02-hand-gesture-audio-design.md): muffle R/M,
+// tilt R/M, level R/M, freeze, bloom, span, whoosh. They need a set built with --gestures (RHYTHM / MELODIC groups).
+var GHOME=[0,0,.5,.5,.5,.5,0,0,.5,0],gest=GHOME.slice(),gref=null,frozen=0,freezeMix=0;
 
 function ids(v){var r=[];for(var i=0;i<v.length;i++)if(v[i]==='id'&&Number(v[i+1])>0)r.push(Number(v[++i]));return r;}
 function api(id){return new LiveAPI(null,'id '+id);}
@@ -25,6 +28,7 @@ function scalar(o,p){return o.get(p)[0];}
 function tracks(name){var all=ids(song.get('tracks')),r=[];for(var i=0;i<all.length;i++){var t=api(all[i]);if(String(scalar(t,'name'))===name)r.push(t);}return r;}
 function device(t,cls){var ds=ids(t.get('devices'));for(var i=0;i<ds.length;i++){var d=api(ds[i]);if(String(scalar(d,'class_name'))===cls)return d;}return null;}
 function param(d,name){if(!d)return null;var ps=ids(d.get('parameters'));for(var i=0;i<ps.length;i++){var p=ref(ps[i]);if(String(scalar(p.a,'name'))===name)return p;}return null;}
+function named(t,name){if(!t)return null;var ds=ids(t.get('devices'));for(var i=0;i<ds.length;i++){var d=api(ds[i]);if(String(scalar(d,'name'))===name)return d;}return null;}
 function mixer(t){return api(ids(t.get('mixer_device'))[0]);}
 function sends(t){return ids(mixer(t).get('sends'));}
 function volume(t){return ref(ids(mixer(t).get('volume'))[0]);}
@@ -34,11 +38,30 @@ function sendlevel(u){if(u<=.0001)return 0;var db=20*Math.log(u)/Math.LN10;retur
 
 function apply(v){if(!refs)return;put(refs.echo,sendlevel(.8*v[1]));put(refs.snare,sendlevel(v[1]));put(refs.other,sendlevel(.6*v[1]));put(refs.drums,sendlevel(.8*v[1]));put(refs.filter,.5-.37*v[2]);for(var i=0;i<refs.cutoff.length;i++){var c=refs.cutoff[i];put(c.p,c.hi-(c.hi-c.lo)*.55*v[2]);}put(refs.bloom,sendlevel(v[3]));}
 function setbalance(b){if(!mix)return;var db=8*(b-.5);for(var i=0;i<mix.length;i++)put(mix[i].p,Math.max(0,Math.min(1,mix[i].home+mix[i].sign*db/40)));}
+// Live 11 scales, read from Live with str_for_value: Auto Filter Frequency 20..135 (135 = 19.9 kHz open, 70 ≈ 450 Hz),
+// Utility Gain −1..1 at ~35 dB per unit, Utility Stereo Width v with percent = 100·v².
+function leveldb(l){return l<.5?-20*(.5-l):12*(l-.5);}  // .5 → 0 dB, 0 → −10 dB, 1 → +6 dB
+function utilgain(db){return Math.max(-1,Math.min(1,db/35));}
+function widthvalue(pct){return Math.sqrt(Math.max(0,pct)/100);}
+function gestureat(k){var g=[];for(var i=0;i<10;i++)g.push(GHOME[i]+(gest[i]-GHOME[i])*k);return g;}
+// Muffle closes each half's low-pass; tilt trades a high shelf (air, palm up) against a low shelf (weight, palm down);
+// level is each half's gain; whoosh sweeps Main's filter; span sets Main's width (40% together … 180% apart).
+function applygestures(k){if(!gref)return;var g=gestureat(k);
+  for(var h=0;h<2;h++){put(gref.muffle[h],135-65*g[h]);var d=g[2+h]-.5,air=Math.max(0,d)*2,weight=Math.max(0,-d)*2;put(gref.hi[h],6*air-5*weight);put(gref.lo[h],5*weight-2*air);put(gref.level[h],utilgain(leveldb(g[4+h])));}
+  put(gref.whoosh,135-75*g[9]);var s=g[8];put(gref.span,widthvalue(s<.5?100-120*(.5-s):100+160*(s-.5)));}
+// Freeze: Frozen on, then Dry Wet up over 0.3 s; on release Dry Wet down over 1.5 s, then unfrozen.
+function freezestep(dt){if(!gref||!gref.frozen)return;var want=gest[6]*(1-quiet)>=.5;
+  if(want&&!frozen){put(gref.frozen,1);frozen=1;}
+  freezeMix=want?Math.min(.65,freezeMix+dt/.3*.65):Math.max(0,freezeMix-dt/1.5*.65);put(gref.mix,freezeMix);
+  if(!want&&frozen&&freezeMix<=0){put(gref.frozen,0);frozen=0;}}
+function gesturesathome(){for(var i=0;i<10;i++)if(gest[i]!==GHOME[i])return false;return true;}
 // Back to each group's home volume, unless the operator has moved that fader since our last write.
 function restorehome(){if(!mix)return;for(var i=0;i<mix.length;i++){var m=mix[i],id=m.p.id;if(last[id]!==undefined&&Math.abs(Number(scalar(m.p.a,'value'))-last[id])>=.001)continue;m.p.a.set('value',m.home);last[id]=m.home;}}
 // Writes only when the controls, the balance or an FX QUIET fade have moved since the last write.
-function steady(){var sig=manual.join()+'|'+balance+'|'+quiet;if(sig===applied)return;applied=sig;var k=1-quiet,v=[];for(var i=0;i<4;i++)v.push(manual[i]*k);apply(v);setbalance(.5+(balance-.5)*k);}
-function athome(){return balance===.5&&!manual[1]&&!manual[2]&&!manual[3];}
+function steady(){var sig=manual.join()+'|'+balance+'|'+quiet+'|'+gest.join();if(sig===applied)return;applied=sig;var k=1-quiet,v=[];for(var i=0;i<4;i++)v.push(manual[i]*k);
+  // The release bloom and a wide span swell the halo reverb (Main's Space reverb belongs to CC21).
+  v[3]=Math.min(1,v[3]+(.6*gest[7]+.6*Math.max(0,gest[8]-.5))*k);apply(v);setbalance(.5+(balance-.5)*k);applygestures(k);}
+function athome(){return balance===.5&&!manual[1]&&!manual[2]&&!manual[3]&&gesturesathome();}
 function quietzone(t){var q=0;for(var i=0;i<zones.length;i++){var z=zones[i];if(t>=z[0]&&t<z[1])q=Math.max(q,Math.min(1,(t-z[0])/2));else if(t>=z[1]&&t<z[1]+2)q=Math.max(q,1-(t-z[1])/2);}return q;}
 
 function init(){try{
@@ -58,15 +81,36 @@ function init(){try{
   for(i=0;i<cs.length;i++){var c=api(cs[i]);cues.push({t:Number(scalar(c,'time')),name:String(scalar(c,'name'))});}
   cues.sort(function(a,b){return a.t-b.t;});
   for(i=0;i<cues.length;i++)if(cues[i].name.indexOf('FX QUIET')===0){var end=Infinity;for(var j=i+1;j<cues.length;j++)if(cues[j].t>cues[i].t&&cues[j].name.indexOf('SONG:')!==0){end=cues[j].t;break;}zones.push([cues[i].t,end]);}
-  last={};applied='';quiet=0;balance=.5;manual=[0,0,0,0];apply(manual);setbalance(.5);lastTick=0;
+  // Gesture devices: on the RHYTHM / MELODIC groups by class, on Main by name (it has two Utilities and two Auto Filters).
+  var halves=[tracks('RHYTHM')[0],tracks('MELODIC')[0]];gref=null;
+  if(halves[0]&&halves[1]){
+    var main=new LiveAPI(null,'live_set master_track'),fz=named(main,'Freeze');
+    gref={muffle:[],lo:[],hi:[],level:[],frozen:param(fz,'Frozen'),mix:param(fz,'Dry Wet'),whoosh:param(named(main,'Whoosh'),'Frequency'),span:param(named(main,'Span'),'Stereo Width')};
+    for(i=0;i<2;i++){var eq=device(halves[i],'Eq8');gref.muffle.push(param(device(halves[i],'AutoFilter'),'Frequency'));gref.lo.push(param(eq,'1 Gain A'));gref.hi.push(param(eq,'4 Gain A'));gref.level.push(param(device(halves[i],'StereoGain'),'Gain'));}
+    var fadein=param(fz,'Fade In');if(fadein)fadein.a.set('value',.3);  // ~230 ms: the freeze answers the fist promptly
+  }
+  last={};applied='';quiet=0;balance=.5;manual=[0,0,0,0];gest=GHOME.slice();frozen=0;freezeMix=0;apply(manual);setbalance(.5);applygestures(1);
+  if(gref){put(gref.mix,0);put(gref.frozen,0);}lastTick=0;
+  dumpparams();
   task=new Task(tick,this);task.interval=40;task.repeat();
-  status('Ready · '+texture.length+' songs · vocals '+mirror.length+'/'+vocals.length+(zones.length?' · '+zones.length+' FX QUIET':''));
+  var found=gref?[gref.muffle[0],gref.muffle[1],gref.lo[0],gref.hi[1],gref.level[0],gref.level[1],gref.frozen,gref.mix,gref.whoosh,gref.span].filter(function(p){return p;}).length:0;
+  status('Ready · '+texture.length+' songs · vocals '+mirror.length+'/'+vocals.length+(gref?' · gestures '+found+'/10':'')+(zones.length?' · '+zones.length+' FX QUIET':''));
 }catch(e){refs=null;mix=null;status('Setup: '+e.message);error(e+'\n');}}
 
-function values(){var v=arrayfromargs(arguments);oscOwned=1;lastValues=Date.now();for(var i=1;i<4;i++)manual[i]=Math.max(0,Math.min(1,Number(v[i])||0));var b=Number(v[4]);balance=v.length>4&&b===b?Math.max(0,Math.min(1,b)):.5;steady();if(!quiet)status('Living · following the box');}
+// Diagnostics: each gesture device's class and parameters (name, min, max, value) to the bridge port, once per init
+// and on /fx/command dumpparams,
+// so the parameter names this Live version uses can be read without any other tooling.
+function dumpdevices(t,label){if(!t)return;var ds=ids(t.get('devices'));for(var i=0;i<ds.length;i++){var d=api(ds[i]),ps=ids(d.get('parameters')),out=['/livemixer/params',label,String(scalar(d,'class_name')),String(scalar(d,'name'))];for(var j=0;j<ps.length;j++){var p=api(ps[j]);out.push(String(scalar(p,'name')),Number(scalar(p,'min')),Number(scalar(p,'max')),Number(scalar(p,'value')));}outlet(2,out);}}
+// The displayed value at 11 points across a parameter's range, for parameters whose units are not obvious.
+var SCALES=['Gain','Frequency','1 Frequency A','4 Frequency A','Stereo Width','Dry Wet','Dry/Wet','Fade In','Fade Out'];
+function dumpscales(t,label){if(!t)return;var ds=ids(t.get('devices'));for(var i=0;i<ds.length;i++){var d=api(ds[i]),ps=ids(d.get('parameters'));for(var j=0;j<ps.length;j++){var p=api(ps[j]),n=String(scalar(p,'name'));if(SCALES.indexOf(n)<0)continue;var lo=Number(scalar(p,'min')),hi=Number(scalar(p,'max')),out=['/livemixer/scale',label,String(scalar(d,'name')),n];for(var k=0;k<=10;k++){var v=lo+(hi-lo)*k/10;out.push(v,String(p.call('str_for_value',v)));}outlet(2,out);}}}
+function dumpparams(){try{var r=tracks('RHYTHM'),m=tracks('MELODIC'),main=new LiveAPI(null,'live_set master_track');dumpdevices(r[0],'RHYTHM');dumpdevices(m[0],'MELODIC');dumpdevices(main,'Main');dumpscales(r[0],'RHYTHM');dumpscales(main,'Main');}catch(e){error('dumpparams: '+e+'\n');}}
+
+function values(){var v=arrayfromargs(arguments);oscOwned=1;lastValues=Date.now();for(var i=1;i<4;i++)manual[i]=Math.max(0,Math.min(1,Number(v[i])||0));var b=Number(v[4]);balance=v.length>4&&b===b?Math.max(0,Math.min(1,b)):.5;
+  for(var j=0;j<10;j++){var x=Number(v[5+j]);gest[j]=v.length>5+j&&x===x?Math.max(0,Math.min(1,x)):GHOME[j];}steady();if(!quiet)status('Living · following the box');}
 function control(index,value){oscOwned=0;var k=Number(index);if(k>0&&k<4)manual[k]=Math.max(0,Math.min(1,Number(value)));steady();status('Manual · combine gently');}
 function auto(v){outlet(1,'auto',0);}
-function reset(){oscOwned=0;manual=[0,0,0,0];balance=.5;for(var i=0;i<4;i++)outlet(1,'dial'+i,0);apply(manual);restorehome();applied='';status('Dry · tails fade naturally');}
+function reset(){oscOwned=0;manual=[0,0,0,0];balance=.5;gest=GHOME.slice();for(var i=0;i<4;i++)outlet(1,'dial'+i,0);apply(manual);applygestures(1);restorehome();applied='';status('Dry · tails fade naturally');}
 
 function tick(){try{
   var now=Date.now(),dt=lastTick?Math.min(.5,Math.max(0,(now-lastTick)/1000)):0;lastTick=now;
@@ -75,13 +119,14 @@ function tick(){try{
   if(now-lastState>=100){lastState=now;outlet(2,'/livemixer/state',0,0,0,t,playing,0,0);}
   if(mirror.length>1){var g=Number(scalar(mirror[0].a,'value'));for(var i=1;i<mirror.length;i++)put(mirror[i],g);}
   if(!refs)return;
-  if(oscOwned&&now-lastValues>1500&&!athome()){var e=Math.exp(-dt/.8);for(var k=1;k<4;k++){manual[k]*=e;if(manual[k]<.002)manual[k]=0;}balance=.5+(balance-.5)*e;if(Math.abs(balance-.5)<.002)balance=.5;status(athome()?'OSC silent · home':'OSC silent · easing home');}
+  if(oscOwned&&now-lastValues>1500&&!athome()){var e=Math.exp(-dt/.8);for(var k=1;k<4;k++){manual[k]*=e;if(manual[k]<.002)manual[k]=0;}balance=.5+(balance-.5)*e;if(Math.abs(balance-.5)<.002)balance=.5;
+    for(var n=0;n<10;n++){gest[n]=GHOME[n]+(gest[n]-GHOME[n])*e;if(Math.abs(gest[n]-GHOME[n])<.002)gest[n]=GHOME[n];}status(athome()?'OSC silent · home':'OSC silent · easing home');}
   var target=zones.length?quietzone(t):0;
   if(target!==quiet){var tempo=Number(scalar(song,'tempo'));if(!(tempo>0))tempo=120;var q=dt*tempo/120;quiet=target>quiet?Math.min(target,quiet+q):Math.max(target,quiet-q);}
-  steady();
+  steady();freezestep(dt);
   if(quiet>0)status('FX QUIET · the song leads');else if(label==='FX QUIET · the song leads')status('Living · following the box');
 }catch(e){status('Setup: '+e.message);}}
 
-function notifydeleted(){if(task)task.cancel();try{apply([0,0,0,0]);}catch(e){}try{restorehome();}catch(e){}}
+function notifydeleted(){if(task)task.cancel();try{apply([0,0,0,0]);}catch(e){}try{gest=GHOME.slice();applygestures(1);if(gref){put(gref.mix,0);put(gref.frozen,0);}}catch(e){}try{restorehome();}catch(e){}}
 // Read-only status for local verification.
 function snapshot(){try{var v={playing:Number(scalar(song,'is_playing')),beat:Number(scalar(song,'current_song_time')),tempo:Number(scalar(song,'tempo')),status:label,ready:!!refs,balance:balance,quiet:quiet,zones:zones,songs:refs?refs.filter.length:0,mirrors:mirror.length};var f=new File('/tmp/livemixer-living-fx-state.json','write','TEXT');f.eof=0;f.writestring(JSON.stringify(v));f.close();}catch(e){error(e+'\n');}}

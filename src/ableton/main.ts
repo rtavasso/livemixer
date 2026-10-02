@@ -1,6 +1,7 @@
 import './style.css';
 import { names, defaults, musicRelay, normalize, smooth, stutterCount, type Control, type Controls, type Source } from './controls';
 import { BROADCAST_CHANNEL_NAME, type TelemetryFrame, type TelemetrySchema } from '../sim/telemetry/types';
+import { HandCombiner } from '../living/hands';
 import { AXES, CONTRACT_SIGNALS, Governor, isLivingSchema, toLiveControls, type Axis, type LiveFx, type LivingSignals } from '../living/governor';
 
 const labels: Record<Control, string> = { vocals: 'Vocal presence', space: 'Reverb', stutter: 'Beat repeat', gain: 'Mix gain' };
@@ -22,7 +23,7 @@ try { const saved = JSON.parse(localStorage.getItem('livemixer-ableton-routes') 
 let value: Controls = { ...defaults }, socket: WebSocket | null = null, schema: TelemetrySchema | null = null;
 let frame: TelemetryFrame | null = null, lastFrame = 0, lastUpdate = performance.now(), lastSchemaId = '';
 let stale = false, fx: LiveFx | null = null, modeChosen = false;
-const governor = new Governor();
+const governor = new Governor(), hands = new HandCombiner();
 const mode = element<HTMLSelectElement>('mode');
 mode.value = 'manual';
 const status = element('status');
@@ -58,14 +59,14 @@ function send() {
   if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(fx ? { type: 'controls', ...value, fx } : { type: 'controls', ...value }));
 }
 function reset() {
-  modeChosen = true; mode.value = 'manual'; value = { ...defaults }; fx = null; governor.release(); updateMode(); drawValues();
+  modeChosen = true; mode.value = 'manual'; value = { ...defaults }; fx = null; governor.release(); hands.release(); updateMode(); drawValues();
   if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'release' }));
 }
 function updateMode() {
   document.querySelectorAll<HTMLElement>('.route').forEach(el => { el.hidden = mode.value !== 'simulation'; });
   element('living').hidden = mode.value !== 'living';
   for (const name of names) element<HTMLInputElement>(name).disabled = mode.value === 'living' || (mode.value === 'simulation' && route[name] !== 'constant');
-  if (mode.value !== 'living') { fx = null; governor.release(); }
+  if (mode.value !== 'living') { fx = null; governor.release(); hands.release(); }
 }
 function livingSignals(current: TelemetryFrame): LivingSignals {
   const signals: LivingSignals = {};
@@ -78,13 +79,14 @@ function update(now = performance.now()) {
     if (!frame || now - lastFrame > 750 || frame.input.sourceAgeMs > 750) {
       if (!stale && socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'release' }));
       stale = true;
-      value = { ...defaults }; fx = null; governor.release();
+      value = { ...defaults }; fx = null; governor.release(); hands.release();
       if (mode.value === 'living') drawLiving({});
       element('simulation').textContent = 'Waiting for fresh simulation input…';
     } else if (mode.value === 'living') {
       stale = false;
       const signals = livingSignals(frame);
-      const live = toLiveControls(governor.step(signals, (now - lastUpdate) / 1000));
+      const dt = (now - lastUpdate) / 1000;
+      const live = toLiveControls(governor.step(signals, dt), {}, hands.step(frame.input.hands, dt));
       value = { vocals: live.vocals, space: live.space, stutter: live.stutter, gain: live.gain }; fx = live.fx;
       drawLiving(signals);
       element('simulation').textContent = `${schema?.sim.title ?? frame.sim.id} · living${isLivingSchema(frame.sim.signals) ? '' : ' · missing contract signals, holding home'}`;

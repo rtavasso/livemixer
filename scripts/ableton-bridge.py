@@ -16,7 +16,12 @@ import time
 DEFAULTS = {"vocals": 1., "space": 0., "stutter": 0., "gain": 1.}
 CC = {"vocals": 20, "space": 21, "gain": 23}
 TIMEOUT = 1.5
-FX = ("flicker", "dub", "dive", "halo", "balance")  # Two Song FX: /fx/values on UDP 7403
+# Living FX: /fx/values on UDP 7403. The hand-gesture values follow the original five; a page that predates
+# a key omits it, which means home (FX_HOME), so older pages keep working.
+FX = ("flicker", "dub", "dive", "halo", "balance", "muffleRhythm", "muffleMelodic", "tiltRhythm", "tiltMelodic",
+      "levelRhythm", "levelMelodic", "freeze", "bloom", "span", "whoosh")
+FX_HOME = {"muffleRhythm": 0., "muffleMelodic": 0., "tiltRhythm": .5, "tiltMelodic": .5, "levelRhythm": .5,
+           "levelMelodic": .5, "freeze": 0., "bloom": 0., "span": .5, "whoosh": 0.}
 FX_HEARTBEAT = .25
 
 
@@ -33,11 +38,11 @@ def controls(raw):
 
 
 def fx_values(raw):
-    """Optional living-mode effects: None when absent, else five validated values in FX order."""
+    """Optional living-mode effects: None when absent, else validated values in FX order (missing gesture keys are home)."""
     fx = raw.get("fx") if isinstance(raw, dict) else None
     if fx is None: return None
     if not isinstance(fx, dict): raise ValueError("fx must be an object")
-    return tuple(unit(f"fx.{name}", fx.get(name)) for name in FX)
+    return tuple(unit(f"fx.{name}", fx.get(name, FX_HOME.get(name))) for name in FX)
 
 
 def osc_string(value):

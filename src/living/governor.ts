@@ -103,7 +103,8 @@ export class Governor {
 
     const arrangement = .5 + .5 * (lift - .5) * 2 * allowance * unit(c.arrangementCeiling);
     a.arrangement = approach(a.arrangement, arrangement, dt, c.arrangementTau);
-    a.depth = approach(a.depth, reach * allowance * unit(c.depthCeiling), dt, c.depthTau);
+    // Dive is a gesture: full strength at once, never scaled by allowance (docs/superpowers/specs/2026-10-02-hand-gesture-audio-design.md).
+    a.depth = approach(a.depth, reach * unit(c.depthCeiling), dt, c.depthTau);
     // Space follows closeness, with allowance as its ceiling (agitation pulls it home too).
     const space = Math.min(closeness, allowance) * unit(c.spaceCeiling);
     a.space = approach(a.space, space, dt, space > a.space ? c.spaceRise : c.spaceFall);
@@ -131,13 +132,22 @@ export interface LiveMapping {
 }
 export const DEFAULT_MAPPING: LiveMapping = { mainSpace: .5, diveCeiling: .8, haloCeiling: .6, dubCeiling: .3 };
 
-export interface LiveFx { flicker: number; dub: number; dive: number; halo: number; balance: number }
+/** Hand-gesture values (src/living/hands.ts), in the bridge's /fx/values order after the first five. */
+export const GESTURE_KEYS = ['muffleRhythm', 'muffleMelodic', 'tiltRhythm', 'tiltMelodic', 'levelRhythm', 'levelMelodic', 'freeze', 'bloom', 'span', 'whoosh'] as const;
+export type GestureKey = typeof GESTURE_KEYS[number];
+export type GestureFx = Record<GestureKey, number>;
+/** Home: open, flat, unity level, unfrozen, normal width. */
+export const GESTURE_HOME: Readonly<GestureFx> = Object.freeze({
+  muffleRhythm: 0, muffleMelodic: 0, tiltRhythm: .5, tiltMelodic: .5, levelRhythm: .5, levelMelodic: .5, freeze: 0, bloom: 0, span: .5, whoosh: 0,
+});
+
+export interface LiveFx extends GestureFx { flicker: number; dub: number; dive: number; halo: number; balance: number }
 export interface LiveControls { type: 'controls'; vocals: number; space: number; stutter: number; gain: number; fx: LiveFx }
 
 const safe = (value: number, fallback: number) => Number.isFinite(value) ? unit(value) : fallback;
 
-/** The bridge message for a set of axes. No one-shots: flicker and stutter stay at 0. */
-export function toLiveControls(axes: Axes, mapping: Partial<LiveMapping> = {}): LiveControls {
+/** The bridge message for a set of axes and hand gestures (missing or invalid gestures are home). Flicker and stutter stay at 0. */
+export function toLiveControls(axes: Axes, mapping: Partial<LiveMapping> = {}, gestures: Partial<GestureFx> = {}): LiveControls {
   const m = { ...DEFAULT_MAPPING, ...mapping };
   const space = safe(axes.space, 0), depth = safe(axes.depth, 0);
   return {
@@ -152,6 +162,7 @@ export function toLiveControls(axes: Axes, mapping: Partial<LiveMapping> = {}): 
       dive: unit(depth * safe(m.diveCeiling, 0)),
       halo: unit(space * safe(m.haloCeiling, 0)),
       balance: safe(axes.arrangement, .5),
+      ...Object.fromEntries(GESTURE_KEYS.map(key => [key, safe(gestures?.[key] as number, GESTURE_HOME[key])])) as GestureFx,
     },
   };
 }

@@ -7,6 +7,8 @@ Live 11 cannot open sets saved by Live 12, so ableton-stem-set.py --live 11 buil
                 one audio track routed into it, holding an audio clip from the Live 11 demo song
   eq-three.xml  EQ Three
   living.xml    the installation's devices and returns
+  gestures.xml  the hand-gesture devices (ableton-stem-set.py --gestures): Muffle / Tilt / Level on the
+                RHYTHM and MELODIC groups, Whoosh / Freeze / Span on Main, each at its rest position
 
 Every device comes from a Live 11 Core Library preset, with each parameter (and MIDI mapping) copied from
 the Live 12 template where Live 11 has the same parameter. Live 12's Auto Filter has no Live 11
@@ -31,8 +33,32 @@ PRESETS = {  # Live 11 Core Library preset for each device
     "Hybrid": "Hybrid Reverb/Drums/Clap Hybrid.adv",
     "Reverb": "Reverb/Hall/Ballad Reverb.adv",
     "Limiter": "Limiter/Fast.adv",
+    "Eq8": "EQ Eight/Filter/Lo-Hi Shelf.adv",
+    "Spectral": "Spectral Time/Freezer Fading.adv",
 }
 LIVE11_FILTER = {"FilterType": 0, "CircuitLpHp": 0, "Cutoff": 135, "Resonance": 0.1, "Drive": 0, "ModHub": 0, "LfoAmount": 0}
+# Rest positions of the gesture devices (Manual values by parameter path). Auto Filter: Live 11's open low-pass,
+# LFO off. EQ Eight: band 1 a low shelf, band 4 a high shelf (modes 2 and 5), both 0 dB, gentle slope; the rest
+# off, analyser off. Utility: Gain is linear in Live 11 (1 = 0 dB), StereoWidth 1 = 100%. Spectral Time: the
+# freezer in Manual mode (0), not frozen, Dry/Wet 0, delay off.
+GESTURE_FILTER = {**LIVE11_FILTER, "Lfo/IsOn": "false"}
+GESTURE_TILT = {"GlobalGain": 0, "Scale": 1, "SpectrumAnalyzer/On": "false", "AdaptiveQ": "false",
+                **{f"Bands.{band}/Parameter{side}/{tag}": value
+                   for band in range(8) for side in "AB"
+                   for tag, value in {"IsOn": "true" if band in (0, 3) else "false", "Gain": 0, "Q": 0.7071067691,
+                                      **({"Mode": 2, "Freq": 200} if band == 0 else {}),
+                                      **({"Mode": 5, "Freq": 4000} if band == 3 else {})}.items()}}
+GESTURE_UTILITY = {"PhaseInvertL": "false", "PhaseInvertR": "false", "ChannelMode": 1, "StereoWidth": 1,
+                   "MidSideBalance": 1, "Mono": "false", "BassMono": "false", "Balance": 0, "Gain": 1,
+                   "LegacyGain": 0, "Mute": "false", "DcFilter": "false"}
+GESTURE_FREEZE = {"Freezer_On": "true", "Freezer_FreezeOn": "false", "Freezer_MainMode": 0, "Delay_On": "false",
+                  "DryWet": 0}
+GESTURES = {  # section: [(preset tag, user name, rest values)]
+    "Halves": [("AutoFilter", "Muffle", GESTURE_FILTER), ("Eq8", "Tilt", GESTURE_TILT),
+               ("StereoGain", "Level", GESTURE_UTILITY)],
+    "Main": [("AutoFilter", "Whoosh", GESTURE_FILTER), ("Spectral", "Freeze", GESTURE_FREEZE),
+             ("StereoGain", "Span", GESTURE_UTILITY)],
+}
 MX_LIVE12_ONLY = {"BreakoutIsExpanded", "MpePitchBendUsesTuning", "ViewData", "AudioOutputsListWrapper",
                   "AudioInputsListWrapper", "MidiOutputsListWrapper", "MidiInputsListWrapper", "MpeTuningEnabled",
                   "IsStored", "IsUndoable", "SourceHint"}
@@ -193,6 +219,21 @@ class Builder:
                 out.extend(self.device(d) for d in section)
         return root
 
+    def gesture_device(self, tag, name, rest):
+        device = copy.deepcopy(self.presets[tag])
+        strip_mappings(device)
+        device.set("Id", "0")
+        device.find("UserName").set("Value", name)
+        for path, value in rest.items():
+            device.find(path + "/Manual").set("Value", str(value))
+        return device
+
+    def gestures(self):
+        root = ET.Element("Gestures")
+        for section, devices in GESTURES.items():
+            ET.SubElement(root, section).extend(self.gesture_device(*d) for d in devices)
+        return root
+
     def eq_three(self):
         return self.device(ET.fromstring((TEMPLATES / "eq-three.xml").read_text(encoding="utf-8")))
 
@@ -213,6 +254,7 @@ def main():
     write_gz(builder.stem_set(), OUT / "stem-set.als")
     (OUT / "eq-three.xml").write_text(ET.tostring(builder.eq_three(), encoding="unicode"), encoding="utf-8")
     (OUT / "living.xml").write_text(ET.tostring(builder.living(), encoding="unicode"), encoding="utf-8")
+    (OUT / "gestures.xml").write_text(ET.tostring(builder.gestures(), encoding="unicode"), encoding="utf-8")
     print(f"wrote {OUT}")
 
 

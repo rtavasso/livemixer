@@ -6,7 +6,7 @@ import vm from 'node:vm';
 
 const source = readFileSync(new URL('../devices/LiveMixer Living FX/living-fx.js', import.meta.url), 'utf8');
 
-function liveSet(songs, cues) {
+function liveSet(songs, cues, { gestures = false } = {}) {
   const objects = new Map(); let next = 1;
   const make = (props) => { const id = next++; const o = { id, ...props }; objects.set(id, o); return o; };
   const param = (name, value) => make({ name, value });
@@ -18,15 +18,24 @@ function liveSet(songs, cues) {
       track('TEXTURE FX', [make({ class_name: 'AutoFilter2', parameters: [param('Control', .5)] })]), track('05 Guitar'),
       track('VOCALS', [make({ class_name: 'StereoGain', parameters: [param('Output', s === 0 ? .3 : 1)] })]), track('08 Lead Vocals'));
   }
+  // A --gestures set: RHYTHM / MELODIC groups with Muffle, Tilt and Level, and Main's Whoosh, Freeze and Span.
+  const device = (class_name, name, params) => make({ class_name, name, parameters: params.map(([n, v]) => param(n, v)) });
+  const half = (name) => track(name, [device('AutoFilter', 'Muffle', [['Frequency', 135]]), device('Eq8', 'Tilt', [['1 Gain A', 0], ['4 Gain A', 0]]),
+    device('StereoGain', 'Level', [['Gain', 0]])]);
+  if (gestures) tracks.unshift(half('RHYTHM'), half('MELODIC'));
+  const master = make({ name: 'Main', devices: gestures ? [device('Reverb', 'Space - CC21', [['Dry/Wet', 0]]), device('AutoFilter', 'Whoosh', [['Frequency', 135]]),
+    device('Spectral', 'Freeze', [['Frozen', 0], ['Dry Wet', 0], ['Fade In', .6]]), device('StereoGain', 'Span', [['Stereo Width', 1]])] : [] });
   const song = make({ tracks, cue_points: cues.map(([time, name]) => make({ time, name })), current_song_time: 0, is_playing: 1, tempo: 120 });
-  return { objects, song, byName: (name) => tracks.filter(t => t.name === name) };
+  const value = (track, dev, name) => tracks.find(t => t.name === track)?.devices.find(d => d.name === dev)?.parameters.find(q => q.name === name)?.value
+    ?? master.devices.find(d => d.name === dev)?.parameters.find(q => q.name === name)?.value;
+  return { objects, song, master, value, byName: (name) => tracks.filter(t => t.name === name) };
 }
 
 function load(set) {
   const out = []; let task = null; let clock = 1000; const calls = { set: 0, id: 0 };
   const ref = (v) => Array.isArray(v) ? v.flatMap(o => ['id', o.id]) : typeof v === 'object' && v !== null ? ['id', v.id] : [v];
   class LiveAPI {
-    constructor(_cb, path) { this.o = path === 'live_set' ? set.song : set.objects.get(Number(String(path).split(' ')[1])); }
+    constructor(_cb, path) { this.o = path === 'live_set' ? set.song : path === 'live_set master_track' ? set.master : set.objects.get(Number(String(path).split(' ')[1])); }
     get id() { calls.id++; return String(this.o.id); }  // a call into Live in Max
     get(prop) { return ref(this.o[prop]); }
     set(prop, v) { calls.set++; this.o[prop] = v; }
@@ -95,6 +104,45 @@ test('mirrors the vocal gain in Live 11, where Utility calls it Gain', () => {
   set.byName('VOCALS')[0].devices[0].parameters[0].value = 0;  // hand out of the box: CC20 at 0
   d.tick();
   assert.deepEqual(set.byName('VOCALS').map(t => t.devices[0].parameters[0].value), [0, 0, 0]);
+});
+
+test('drives the gesture devices of a --gestures set, per half', () => {
+  const set = liveSet(2, [], { gestures: true }); const d = load(set);
+  d.ctx.init();
+  assert.match(d.out.filter(a => a[0] === 0 && a[1] === 'set').at(-1)[2], /gestures 10\/10/);
+  //                 flicker dub dive halo bal | muffleR muffleM tiltR tiltM levelR levelM freeze bloom span whoosh
+  d.ctx.values(0, 0, 0, 0, .5,                 1, 0,      0,   1,    0,     1,     0,     0,    1,   0);
+  assert.equal(set.value('RHYTHM', 'Muffle', 'Frequency'), 70);   // fist on the rhythm half: low-pass ~450 Hz
+  assert.equal(set.value('MELODIC', 'Muffle', 'Frequency'), 135); // open
+  assert.deepEqual([set.value('RHYTHM', 'Tilt', '1 Gain A'), set.value('RHYTHM', 'Tilt', '4 Gain A')], [5, -5]);   // palm down: weight
+  assert.deepEqual([set.value('MELODIC', 'Tilt', '1 Gain A'), set.value('MELODIC', 'Tilt', '4 Gain A')], [-2, 6]); // palm up: air
+  assert.ok(Math.abs(set.value('RHYTHM', 'Level', 'Gain') - -10 / 35) < 1e-9);
+  assert.ok(Math.abs(set.value('MELODIC', 'Level', 'Gain') - 6 / 35) < 1e-9);
+  assert.ok(Math.abs(set.value(null, 'Span', 'Stereo Width') - Math.sqrt(1.8)) < 1e-9);  // 180 %
+  assert.equal(set.value(null, 'Fade In', 'Fade In') ?? set.value(null, 'Freeze', 'Fade In'), .3);
+  d.ctx.values(0, 0, 0, 0, .5);  // an old page without gesture values: home
+  assert.equal(set.value('RHYTHM', 'Muffle', 'Frequency'), 135);
+  assert.equal(set.value(null, 'Span', 'Stereo Width'), 1);
+});
+
+test('freeze holds the moment, then fades out and unfreezes', () => {
+  const set = liveSet(1, [], { gestures: true }); const d = load(set);
+  d.ctx.init();
+  const freeze = (on) => d.ctx.values(0, 0, 0, 0, .5, 0, 0, .5, .5, .5, .5, on, 0, .5, 0);
+  freeze(1); d.tick(); assert.equal(set.value(null, 'Freeze', 'Frozen'), 1);
+  for (let i = 0; i < 10; i++) { freeze(1); d.tick(); }
+  assert.ok(Math.abs(set.value(null, 'Freeze', 'Dry Wet') - .65) < 1e-9, 'fully in after ~0.3 s');
+  freeze(0); d.tick(); assert.equal(set.value(null, 'Freeze', 'Frozen'), 1, 'still frozen while it fades');
+  for (let i = 0; i < 50; i++) { freeze(0); d.tick(); }
+  assert.equal(set.value(null, 'Freeze', 'Dry Wet'), 0); assert.equal(set.value(null, 'Freeze', 'Frozen'), 0);
+});
+
+test('FX QUIET holds the gestures at home', () => {
+  const set = liveSet(1, [[0, 'FX QUIET'], [64, 'FX ON']], { gestures: true }); const d = load(set);
+  d.ctx.init(); set.song.current_song_time = 8;  // inside the zone, past its 2-beat fade
+  for (let i = 0; i < 100; i++) { d.ctx.values(0, 0, 0, 0, .5, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1); d.tick(); }
+  assert.equal(set.value('RHYTHM', 'Muffle', 'Frequency'), 135);
+  assert.equal(set.value(null, 'Freeze', 'Frozen'), 0);
 });
 
 test('reports the song position for the simulation page', () => {

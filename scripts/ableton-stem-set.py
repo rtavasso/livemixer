@@ -19,6 +19,9 @@ top-level group named "Artist - Title" containing one audio track per stem.
    Main gets Space, Mix Gain, a limiter and LiveMixer Living FX (copied next
    to the set), and every transition is marked FX QUIET … FX ON so the box
    never colours a handover. See docs/LIVING-MUSIC.md.
+5. Gestures (--gestures, Live 11 only): each song splits into a subgroup in RHYTHM (DRUM FX, Bass) and
+   one in MELODIC (TEXTURE FX, VOCALS); RHYTHM and MELODIC carry Muffle / Tilt / Level and Main gains
+   Whoosh / Freeze / Span for the hand gestures. See docs/superpowers/specs/2026-10-02-hand-gesture-audio-design.md.
 
 Renders and analyses are cached per song, so reordering is fast. The set is
 written with a report of every transition, also saved as <set>.transitions.json.
@@ -39,7 +42,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ableton_set import transitions as tx  # noqa: E402
-from ableton_set.als import LIVE11_TEMPLATES, TEMPLATES, Living, write_mix  # noqa: E402
+from ableton_set.als import LIVE11_TEMPLATES, TEMPLATES, Gestures, Living, write_mix  # noqa: E402
 from ableton_set.analysis import analyze_all  # noqa: E402
 from ableton_set.merge import merge_levels, merge_song  # noqa: E402
 from ableton_set.render import AUDIO, render_song  # noqa: E402
@@ -154,7 +157,8 @@ def build(folders, output, args):
 
     templates = LIVE11_TEMPLATES if args.live == 11 else TEMPLATES
     write_mix(plan, envelopes, [(stems, frames, rate) for _, stems, frames, rate in rendered], output, COLORS, args.unfold,
-              living=None if args.plain else Living(templates), templates=templates, retimed=retimed)
+              living=None if args.plain else Living(templates), templates=templates, retimed=retimed,
+              gestures=Gestures() if args.gestures else None)
 
     report = []
     print()
@@ -206,12 +210,19 @@ def main():
                         help="lighter set: Snare + Other Drums, the melodic stems and the vocals each summed to one track "
                              "(written to <rendered>/../merged-stems)")
     parser.add_argument("--live", type=int, choices=(11, 12), default=12, help="Live version to write the set for")
+    parser.add_argument("--gestures", action="store_true",
+                        help="hand-gesture layout (needs --live 11): each song split into RHYTHM and MELODIC groups "
+                             "with Muffle / Tilt / Level on each, and Whoosh / Freeze / Span on Main")
     parser.add_argument("--from-rendered", action="store_true",
                         help="use the rendered stems as they are (no source stems needed, e.g. on Windows)")
     parser.add_argument("--force", action="store_true", help="overwrite an existing set")
     parser.add_argument("--list", action="store_true", help="print the available song folders and exit")
     args = parser.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")  # song names and ⚠ on a Windows console
+    if args.gestures and args.live != 11:
+        parser.error("--gestures needs --live 11: its devices come from Live 11's Core Library (no Live 12 versions here)")
+    if args.gestures and args.plain:
+        parser.error("--gestures builds on the living installation; leave out --plain")
 
     root = rendered_root(args) if args.from_rendered else Path(args.stems)
     folders = songs_in(root)

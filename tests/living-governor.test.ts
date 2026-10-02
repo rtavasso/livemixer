@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { AXES, Governor, HOME, isLivingSchema, toLiveControls, type Axes, type LivingSignals } from '../src/living/governor';
+import { AXES, GESTURE_HOME, GESTURE_KEYS, Governor, HOME, isLivingSchema, toLiveControls, type Axes, type LivingSignals } from '../src/living/governor';
 
 const DT = 1 / 30;
 function run(governor: Governor, signals: LivingSignals | null, seconds: number): Axes {
@@ -23,7 +23,8 @@ describe('living governor', () => {
     run(g, { presence: 1, reach: 0, lift: .5, closeness: 0, agitation: 0 }, 3);
     const before = g.value;
     run(g, { presence: 1, reach: 1, lift: .5, closeness: 0, agitation: 0 }, .1);
-    expect(g.value.depth - before.depth).toBeLessThan(.05);
+    // Dive is full strength now, but keeps its 0.8 s time constant: 100 ms moves it about 12%.
+    expect(g.value.depth - before.depth).toBeLessThan(.13);
 
     const h = new Governor();
     const settled = run(h, patient, 10);
@@ -40,7 +41,8 @@ describe('living governor', () => {
     expect(near.allowance).toBeCloseTo(1);
     expect(far.arrangement).toBeCloseTo(.5 + .5 * .35, 2);
     expect(near.arrangement).toBeGreaterThan(.99);
-    expect(far.depth).toBeCloseTo(.35, 2);
+    // Dive is a gesture: full strength whatever the allowance.
+    expect(far.depth).toBeGreaterThan(.99);
     expect(near.depth).toBeGreaterThan(.99);
     expect(far.space).toBe(0);
     expect(near.space).toBeGreaterThan(.9);
@@ -52,7 +54,7 @@ describe('living governor', () => {
     const calm = run(new Governor(), patient, 10);
     const wild = run(new Governor(), { ...patient, agitation: 1 }, 10);
     expect(wild.allowance).toBeCloseTo(.3);
-    expect(wild.depth).toBeLessThan(calm.depth * .35);
+    expect(wild.depth).toBeCloseTo(calm.depth, 5); // dive is not scaled by allowance
     expect(Math.abs(wild.arrangement - .5)).toBeLessThan(Math.abs(calm.arrangement - .5) * .35);
     expect(wild.space).toBeLessThan(calm.space * .35);
   });
@@ -109,11 +111,22 @@ describe('living governor', () => {
 
   it('maps axes to the bridge message with low echo and no one-shots', () => {
     const live = toLiveControls({ vocals: 1, arrangement: .7, depth: 1, space: 1, allowance: 1 });
-    expect(live).toEqual({ type: 'controls', vocals: 1, space: .5, stutter: 0, gain: 1, fx: { flicker: 0, dub: .3, dive: .8, halo: .6, balance: .7 } });
+    expect(live).toEqual({ type: 'controls', vocals: 1, space: .5, stutter: 0, gain: 1, fx: { flicker: 0, dub: .3, dive: .8, halo: .6, balance: .7, ...GESTURE_HOME } });
     const home = toLiveControls(HOME);
-    expect(home.fx).toEqual({ flicker: 0, dub: 0, dive: 0, halo: 0, balance: .5 });
+    expect(home.fx).toEqual({ flicker: 0, dub: 0, dive: 0, halo: 0, balance: .5, ...GESTURE_HOME });
     expect(home.space).toBe(0);
     expect(toLiveControls({ vocals: NaN, arrangement: NaN, depth: NaN, space: NaN, allowance: NaN }).fx.balance).toBe(.5);
+  });
+
+  it('carries the hand-gesture values, home when missing or invalid', () => {
+    expect(GESTURE_KEYS).toEqual(['muffleRhythm', 'muffleMelodic', 'tiltRhythm', 'tiltMelodic', 'levelRhythm', 'levelMelodic', 'freeze', 'bloom', 'span', 'whoosh']);
+    expect(GESTURE_HOME).toEqual({ muffleRhythm: 0, muffleMelodic: 0, tiltRhythm: .5, tiltMelodic: .5, levelRhythm: .5, levelMelodic: .5, freeze: 0, bloom: 0, span: .5, whoosh: 0 });
+    const gestures = { muffleRhythm: .1, muffleMelodic: .2, tiltRhythm: .3, tiltMelodic: .4, levelRhythm: .6, levelMelodic: .7, freeze: 1, bloom: .8, span: .9, whoosh: .05 };
+    const live = toLiveControls(HOME, {}, gestures);
+    expect(live.fx).toEqual({ flicker: 0, dub: 0, dive: 0, halo: 0, balance: .5, ...gestures });
+    expect(Object.keys(live.fx).slice(5)).toEqual([...GESTURE_KEYS]);
+    const odd = toLiveControls(HOME, {}, { muffleRhythm: NaN, span: Infinity, levelMelodic: 2, tiltRhythm: -1, freeze: 'yes' as unknown as number });
+    expect(odd.fx).toMatchObject({ muffleRhythm: 0, span: .5, levelMelodic: 1, tiltRhythm: 0, freeze: 0, bloom: 0 });
   });
 
   it('recognises schemas that publish the living contract', () => {

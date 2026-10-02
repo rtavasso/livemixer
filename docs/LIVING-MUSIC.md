@@ -15,6 +15,30 @@ Every living simulation (Tide, Lantern, Murmuration) publishes `presence`, `reac
 
 **Allowance** is how far the song may leave home: `(0.35 + 0.65·closeness) × (1 − 0.7·agitation)`. Agitation is smoothed first (τ 0.6 s), so one flick of the hand does not collapse the song. Arrangement and depth are scaled by allowance, and space is capped by it. A patient visitor gets the transformed song. A flailing one gets something close to the plain song. When presence is 0, every target is home. Missing or invalid signals count as absent.
 
+## Hand gestures
+
+Sets built with `--gestures` (Live 11) split every song into two top-level groups, **RHYTHM** (DRUM FX,
+Bass) and **MELODIC** (TEXTURE FX, VOCALS), each with Muffle (Auto Filter), Tilt (EQ Eight shelves) and
+Level (Utility), and add Whoosh, Freeze (Spectral Time) and Span (Utility width) on Main. The controls
+page combines the hands (`src/living/hands.ts`) into ten more values that ride on `/fx/values`; every one
+acts at full strength. Design: [the spec](superpowers/specs/2026-10-02-hand-gesture-audio-design.md).
+
+| Gesture | One hand | Two hands | In Live |
+|---|---|---|---|
+| Closing the fist | Muffles the whole song | Muffles that hand's half | Muffle low-pass down to ~450 Hz |
+| Holding a fist ~0.4 s | Freezes the moment | Either hand | Spectral Time frozen, wet to 65% in 0.3 s; never longer than 6 s |
+| Opening the hand | Freeze fades out over 1.5 s with a reverb bloom | Same | Halo sends swell |
+| Palm up / down | Air / weight for the whole song | For that hand's half | Tilt high shelf +6 dB / low shelf +5 dB |
+| Hand height | High: melody and vocals forward; low: drums and bass forward | Each hand sets its half's level | Level −10 … +6 dB |
+| Hands apart / together | — | Wider / narrower | Span 40 … 180%, wide also swells the halo |
+| Fast swipe | A short sweep | Either hand | Whoosh filter dip |
+| Reach through the picture | Underwater dive at full strength | Deeper hand | TEXTURE FX Auto Filter |
+
+The left hand on the picture plays the rhythm half; roles swap only when the hands clearly cross, and a
+hand arriving or leaving crossfades over 0.5 s. Inside FX QUIET zones every gesture holds at home.
+LiveMixer Living FX reports what it found in its status (`gestures 10/10`); `/fx/command dumpparams`
+sends every gesture device's parameters and values to UDP 7401 for checking.
+
 ### Ceilings (`toLiveControls`)
 
 | Value sent | At full axis | Notes |
