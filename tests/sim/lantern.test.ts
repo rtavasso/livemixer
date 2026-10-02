@@ -167,3 +167,78 @@ describe('lantern: behaviour', () => {
     expect(empty.closeness.value).toBe(0);
   });
 });
+
+describe('lantern: hand shape', () => {
+  const HX = .5, HY = .35;
+  const capsules = [{ a: { x: HX, y: HY - .02, z: .6 }, b: { x: HX, y: HY + .08, z: .6 }, radius: .012 }];
+  const shaped = (openness: number, palmUp: number) => hand(HX, HY, .6, {
+    openness, palmUp, palmNormal: palmUp === 0 ? null : { x: 0, y: palmUp > 0 ? 1 : -1, z: 0 }, capsules,
+  });
+  /** Settle with the same seed and hand, then average over a few pulses. */
+  function settle(openness: number, palmUp: number) {
+    const l = new Lantern(ASPECT, 1);
+    const h = shaped(openness, palmUp);
+    run(l, 18, () => h);
+    let dist = 0, height = 0, span = 0, n = 0;
+    run(l, 4, () => h, undefined, () => {
+      dist += bellDistance(l, HX, HY); height += l.y - HY;
+      let s = 0, k = 0;
+      for (const c of l.chains) if (c.kind === 'tentacle') { s += Math.hypot(c.x[c.n - 1] - c.x[0], c.y[c.n - 1] - c.y[0]); k++; }
+      span += s / k; n++;
+    });
+    return { l, dist: dist / n, height: height / n, span: span / n };
+  }
+
+  it('keeps away from a fist with its tentacles drawn in', () => {
+    const open = settle(1, 0), fist = settle(0, 0);
+    expect(open.l.mood.boldness).toBeGreaterThan(.6);
+    expect(fist.l.mood.fear).toBeLessThan(.1); // wary, not frightened
+    expect(fist.dist - open.dist).toBeGreaterThan(.04);
+    expect(fist.span).toBeLessThan(open.span * .8);
+    expect(fist.l.reel).toBeLessThan(.7);
+    expect(open.l.reel).toBe(1);
+  });
+
+  it('settles lower onto an open palm facing up, and glows', () => {
+    const flat = settle(1, 0), up = settle(1, 1);
+    expect(up.height).toBeLessThan(flat.height - .015);
+    expect(up.dist).toBeLessThan(flat.dist);
+    expect(up.l.glow.value).toBeGreaterThan(flat.l.glow.value);
+    // A fist cancels the invitation.
+    expect(settle(0, 1).l.invited).toBeLessThan(.05);
+  });
+
+  it('hovers above a palm facing down', () => {
+    const flat = settle(1, 0), down = settle(1, -1);
+    expect(down.height).toBeGreaterThan(flat.height + .08);
+    expect(down.l.x).toBeCloseTo(flat.l.x, 1); // still above the hand, not away from it
+  });
+
+  it('eases the response in rather than popping', () => {
+    const l = new Lantern(ASPECT, 1);
+    run(l, 18, () => shaped(1, 0));
+    const y0 = l.y;
+    run(l, DT, () => shaped(0, -1));
+    expect(l.wary).toBeLessThan(.1); expect(l.hover).toBeLessThan(.1);
+    expect(Math.abs(l.y - y0)).toBeLessThan(.01);
+  });
+
+  it('still flees agitation whatever the hand shape', () => {
+    const l = new Lantern(ASPECT, 1);
+    run(l, 18, () => shaped(1, 1));
+    run(l, 3, t => {
+      const x = HX + .15 * Math.sin(t * 9), vx = .15 * 9 * Math.cos(t * 9);
+      return hand(x, HY, .6, { velocity: { x: vx, y: 0, z: 0 }, speed: Math.abs(vx), openness: 1, palmUp: 1 });
+    });
+    expect(l.mood.fear).toBeGreaterThan(.5);
+    run(l, 4, () => shaped(1, 1));
+    expect(bellDistance(l, HX, HY)).toBeGreaterThan(.45);
+  });
+
+  it('behaves exactly as before with an open, sideways hand', () => {
+    const a = new Lantern(ASPECT, 11), b = new Lantern(ASPECT, 11);
+    run(a, 10, performer); run(b, 10, t => { const h = performer(t); return h && { ...h, openness: 1, palmUp: 0, palmNormal: { x: 1, y: 0, z: 0 } }; });
+    expect(a.x).toBe(b.x); expect(a.y).toBe(b.y);
+    expect(a.reel).toBe(1); expect(a.wary).toBe(0); expect(a.invited).toBe(0); expect(a.hover).toBe(0);
+  });
+});

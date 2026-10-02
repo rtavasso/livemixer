@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { School, SEGMENTS, closeRadius, ringRadius, type SchoolBounds, type SchoolHand } from '../../src/sim/sims/tide/school';
-import { Forces, HandWater, MAX_FORCES, TideSignals, agitationFrom, fingertips, substeps, waveGrid } from '../../src/sim/sims/tide/model';
+import { School, SEGMENTS, closeRadius, coilRadius, ringRadius, type SchoolBounds, type SchoolHand } from '../../src/sim/sims/tide/school';
+import { Forces, HandGestures, HandWater, MAX_FORCES, TideSignals, agitationFrom, fingertips, handBloom, substeps, waveGrid } from '../../src/sim/sims/tide/model';
 import { Mood, pictureHand } from '../../src/sim/sims/living';
 import { syntheticHandCapsules } from '../../src/sim/input/synthetic';
 import type { HandState } from '../../src/sim/input/types';
@@ -10,7 +10,7 @@ const BOUNDS: SchoolBounds = { x0: .05 * ASPECT, y0: .05, x1: .95 * ASPECT, y1: 
 const HAND: SchoolHand = { x: .5 * ASPECT, y: .5, radius: .06 * ASPECT };
 const DT = 1 / 60;
 
-function run(school: School, seconds: number, drive: { boldness: number; fear: number; hand: SchoolHand | null }) {
+function run(school: School, seconds: number, drive: { boldness: number; fear: number; hand: SchoolHand | null; grip?: number }) {
   for (let t = 0; t < seconds; t += DT) school.update({ dt: DT, bounds: BOUNDS, ...drive });
 }
 function meanDistance(school: School, x: number, y: number) {
@@ -150,5 +150,89 @@ describe('tide: water and signals', () => {
     const end = sig.values();
     expect(end.closeness).toBeLessThan(.5);
     expect(end.reach).toBeLessThan(.95);
+  });
+});
+
+describe('tide: gestures', () => {
+  const UP = { x: 0, y: 1, z: 0 }, DOWN = { x: 0, y: -1, z: 0 };
+  /** Feed one pose for `seconds` and return the smoothed gesture. */
+  const settle = (g: HandGestures, extra: Partial<HandState>, seconds: number) => {
+    const hand = pictureHand(handState(.5, .5, .8, extra));
+    for (let t = 0; t < seconds; t += DT) g.update([hand], DT);
+    return g.get(hand.id);
+  };
+
+  it('smooths grip and palm facing instead of popping, and reads open/sideways as nothing', () => {
+    const g = new HandGestures();
+    expect(settle(g, {}, 1)).toEqual({ grip: 0, offer: 0, calm: 0 });
+    const first = settle(g, { openness: 0, palmNormal: UP, palmUp: 1 }, DT);
+    expect(first.grip).toBeGreaterThan(0); expect(first.grip).toBeLessThan(.15);
+    expect(first.offer).toBeGreaterThan(0); expect(first.offer).toBeLessThan(.15);
+    const held = settle(g, { openness: 0, palmNormal: UP, palmUp: 1 }, 2);
+    expect(held.grip).toBeGreaterThan(.95); expect(held.offer).toBeGreaterThan(.95); expect(held.calm).toBe(0);
+    // A one-frame flicker to palm down barely moves it.
+    const flick = settle(g, { openness: 0, palmNormal: DOWN, palmUp: -1 }, DT);
+    expect(flick.offer).toBeGreaterThan(.85); expect(flick.calm).toBe(0);
+    const down = settle(g, { openness: 1, palmNormal: DOWN, palmUp: -1 }, 3);
+    expect(down.calm).toBeGreaterThan(.95); expect(down.offer).toBe(0); expect(down.grip).toBeLessThan(.05);
+  });
+
+  it('a fist coils a willing school tighter and closer than an open hand', () => {
+    expect(coilRadius(HAND.radius, 0)).toBe(ringRadius(HAND.radius));
+    expect(coilRadius(HAND.radius, 1)).toBeLessThan(ringRadius(HAND.radius) * .7);
+    const open = new School(48, BOUNDS, 5), fist = new School(48, BOUNDS, 5);
+    run(open, 12, { boldness: 1, fear: 0, hand: HAND, grip: 0 });
+    run(fist, 12, { boldness: 1, fear: 0, hand: HAND, grip: 1 });
+    expect(meanDistance(fist, HAND.x, HAND.y)).toBeLessThan(meanDistance(open, HAND.x, HAND.y) * .8);
+    const tight = ringRadius(HAND.radius);
+    expect(fist.fractionWithin(HAND.x, HAND.y, tight)).toBeGreaterThan(open.fractionWithin(HAND.x, HAND.y, tight) + .2);
+    expect(fist.fractionWithin(HAND.x, HAND.y, closeRadius(HAND.radius))).toBeGreaterThan(.6);
+  });
+
+  it('a fist does not hold a frightened school', () => {
+    const s = new School(48, BOUNDS, 9);
+    run(s, 10, { boldness: 1, fear: 0, hand: HAND, grip: 1 });
+    run(s, 4, { boldness: 0, fear: 1, hand: HAND, grip: 1 });
+    expect(s.fractionWithin(HAND.x, HAND.y, closeRadius(HAND.radius))).toBeLessThan(.05);
+  });
+
+  it('grip 0 leaves the school exactly as before', () => {
+    const a = new School(48, BOUNDS, 3), b = new School(48, BOUNDS, 3);
+    run(a, 3, { boldness: .7, fear: .1, hand: HAND }); run(b, 3, { boldness: .7, fear: .1, hand: HAND, grip: 0 });
+    expect(Array.from(b.x)).toEqual(Array.from(a.x));
+    expect(Array.from(b.y)).toEqual(Array.from(a.y));
+  });
+
+  it('palm up wells the glow up around the hand, palm down damps it', () => {
+    const r = .06 * ASPECT, base = { grip: 0, offer: 0, calm: 0 };
+    for (const d of [0, .5 * r, r]) {
+      const flat = handBloom(d, r, .3, 1, base);
+      expect(handBloom(d, r, .3, 1)).toBe(flat);
+      expect(handBloom(d, r, .3, 1, { ...base, offer: 1 })).toBeGreaterThan(flat * 1.8);
+      expect(handBloom(d, r, .3, 1, { ...base, offer: .5 })).toBeGreaterThan(flat);
+      expect(handBloom(d, r, .3, 1, { ...base, calm: 1 })).toBeLessThan(flat * .5);
+    }
+    // No touch, no light, whatever the palm.
+    expect(handBloom(0, r, .3, 0, { ...base, offer: 1 })).toBe(0);
+  });
+
+  it('palm down calms the disturbance of the water; sideways changes nothing', () => {
+    const impulses = (extra: Partial<HandState>, withGestures: boolean) => {
+      const water = new HandWater(), forces = new Forces(), g = new HandGestures();
+      const hand = pictureHand(handState(.5, .5, .8, { capsules: syntheticHandCapsules({ x: .5, y: .5, z: .8 }, 1, .05), speed: .4, ...extra }));
+      let sum = 0;
+      for (let k = 0; k < 120; k++) {
+        g.update([hand], DT);
+        forces.begin(); water.update([hand], DT, k * DT, ASPECT, 1, forces, withGestures ? g : undefined);
+        for (let i = 0; i < forces.count; i++) sum += Math.abs(forces.data[i * 4 + 3]);
+      }
+      return { sum, stir: water.stir };
+    };
+    const before = impulses({}, false), neutral = impulses({}, true);
+    expect(neutral.sum).toBe(before.sum);
+    const down = impulses({ palmNormal: { x: 0, y: -1, z: 0 }, palmUp: -1 }, true);
+    expect(down.sum).toBeLessThan(before.sum * .5);
+    // Agitation (a published signal) still reads the hand's real motion.
+    expect(down.stir).toBe(before.stir);
   });
 });

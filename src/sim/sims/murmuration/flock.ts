@@ -18,7 +18,9 @@
  *  3. hands: attraction from a distance, repulsion inside a ring at hand radius + margin; with
  *     boldness the ring becomes an orbiting halo, and long stillness (`hold`) tightens it; a fast
  *     hand near the flock tears it apart with an outward impulse and fear loosens the flock so it
- *     re-forms over several seconds.
+ *     re-forms over several seconds. Each hand shapes its gathered halo (scaled by boldness): a
+ *     fist (`grip`) pulls it into a small, dense, brighter ball; a palm turned up lifts the halo's
+ *     centre above the hand, turned down settles it below (`palmUp`). Both arrive smoothed.
  *
  * Fear is driven by the hand's speed near the flock (the threat), not by the flock's own
  * turbulence, so the tearing impulse cannot excite itself: flock agitation enters the mood only at
@@ -57,8 +59,15 @@ export interface MurmurationParams {
   flow: number;
   /** Strength of the hands' pull. */
   attraction: number;
+  /** How far a fist shrinks the gathered halo (0 = no effect … 0.8 = to a fifth of its radius). */
+  gripTighten: number;
+  /** How far (picture heights) a palm turned fully up lifts the halo above the hand, or fully down sinks it below. */
+  palmLift: number;
 }
-export const DEFAULT_MURMURATION: MurmurationParams = { flow: .55, attraction: 1 };
+export const DEFAULT_MURMURATION: MurmurationParams = { flow: .55, attraction: 1, gripTighten: .55, palmLift: .11 };
+
+/** A hand's smoothed shape for the halo: `grip` 0 open … 1 fist, `palmUp` 1 up … −1 down. */
+export interface HandShape { grip: number; palmUp: number }
 
 /** exp(−u) for u ≥ 0, to a few per cent: cheap enough for the per-mote hand loop. */
 function fastExpNeg(u: number) { return 1 / (1 + u * (1 + u * (.5 + u * .1666667))); }
@@ -178,7 +187,7 @@ export class Flock {
   /**
    * Advance by `dt`. `hands` are in picture uv. `mood` is read, never written here.
    */
-  step(dt: number, time: number, hands: readonly PictureHand[], primaryId: number | null, mood: FlockMood, params: MurmurationParams, area: Area) {
+  step(dt: number, time: number, hands: readonly PictureHand[], primaryId: number | null, mood: FlockMood, params: MurmurationParams, area: Area, shapes?: readonly HandShape[]) {
     const { n, aspect, px, py, pz, vx, vy, density, bright, hash, sorted, cellStart, cellOf, cols, rows, psi, flowX, flowY } = this;
     this.buildGrid();
     this.buildFlow(time);
@@ -209,6 +218,8 @@ export class Flock {
     // Hands in uniform units (up to 4).
     const hc = Math.min(4, hands.length);
     const hX = this.hX, hY = this.hY, hR = this.hR, hRing = this.hRing, hPull = this.hPull, hThreat = this.hThreat, hGlow = this.hGlow, hW = this.hW;
+    const hCY = this.hCY, hGrip = this.hGrip, hSettle = this.hSettle;
+    let packMax = 0;
     let primaryIndex = -1;
     for (let k = 0; k < hc; k++) {
       const h = hands[k];
@@ -217,11 +228,22 @@ export class Flock {
       // Ring at the hand's edge plus a margin; long stillness draws it in, the beat breathes it.
       // A shy flock circles at a distance; boldness brings the ring in to the hand.
       hRing[k] = (hR[k] * (1.05 - .2 * hold) + (.05 - .025 * hold) * (1 - .4 * bold)) * (1 + .05 * pulse) + .1 * (1 - bold) + .06 * fear;
+      // The gathered halo takes the hand's shape (only as far as the flock trusts it, so a fast hand still tears it).
+      const shape = shapes?.[k], trust = bold * weight;
+      const grip = shape ? clamp01(shape.grip) * trust : 0, palm = shape ? Math.max(-1, Math.min(1, shape.palmUp)) * trust : 0;
+      hGrip[k] = grip;
+      hRing[k] *= 1 - params.gripTighten * grip;
+      // Halo centre: lifted above the hand for a palm turned up, sunk below it for a palm turned down.
+      hCY[k] = hY[k] + params.palmLift * palm;
+      hSettle[k] = palm < 0 ? -palm : 0;
+      if (grip > packMax) packMax = grip;
       hPull[k] = params.attraction * (.35 + .9 * bold) * (1 - fear) * (1 + .8 * h.reach) * weight;
       hThreat[k] = mood.threat * (h.id === primaryId ? 1 : .6);
       hGlow[k] = h.contact * weight;
       if (h.id === primaryId) primaryIndex = k;
     }
+    // A fist packs its ball denser than the flock otherwise likes.
+    const invRho0g = packMax > 0 ? invRho0 / (1 + 1.5 * packMax) : invRho0;
     const closeR = primaryIndex >= 0 ? CLOSE_RADII * hR[primaryIndex] : 0, closeR2 = closeR * closeR;
     const threatR2 = THREAT_RADIUS * THREAT_RADIUS;
     let closeCount = 0, nearCount = 0;
@@ -286,20 +308,22 @@ export class Flock {
         const ic = 1 / cnt;
         // Cohesion turns into pressure where the flock is denser than it likes: toward the local
         // centroid when sparse, away from it (down the density gradient) when packed.
-        const pr = rho * invRho0, coh = wCohesion * (1 - pr * pr);
+        const pr = rho * invRho0g, coh = wCohesion * (1 - pr * pr);
         ax += coh * sx * ic + wAlign * (svx * ic - vxi) + wSep * sepx;
         ay += coh * sy * ic + wAlign * (svy * ic - vyi) + wSep * sepy;
         const dvx = vxi - svx * ic, dvy = vyi - svy * ic;
         disorder += Math.sqrt(dvx * dvx + dvy * dvy);
       }
       // Hands.
-      let glow = 0, held = 0, heldX = 0, heldY = 0;
+      let glow = 0, held = 0, heldX = 0, heldY = 0, heldGrip = 0;
       for (let k = 0; k < hc; k++) {
-        const dx = hX[k] - x, dy = hY[k] - y, d2 = dx * dx + dy * dy, d = Math.sqrt(d2) + 1e-6;
-        const nx = dx / d, ny = dy / d, ring = hRing[k];
+        const dx = hX[k] - x, dhy = hY[k] - y, d2 = dx * dx + dhy * dhy;
         if (k === primaryIndex) { if (d2 < closeR2) closeCount++; if (d2 < threatR2) nearCount++; }
         const w = hW[k];
         if (w <= 0) continue;
+        // The halo forms around its centre (the hand, shifted by the palm's facing).
+        const dy = hCY[k] - y, dc2 = dx * dx + dy * dy, d = Math.sqrt(dc2) + 1e-6;
+        const nx = dx / d, ny = dy / d, ring = hRing[k];
         // Pull from a distance, easing to zero at the ring; push out inside it.
         if (d > ring) {
           const reachOut = .45 + .7 * bold;
@@ -313,23 +337,27 @@ export class Flock {
         const outside = d > ring ? d - ring : 0;
         const local = fastExpNeg(outside / (.1 + .1 * bold));
         const b = bold * w * local;
-        if (b > held) { held = b; heldX = nx; heldY = ny; }
+        if (b > held) { held = b; heldX = nx; heldY = ny; heldGrip = hGrip[k]; }
+        const stiff = 1 + hGrip[k], settle = 1 - .35 * hSettle[k];
         if (b > 1e-3) {
           const vr = vxi * nx + vyi * ny;
           // A well-damped radial spring to the ring (no bobbing in and out).
-          const k = 2.5 + 5 * hold, radial = k * (d - ring) - 1.6 * Math.sqrt(k) * vr;
+          // A fist holds its ball on a stiffer spring.
+          const k = (2.5 + 5 * hold) * stiff, radial = k * (d - ring) - 1.6 * Math.sqrt(k) * vr;
           ax += b * nx * radial; ay += b * ny * radial;
           // Everyone orbits the same way (counter-streams would read as turbulence).
           const tx2 = -ny, ty2 = nx;
-          const vt = vxi * tx2 + vyi * ty2, target = CRUISE * (.9 + .5 * hold);
+          // A palm turned down lets the halo settle: a slower orbit.
+          const vt = vxi * tx2 + vyi * ty2, target = CRUISE * (.9 + .5 * hold) * settle;
           ax += b * 2.2 * (target - vt) * tx2; ay += b * 2.2 * (target - vt) * ty2;
         }
         // A fast hand near the flock tears it apart.
         const th = hThreat[k];
         if (th > 1e-3 && d2 < threatR2) {
-          const f = th * 16 * (1 - d / THREAT_RADIUS) * w;
+          const dh = Math.sqrt(d2) + 1e-6, hx = dx / dh, hy = dhy / dh;
+          const f = th * 16 * (1 - dh / THREAT_RADIUS) * w;
           const jitter = .6 * (random() - .5);
-          ax -= (nx + jitter * ny) * f; ay -= (ny - jitter * nx) * f;
+          ax -= (hx + jitter * hy) * f; ay -= (hy - jitter * hx) * f;
         }
         glow += hGlow[k] * fastExpNeg(outside / .08);
       }
@@ -378,7 +406,7 @@ export class Flock {
       // Brightness: density, a glint of speed, the hand's glow on contact.
       const dens = rho > 30 ? 1 : rho / 30;
       const fast = spd > CRUISE ? Math.min(1, (spd - CRUISE) / CRUISE) : 0;
-      bright[i] = (.5 + .5 * dens + .35 * fast) * (1 + 1.6 * (glow > 1 ? 1 : glow));
+      bright[i] = (.5 + .5 * dens + .35 * fast) * (1 + 1.6 * (glow > 1 ? 1 : glow)) * (1 + .45 * heldGrip * held);
     }
     // Agitation: the flock's velocity dispersion — local disorder (velocity against the
     // neighbourhood's mean) and speed above the expected cruise (a scattered flock runs fast).
@@ -400,6 +428,7 @@ export class Flock {
   private readonly hX = new Float32Array(4); private readonly hY = new Float32Array(4); private readonly hR = new Float32Array(4);
   private readonly hRing = new Float32Array(4); private readonly hPull = new Float32Array(4); private readonly hThreat = new Float32Array(4);
   private readonly hGlow = new Float32Array(4); private readonly hW = new Float32Array(4);
+  private readonly hCY = new Float32Array(4); private readonly hGrip = new Float32Array(4); private readonly hSettle = new Float32Array(4);
 
   /** Pack for drawing: uv x, uv y, depth, brightness per mote. */
   pack(out: Float32Array) {
@@ -428,6 +457,9 @@ export class MurmurationState {
   private reach = 0;
   private lift = .5;
   private presence = 0;
+  /** Each hand's grip and palm facing, smoothed (by hand id) so a flickering tracker never pops the halo. */
+  private readonly shapeF = new Map<number, { grip: Follower; palm: Follower }>();
+  private readonly shapes: HandShape[] = [];
 
   constructor(count: number, aspect: number, readonly seed = 7) { this.flock = new Flock(count, aspect, seed); }
 
@@ -456,13 +488,25 @@ export class MurmurationState {
     this.hold = approach(this.hold, smoothstep(4, 12, this.holdFor), dt, .8);
 
     const mood: FlockMood = { fear: this.mood.fear, boldness: this.mood.boldness * (primary ? 1 : 0), hold: this.hold, threat: this.threat, presence: primary ? 1 : 0, pulse: this.pulse };
-    this.flock.step(dt, input.time, hands, primary ? primary.id : null, mood, params, area);
+    this.updateShapes(hands, dt);
+    this.flock.step(dt, input.time, hands, primary ? primary.id : null, mood, params, area, this.shapes);
 
     // Signals.
     if (primary) { this.reach = approach(this.reach, primary.reach, dt, .08); this.lift = clamp01(primary.y); }
     else this.reach = approach(this.reach, 0, dt, 2.5);
     this.closenessF.update(primary ? clamp01(this.flock.stats.closeShare / HALO_SHARE) : 0, dt);
     this.agitationF.update(this.flock.stats.agitation, dt);
+  }
+
+  private updateShapes(hands: readonly PictureHand[], dt: number) {
+    for (const id of [...this.shapeF.keys()]) if (!hands.some(h => h.id === id)) this.shapeF.delete(id);
+    this.shapes.length = hands.length;
+    hands.forEach((h, k) => {
+      let f = this.shapeF.get(h.id);
+      // Grip closes in a quarter second and opens a little slower; the palm turns over half a second.
+      if (!f) { f = { grip: new Follower(0, .25, .4), palm: new Follower(0, .5, .5) }; this.shapeF.set(h.id, f); }
+      this.shapes[k] = { grip: f.grip.update(clamp01(h.grip), dt), palmUp: f.palm.update(Math.max(-1, Math.min(1, h.palmUp)), dt) };
+    });
   }
 
   signals() {

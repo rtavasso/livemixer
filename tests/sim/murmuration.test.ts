@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { SimInput } from '../../src/sim/core/types';
 import type { HandState } from '../../src/sim/input/types';
 import { CRUISE, DEFAULT_MURMURATION, Flock, MurmurationState } from '../../src/sim/sims/murmuration/flock';
+import type { Vec3 } from '../../src/sim/core/types';
 
 const ASPECT = 16 / 9, DT = 1 / 60;
 
@@ -10,6 +11,33 @@ const hand = (x: number, y: number, vx = 0, vy = 0, z = .3): HandState => ({
   extent: { min: { x: x - .05, y: y - .05, z }, max: { x: x + .05, y: y + .05, z } }, radius: .05,
   openness: 1, pinch: 0, palmNormal: null, palmUp: 0, confidence: 1, ageMs: 1000, staleMs: 0, push: z, points: [], capsules: [],
 });
+
+/** The same hand with a grip (0 open … 1 fist) and palm facing (1 up … −1 down). */
+const shaped = (h: HandState, grip: number, palmUp: number): HandState => {
+  const palmNormal: Vec3 | null = palmUp === 0 ? null : { x: 0, y: palmUp, z: Math.sqrt(Math.max(0, 1 - palmUp * palmUp)) };
+  return { ...h, openness: 1 - grip, palmUp, palmNormal };
+};
+
+/** Motes within `radius` (uniform units) of the hand at uv (hx, hy): their mean distance and mean height relative to the hand. */
+function haloAround(f: Flock, hx: number, hy: number, radius = .35) {
+  const x0 = hx * f.aspect;
+  let count = 0, dist = 0, dy = 0;
+  for (let i = 0; i < f.n; i++) {
+    const dx = f.px[i] - x0, ddy = f.py[i] - hy, d = Math.sqrt(dx * dx + ddy * ddy);
+    if (d > radius) continue;
+    count++; dist += d; dy += ddy;
+  }
+  return { count, meanDist: count ? dist / count : Infinity, meanDy: count ? dy / count : 0 };
+}
+
+/** Idle, then a still trusted hand with the given shape until the halo has formed. */
+function gather(grip: number, palmUp: number, count = 2000) {
+  const s = new MurmurationState(count, ASPECT);
+  const t = run(s, 0, 3, () => null);
+  const h = shaped(hand(.5, .5), grip, palmUp);
+  run(s, t, 16, () => h);
+  return s;
+}
 
 function input(time: number, h: HandState | null): SimInput {
   return { time, dt: DT, hands: h ? [h] : [], primary: h, events: [], presence: h ? 1 : 0, activity: 0, occupancy: null, volume: null, surface: null, music: null };
@@ -125,5 +153,59 @@ describe('murmuration flock', { timeout: 60_000 }, () => {
     timeIt('idle', null);
     const ms = timeIt('hand', hand(.5, .5));
     expect(ms).toBeLessThan(8); // generous for CI; the real target (~1–2 ms) is logged above
+  });
+
+  it('a fist draws the halo into a tighter, denser, brighter ball than an open hand', () => {
+    const open = gather(0, 0), fist = gather(1, 0);
+    const a = haloAround(open.flock, .5, .5), b = haloAround(fist.flock, .5, .5);
+    const brightNear = (f: Flock) => { let s = 0, c = 0; for (let i = 0; i < f.n; i++) { const dx = f.px[i] - .5 * f.aspect, dy = f.py[i] - .5; if (dx * dx + dy * dy < .35 * .35) { s += f.bright[i]; c++; } } return s / c; };
+    console.log(`grip: open meanDist=${a.meanDist.toFixed(3)} (${a.count}) fist meanDist=${b.meanDist.toFixed(3)} (${b.count}) bright ${brightNear(open.flock).toFixed(2)} → ${brightNear(fist.flock).toFixed(2)}`);
+    expect(b.meanDist).toBeLessThan(a.meanDist * .8);
+    expect(brightNear(fist.flock)).toBeGreaterThan(brightNear(open.flock));
+    // Still a calm halo, and the music still hears the hand.
+    expect(fist.signals().agitation).toBeLessThan(.3);
+    expect(fist.signals().closeness).toBeGreaterThan(.7);
+    checkFlock(fist.flock);
+  });
+
+  it('palm up lifts the halo above the hand; palm down settles it below', () => {
+    const flat = gather(0, 0), up = gather(0, 1), down = gather(0, -1);
+    const f = haloAround(flat.flock, .5, .5, .4), u = haloAround(up.flock, .5, .5, .4), d = haloAround(down.flock, .5, .5, .4);
+    console.log(`palm: flat dy=${f.meanDy.toFixed(3)} up dy=${u.meanDy.toFixed(3)} down dy=${d.meanDy.toFixed(3)}`);
+    expect(Math.abs(f.meanDy)).toBeLessThan(.03);
+    expect(u.meanDy).toBeGreaterThan(.05);
+    expect(d.meanDy).toBeLessThan(-.05);
+    checkFlock(up.flock); checkFlock(down.flock);
+  });
+
+  it('a fast hand still tears a fist-held, palm-up halo apart', () => {
+    const s = gather(1, 1, 3000);
+    const t0 = 19;
+    let peak = 0, peakFear = 0;
+    const swipe = (tt: number) => { const u = tt - t0; return shaped(hand(.5 + .3 * Math.sin(u * 6.6), .5, .3 * 6.6 * Math.cos(u * 6.6), 0), 1, 1); };
+    run(s, t0, 1, swipe, () => { peak = Math.max(peak, s.signals().agitation); peakFear = Math.max(peakFear, s.mood.fear); });
+    expect(peak).toBeGreaterThan(.3);
+    expect(peakFear).toBeGreaterThan(.5);
+  });
+
+  it('an open hand with a sideways palm is the plain halo (grip 0, palmUp 0 change nothing)', () => {
+    // Explicit zero shapes give bit-identical motion to stepping with no shapes at all.
+    const a = new Flock(1500, ASPECT), b = new Flock(1500, ASPECT);
+    const h = hand(.45, .55);
+    const ph = { id: 1, x: .45, y: .55, vx: 0, vy: 0, speed: 0, contact: 0, reach: 0, radius: .05, grip: 0, palmUp: 0, hand: h };
+    const mood = { fear: 0, boldness: .9, hold: .5, threat: 0, presence: 1, pulse: .3 };
+    for (let k = 0; k < 300; k++) {
+      a.step(DT, k * DT, [ph], 1, mood, DEFAULT_MURMURATION, { x0: 0, y0: 0, x1: 1, y1: 1 });
+      b.step(DT, k * DT, [ph], 1, mood, DEFAULT_MURMURATION, { x0: 0, y0: 0, x1: 1, y1: 1 }, [{ grip: 0, palmUp: 0 }]);
+    }
+    expect(Array.from(b.px)).toEqual(Array.from(a.px));
+    expect(Array.from(b.bright)).toEqual(Array.from(a.bright));
+    // Through the whole simulation, a neutral hand is unaffected by the gesture tunables.
+    const off = { ...DEFAULT_MURMURATION, gripTighten: 0, palmLift: 0 };
+    const c = new MurmurationState(1500, ASPECT), d = new MurmurationState(1500, ASPECT);
+    for (let k = 0; k < 600; k++) { const inp = input(k * DT, h); c.step(inp, off); d.step(inp, DEFAULT_MURMURATION); }
+    expect(d.mood.boldness).toBeGreaterThan(.5);
+    expect(Array.from(d.flock.px)).toEqual(Array.from(c.flock.px));
+    expect(d.signals()).toEqual(c.signals());
   });
 });

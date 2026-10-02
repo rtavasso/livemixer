@@ -46,6 +46,10 @@ export interface PictureHand {
   reach: number;
   /** Approximate size on the picture (uv x units). */
   radius: number;
+  /** 0 open hand … 1 fist (1 − openness). Sources that cannot tell read as an open hand. */
+  grip: number;
+  /** Palm facing: 1 palm up … −1 palm down; 0 sideways or when the source cannot tell. */
+  palmUp: number;
   hand: HandState;
 }
 
@@ -56,7 +60,8 @@ export function pictureHand(hand: HandState): PictureHand {
     id: hand.id, x: hand.position.x, y: hand.position.y, vx: hand.velocity.x, vy: hand.velocity.y, speed: hand.speed,
     contact: smoothstep(PLANE_Z - PLANE_BAND, PLANE_Z + PLANE_BAND * .5, z),
     reach: smoothstep(PLANE_Z - PLANE_BAND, 1, z),
-    radius: Math.max(.03, Math.min(.2, hand.radius)), hand,
+    radius: Math.max(.03, Math.min(.2, hand.radius)),
+    grip: clamp01(1 - hand.openness), palmUp: Math.max(-1, Math.min(1, hand.palmUp)), hand,
   };
 }
 

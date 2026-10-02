@@ -24,6 +24,23 @@ does not change with the simulation:
 | `closeness` | How near the creatures are to the hand (slow) | Space, and how far the song may move from the original mix |
 | `agitation` | Turbulence (fast) | Pulls the song back toward the original mix |
 
+## Hand gestures
+
+Every hand also carries `grip` (0 open … 1 fist) and `palmUp` (1 palm up … −1 palm down, 0 sideways or
+unknown); see the palm facing in [SIMULATIONS.md](SIMULATIONS.md). They only shape how creatures behave
+once they have chosen to come to the hand: fear still wins, and an open, sideways hand behaves exactly as
+before. They do not change the five signals' meaning (closeness moves only because the creatures really do).
+
+| | Fist | Palm up | Palm down |
+|---|---|---|---|
+| **Tide** | The willing school coils into a tighter ring around the fist and is pulled onto it harder (`fistCoil`, `fistPull`) | The plankton glow wells up brighter and wider where the hand touches the water (`offering`) | The water under the hand calms: rings, wake and splash damped, its light fades faster (`calming`) |
+| **Lantern** | It rests higher above the hand with its tentacles drawn in and curled: wary, not fleeing (`fistGap`, `fistCurl`) | An open upturned palm invites it: it comes a little sooner, sits lower on the palm, drapes heavier and glows brighter (`palmSettle`) | It hovers above the hand instead of draping (`hoverGap`) |
+| **Murmuration** | The halo shrinks into a small, dense, brighter ball (`gripTighten`) | The halo floats up off the hand (`palmLift`) | The halo sinks below the hand and its orbit slows |
+
+All of it eases in over a few tenths of a second, so tracker flicker never pops. The tunables are in each
+simulation's settings panel. Without a Leap, the pointer source fakes them: **Shift** (or the right button)
+for a fist, hold **U** / **D** for palm up / down.
+
 ## Run the show
 
 1. **Leap bridge** (box empty for its first seconds so the background, including the beamsplitter's

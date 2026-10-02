@@ -20,6 +20,11 @@
  *  - With boldness it drifts to just above a still hand so the tentacles fall over it.
  *  - A slow hand in contact with the bell strokes it (glow rises); a fast approach pokes it
  *    (flinch: snap contraction, dim, recoil); fear sends it to the far corner, dim.
+ *  - The hand's shape changes how it settles when it is willing (never whether it flees):
+ *    a fist makes it wary (it keeps a little farther above and draws its tentacles in), an open
+ *    palm facing up invites it (it comes a little sooner, sits lower over the palm, drapes more
+ *    heavily and glows), a palm facing down keeps it hovering above the hand. Each is eased
+ *    (`gesture` seconds) so tracker flicker never pops.
  */
 import { approach, clamp, clamp01, rng, smoothstep } from '../../core/math';
 import type { MusicClock } from '../../core/music';
@@ -34,8 +39,21 @@ export interface LanternParams {
   /** Beats per contraction. */
   pulseBeats: number;
   glow: number;
+  /** Extra height it keeps above a fist (canvas heights, at a full fist). */
+  fistGap: number;
+  /** How far a fist draws the tentacles in (0 none … 1 fully). */
+  fistCurl: number;
+  /** How much lower it sits onto an open, upturned palm (canvas heights). */
+  palmSettle: number;
+  /** Extra height it hovers above a downturned palm (canvas heights). */
+  hoverGap: number;
+  /** Seconds for the gesture responses to ease in (they ease out a little slower). */
+  gesture: number;
 }
-export const DEFAULT_LANTERN: LanternParams = { size: .12, tentacles: 16, length: .42, pulseBeats: 2, glow: 1 };
+export const DEFAULT_LANTERN: LanternParams = {
+  size: .12, tentacles: 16, length: .42, pulseBeats: 2, glow: 1,
+  fistGap: .09, fistCurl: .45, palmSettle: .035, hoverGap: .14, gesture: .5,
+};
 
 export interface LanternStepInput {
   dt: number;
@@ -105,6 +123,10 @@ export class Lantern {
   readonly dim = new Follower(0, .3, 2);
   private wanderX: number; private wanderY: number; private wanderTimer = 0;
   private fleeing = false; private fleeX = 0; private fleeY = 0;
+  /** Gesture responses 0..1, eased: a fist (wary), an open upturned palm (invited), a downturned palm (hover). */
+  wary = 0; invited = 0; hover = 0;
+  /** Tentacle reel: 1 hanging at full length, lower when drawn in. */
+  reel = 1;
   targetX: number; targetY: number;
 
   // Signals.
@@ -239,6 +261,14 @@ export class Lantern {
     this.mood.update(dt, { presence: primary ? input.presence : 0, stillness: primary ? still : 1, agitation: this.agitation.value }, DEFAULT_MOOD);
     const { fear, boldness } = this.mood;
 
+    // Hand shape: grip and palm facing, eased so a flickering tracker never pops.
+    const grip = primary ? clamp01(primary.grip) : 0, palmUp = primary ? clamp(primary.palmUp, -1, 1) : 0;
+    const tau = Math.max(.05, params.gesture);
+    this.wary = approach(this.wary, grip, dt, grip > this.wary ? tau : tau * 1.6);
+    const inviteTarget = Math.max(0, palmUp) * (1 - grip), hoverTarget = Math.max(0, -palmUp);
+    this.invited = approach(this.invited, inviteTarget, dt, inviteTarget > this.invited ? tau : tau * 1.6);
+    this.hover = approach(this.hover, hoverTarget, dt, hoverTarget > this.hover ? tau : tau * 1.6);
+
     // --- Where to go --------------------------------------------------------------------------
     const b = this.bounds();
     this.wanderTimer -= dt;
@@ -249,10 +279,13 @@ export class Lantern {
       this.wanderTimer = 8 + 7 * this.random();
     }
     let tx = this.wanderX, ty = this.wanderY;
-    const come = primary ? smoothstep(.1, .6, boldness) : 0;
+    // An upturned palm invites it a little sooner (the mood still decides whether it is willing).
+    const come = primary ? smoothstep(.1 - .06 * this.invited, .6 - .2 * this.invited, boldness) : 0;
     if (come > 0) {
-      // Just above the hand, so the rim sits over the fingertips and the tentacles fall across it.
-      const ax = clamp(hx, b.x0, b.x1), ay = clamp(hy + primary!.radius * 1.7 + .02, b.y0, b.y1);
+      // Just above the hand, so the rim sits over the fingertips and the tentacles fall across it;
+      // higher above a fist or a downturned palm, lower onto an upturned one.
+      const gap = params.fistGap * this.wary + params.hoverGap * this.hover - params.palmSettle * this.invited;
+      const ax = clamp(hx, b.x0, b.x1), ay = clamp(hy + primary!.radius * 1.7 + .02 + gap, b.y0, b.y1);
       tx += (ax - tx) * come; ty += (ay - ty) * come;
     }
     if (fear > .3 && !this.fleeing) {
@@ -320,13 +353,15 @@ export class Lantern {
     if (this.y > b.y1) { this.y = b.y1; this.vy = Math.min(0, this.vy); }
 
     // --- Tentacles ---------------------------------------------------------------------------
+    // A fist draws them in (only while it is near and attending); a downturned palm a little too.
+    this.reel = 1 - clamp01(params.fistCurl) * this.wary * Math.max(come, near) - .15 * this.hover * come;
     const touched = this.stepChains(dt);
     const total = this.chains.reduce((s, c) => s + c.n - 1, 0);
     this.contactFraction = clamp01(touched / Math.max(1, total * .12));
 
     // --- Light and signals -----------------------------------------------------------------------
     this.dim.update(clamp01(smoothstep(.05, .5, fear) + (this.fleeing ? .3 : 0)), dt);
-    const light = (.55 + .3 * input.presence + .45 * this.stroke.value + .12 * pulse) * (1 - .6 * this.dim.value) * (1 - .55 * this.flinch);
+    const light = (.55 + .3 * input.presence + .45 * this.stroke.value + .12 * pulse + .25 * this.invited * come) * (1 - .6 * this.dim.value) * (1 - .55 * this.flinch);
     this.glow.update(light, dt);
     const proximity = primary ? 1 - smoothstep(bellR + handR * .5, .5, handDist) : 0;
     this.closeness.update(primary ? clamp01(.8 * proximity + .4 * this.contactFraction) : 0, dt);
@@ -379,10 +414,10 @@ export class Lantern {
     }
   }
 
-  /** The bell body is pushed softly off the hand. */
+  /** The bell body is pushed softly off the hand (more softly when invited: it rests on the palm). */
   private bellHandPush(dt: number) {
     const [cx, cy] = this.centre();
-    const r = this.width * .9, caps = this.caps;
+    const r = this.width * (.9 - .25 * this.invited), caps = this.caps;
     for (let k = 0; k < this.capCount; k++) {
       const o = k * 6;
       closest(cx, cy, caps[o], caps[o + 1], caps[o + 2], caps[o + 3]);
@@ -402,7 +437,9 @@ export class Lantern {
     for (const c of this.chains) {
       const arm = c.kind === 'arm';
       const [rx, ry] = this.local(c.rootU * this.width, c.rootV * this.height);
-      const weight = arm ? .16 : .22;
+      const weight = (arm ? .16 : .22) * (1 + .5 * this.invited);
+      // Drawn in: shorter segments, and the tips curl in toward the bell's axis.
+      const rest = c.rest * this.reel, curl = (1 - this.reel) * (arm ? .5 : 1);
       // Undulation, travelling down the chain, and a kick from each contraction.
       const hs = Math.sin(this.heading), hc = Math.cos(this.heading);
       for (let i = 1; i < c.n; i++) {
@@ -410,7 +447,9 @@ export class Lantern {
         const vx = (c.x[i] - c.px[i]) * damping, vy = (c.y[i] - c.py[i]) * damping;
         const wave = (Math.sin(this.time * (arm ? 1.1 : 1.6) - f * (arm ? 5 : 6) + c.phase) + .5 * Math.sin(this.time * .7 - f * 3 + c.phase * 1.7)) * (arm ? .22 : .3) * f;
         // Perpendicular to the bell axis.
-        const ax = hc * wave, ay = -hs * wave - weight;
+        // Curl: pull toward the bell's axis (perpendicular offset from the root, bell frame).
+        const off = curl > 0 ? (c.x[i] - this.x) * hc - (c.y[i] - this.y) * hs : 0;
+        const ax = hc * (wave - off * curl * 6 * f), ay = -hs * (wave - off * curl * 6 * f) - weight;
         c.px[i] = c.x[i]; c.py[i] = c.y[i];
         c.x[i] += vx + ax * dt2; c.y[i] += vy + ay * dt2;
       }
@@ -419,7 +458,7 @@ export class Lantern {
         for (let i = 0; i < c.n - 1; i++) {
           const dx = c.x[i + 1] - c.x[i], dy = c.y[i + 1] - c.y[i];
           const d = Math.sqrt(dx * dx + dy * dy) || 1e-9;
-          const diff = (d - c.rest) / d;
+          const diff = (d - rest) / d;
           if (i === 0) { c.x[1] -= dx * diff; c.y[1] -= dy * diff; }
           else { c.x[i] += dx * diff * .5; c.y[i] += dy * diff * .5; c.x[i + 1] -= dx * diff * .5; c.y[i + 1] -= dy * diff * .5; }
         }

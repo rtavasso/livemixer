@@ -59,6 +59,8 @@ void main() {
  * Plankton: r = surface glow, g = deep glow (where a hand reaches far through), b = eel wakes.
  * Emission is wave motion (|rate| and slope) above a small threshold, saturating toward 1, plus a
  * soft bloom where a hand touches and a sparse idle twinkle. Everything decays with the persistence.
+ * A palm turned up (`u_offer`) wells the bloom brighter and wider; a palm turned down (`u_calm`)
+ * damps it and lets the light under the hand fade faster (`handBloom` in model.ts mirrors the bloom).
  */
 export const GLOW = `${GLSL_HEADER}
 in vec2 v_uv; out vec4 o;
@@ -68,6 +70,8 @@ uniform float u_decay, u_floor, u_gain, u_dt, u_aspect, u_time, u_sparkle;
 uniform int u_handCount;
 uniform vec4 u_hands[2];   // x, y (uv), radius (uniform units), reach
 uniform float u_contact[2];
+uniform float u_offer[2], u_calm[2];  // smoothed palm up / palm down, 0..1
+uniform float u_offering, u_calming;  // gesture strengths
 ${STORAGE}
 float hash(vec3 p) { p = fract(p * vec3(0.1031, 0.1030, 0.0973)); p += dot(p, p.yxz + 33.33); return fract((p.x + p.y) * p.z); }
 float vnoise(vec2 p) {
@@ -89,14 +93,16 @@ void main() {
   float slope = length(vec2(gx, gy)) / (2.0 * u_waveTexel.y);
   // Only real motion lights: crests and fast-moving water, not the slow swell.
   float e = 0.7 * smoothstep(0.15, 1.0, abs(v)) + 0.5 * smoothstep(0.35, 1.6, slope);
-  float deep = 0.0, bloom = 0.0;
+  float deep = 0.0, bloom = 0.0, hush = 0.0;
   for (int i = 0; i < 2; i++) {
     if (i >= u_handCount) break;
     vec4 h = u_hands[i];
     float d = length((v_uv - h.xy) * vec2(u_aspect, 1.0));
     deep = max(deep, h.w * exp(-pow(d / (h.z * (1.6 + 2.0 * h.w)), 2.0)));
-    float br = d / (h.z * (0.45 + 0.6 * h.w));
-    bloom += u_contact[i] * exp(-br * br) * (0.05 + 0.06 * h.w);
+    float br = d / (h.z * (0.45 + 0.6 * h.w) * (1.0 + 0.5 * u_offering * u_offer[i]));
+    float near = exp(-br * br);
+    bloom += u_contact[i] * near * (0.05 + 0.06 * h.w) * (1.0 + u_offering * u_offer[i]) * (1.0 - u_calming * u_calm[i]);
+    hush = max(hush, u_contact[i] * u_calming * u_calm[i] * exp(-pow(d / (h.z * 1.6), 2.0)));
   }
   float add = u_gain * (e * 6.0 + bloom) * plankton(v_uv) * u_dt;
   g.r += (1.0 - g.r) * add * (1.0 - deep);
@@ -105,6 +111,8 @@ void main() {
   vec2 cell = floor(v_uv * u_glowSize);
   float tw = hash(vec3(cell, floor(u_time * 30.0)));
   if (tw > 1.0 - u_sparkle) g.r = max(g.r, 0.35 + 0.5 * hash(vec3(cell.yx, u_time)));
+  // Under a palm turned down the light settles faster.
+  g *= exp(-4.0 * hush * u_dt);
   g = max(g * u_decay - u_floor, 0.0);
   o = vec4(g, 1.0);
 }`;

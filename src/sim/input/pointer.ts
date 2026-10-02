@@ -6,6 +6,7 @@
  *  - The hand is present while the pointer moved recently or a button is down.
  *  - z (depth): rest value adjustable with the wheel; primary button pushes to 1.
  *  - Shift or the secondary button closes the hand (openness 0).
+ *  - Hold U / D to turn the palm up / down (sends a palm normal; otherwise the palm is unknown).
  */
 import type { InputFrame, InputSource, InputSourceStatus } from './types';
 
@@ -15,6 +16,8 @@ export class PointerSource implements InputSource {
   private sequence = 0;
   private x = .5; private y = .5; private restZ = .25;
   private lastMoveMs = -Infinity; private down = false; private closed = false; private inside = false;
+  /** Palm facing held by the U / D keys: 1 up, −1 down, 0 unknown. */
+  private palm: -1 | 0 | 1 = 0;
   private running = false;
   private readonly listeners: [EventTarget, string, (e: Event) => void][] = [];
   /** Milliseconds of stillness after which the pointer hand leaves. Set to Infinity to keep it. */
@@ -39,8 +42,17 @@ export class PointerSource implements InputSource {
     this.listen(this.target, 'pointerleave', () => { this.inside = false; });
     this.listen(this.target, 'contextmenu', e => e.preventDefault());
     this.listen(this.target, 'wheel', e => { const w = e as WheelEvent; this.restZ = Math.min(1, Math.max(0, this.restZ - w.deltaY * .001)); this.lastMoveMs = this.now(); e.preventDefault(); }, { passive: false });
-    this.listen(window, 'keydown', e => { if ((e as KeyboardEvent).key === 'Shift') this.closed = true; });
-    this.listen(window, 'keyup', e => { if ((e as KeyboardEvent).key === 'Shift') this.closed = false; });
+    this.listen(window, 'keydown', e => {
+      const key = (e as KeyboardEvent).key;
+      if (key === 'Shift') this.closed = true;
+      else if (key.toLowerCase() === 'u') this.palm = 1;
+      else if (key.toLowerCase() === 'd') this.palm = -1;
+    });
+    this.listen(window, 'keyup', e => {
+      const key = (e as KeyboardEvent).key;
+      if (key === 'Shift') this.closed = false;
+      else if ((key.toLowerCase() === 'u' && this.palm === 1) || (key.toLowerCase() === 'd' && this.palm === -1)) this.palm = 0;
+    });
   }
 
   sample(nowMs: number) {
@@ -49,15 +61,16 @@ export class PointerSource implements InputSource {
     const z = this.down ? 1 : this.restZ;
     this.emit({
       source: 'pointer', sequence: this.sequence++, observedAtMs: nowMs, receivedAtMs: nowMs,
-      hands: present ? [{ id: 1, position: { x: this.x, y: this.y, z }, confidence: 1, openness: this.closed ? 0 : 1, pinch: this.closed ? 1 : 0 }] : [],
+      // Screen frame: y grows downward, so a palm facing up points along −y.
+      hands: present ? [{ id: 1, position: { x: this.x, y: this.y, z }, confidence: 1, openness: this.closed ? 0 : 1, pinch: this.closed ? 1 : 0, palmNormal: this.palm ? { x: 0, y: -this.palm, z: 0 } : undefined }] : [],
     });
   }
 
   stop() {
     this.running = false;
     for (const [el, type, fn] of this.listeners) el.removeEventListener(type, fn);
-    this.listeners.length = 0; this.down = false; this.closed = false; this.inside = false;
+    this.listeners.length = 0; this.down = false; this.closed = false; this.inside = false; this.palm = 0;
   }
 
-  status(): InputSourceStatus { return { state: this.running ? 'running' : 'idle', message: this.running ? 'Move the pointer over the canvas. Press to push, wheel for depth, Shift to close the hand.' : 'Pointer source stopped.' }; }
+  status(): InputSourceStatus { return { state: this.running ? 'running' : 'idle', message: this.running ? 'Move the pointer over the canvas. Press to push, wheel for depth, Shift to close the hand, hold U / D for palm up / down.' : 'Pointer source stopped.' }; }
 }

@@ -67,6 +67,56 @@ export function fingertips(hand: PictureHand, max: number): { x: number; y: numb
   return tipScratch;
 }
 
+/**
+ * Gesture response settings. `offering`: how much a palm turned up makes the plankton well up
+ * around the hand (glow gain and width at palmUp = 1). `calming`: how much a palm turned down
+ * stills the water under it (fraction of the hand's disturbance and glow removed at palmUp = −1).
+ */
+export interface GestureSettings { offering: number; calming: number }
+export const DEFAULT_GESTURES: GestureSettings = { offering: 1.2, calming: .75 };
+/** Smoothing time constants (s) for grip and palm facing, so a flickering tracker never pops. */
+export const GRIP_RISE = .3, GRIP_FALL = .45, PALM_TAU = .35;
+
+/** A hand's smoothed gestures: grip 0..1, and the palm split into `offer` (up, 0..1) and `calm` (down, 0..1). */
+export interface HandGesture { grip: number; offer: number; calm: number }
+const NO_GESTURE: HandGesture = { grip: 0, offer: 0, calm: 0 };
+
+/**
+ * Smooths each hand's `grip` and `palmUp` over time (per hand id). A hand that has just appeared
+ * starts from open and sideways and eases into its pose; a hand that leaves is forgotten.
+ */
+export class HandGestures {
+  private state = new Map<number, { grip: Follower; palm: number; out: HandGesture }>();
+  private seen = new Set<number>();
+
+  update(hands: readonly PictureHand[], dt: number) {
+    this.seen.clear();
+    for (const hand of hands) {
+      let s = this.state.get(hand.id);
+      if (!s) { s = { grip: new Follower(0, GRIP_RISE, GRIP_FALL), palm: 0, out: { grip: 0, offer: 0, calm: 0 } }; this.state.set(hand.id, s); }
+      s.grip.update(clamp01(hand.grip), dt);
+      s.palm = approach(s.palm, Math.max(-1, Math.min(1, hand.palmUp)), dt, PALM_TAU);
+      s.out.grip = clamp01(s.grip.value); s.out.offer = clamp01(s.palm); s.out.calm = clamp01(-s.palm);
+      this.seen.add(hand.id);
+    }
+    for (const id of this.state.keys()) if (!this.seen.has(id)) this.state.delete(id);
+  }
+
+  /** The smoothed gesture of a hand (open and sideways if unknown). */
+  get(id: number): HandGesture { return this.state.get(id)?.out ?? NO_GESTURE; }
+}
+
+/**
+ * The soft bloom of light a touching hand adds to the plankton at distance `d` (uniform units),
+ * per second before the plankton texture. The GLOW shader computes the same thing; this mirror
+ * exists so the gesture response is unit-tested. A palm turned up wells the bloom brighter and
+ * wider (an offering); a palm turned down damps it.
+ */
+export function handBloom(d: number, radius: number, reach: number, contact: number, gesture: HandGesture = NO_GESTURE, settings: GestureSettings = DEFAULT_GESTURES): number {
+  const br = d / (radius * (.45 + .6 * reach) * (1 + .5 * settings.offering * gesture.offer));
+  return contact * Math.exp(-br * br) * (.05 + .06 * reach) * (1 + settings.offering * gesture.offer) * (1 - clamp01(settings.calming) * gesture.calm);
+}
+
 /** Per-hand memory for the disturbance model: last contact, to detect entering the water. */
 export class HandWater {
   private last = new Map<number, number>();
@@ -78,8 +128,11 @@ export class HandWater {
    * Turn the hands into disturbances. A hand behind the plane makes a slow breathing source
    * (so a still hand glows softly and blooms outward), a wake proportional to its speed, and a
    * splash as it enters. Deeper reach widens it. The weak top band fades everything out.
+   * With `gestures`, a palm turned down calms its hand's disturbance by `settings.calming`
+   * (agitation, a published signal, still reads the hand's real motion).
    */
-  update(hands: readonly PictureHand[], dt: number, time: number, aspect: number, force: number, out: Forces) {
+  update(hands: readonly PictureHand[], dt: number, time: number, aspect: number, force: number, out: Forces,
+    gestures?: HandGestures, settings: GestureSettings = DEFAULT_GESTURES) {
     this.seen.clear(); this.stir = 0;
     for (let h = 0; h < hands.length; h++) {
       const hand = hands[h];
@@ -90,18 +143,19 @@ export class HandWater {
       const entering = Math.max(0, contact - prev) / Math.max(dt, 1e-3);
       this.stir += contact * hand.speed + .12 * entering;
       if (contact < .02) continue;
+      const still = gestures ? 1 - clamp01(settings.calming) * gestures.get(hand.id).calm : 1;
       // The source stays compact (so it rings at a readable wavelength); reach widens the glow instead.
       const radius = hand.radius * aspect * (.4 + .25 * hand.reach);
       // A still hand breathes a ring outward about once a second: a short kick, then quiet while it spreads.
       const phase = (time * .8 + hand.id * .37) % 1, kick = Math.exp(-(phase / .05) * (phase / .05));
-      const impulse = force * dt * contact * (22 * kick - 4 * Math.min(hand.speed, 1.5)) - force * .08 * entering * dt * 6;
+      const impulse = still * (force * dt * contact * (22 * kick - 4 * Math.min(hand.speed, 1.5)) - force * .08 * entering * dt * 6);
       out.add(hand.x, hand.y, radius, impulse);
       // Fingers through the water ring on their own (first hand gets most of the slots).
       const tips = fingertips(hand, h === 0 ? 5 : 1);
       for (const t of tips) {
         const c = pointContact(t.z) * topFade(t.y);
         if (c < .05) continue;
-        out.add(t.x, t.y, Math.max(.012, hand.radius * aspect * .22), force * dt * c * (5 * Math.sin(time * 17 + t.x * 40) - 3 * Math.min(hand.speed, 1.5)));
+        out.add(t.x, t.y, Math.max(.012, hand.radius * aspect * .22), still * force * dt * c * (5 * Math.sin(time * 17 + t.x * 40) - 3 * Math.min(hand.speed, 1.5)));
       }
     }
     for (const id of this.last.keys()) if (!this.seen.has(id)) this.last.delete(id);

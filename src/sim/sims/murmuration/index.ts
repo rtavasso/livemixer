@@ -6,7 +6,9 @@
  * A hand pulls them from a distance and keeps them off its skin; held gently still, the flock
  * wraps it in an orbiting halo that tightens into a ring the longer it is trusted. A fast hand
  * tears the ribbons apart; they re-form over several seconds. Pushing through the picture draws
- * the flock in harder and lights the motes near the hand.
+ * the flock in harder and lights the motes near the hand. Closing the hand draws the halo into a
+ * small, dense, brighter ball; turning the palm up lifts it off the hand, turning it down settles
+ * it below.
  *
  * The flock is simulated on the CPU (`flock.ts`: uniform grid, O(n), deterministic). Each frame
  * the motes are uploaded (bufferSubData) and drawn as instanced, additive streak sprites from
@@ -40,6 +42,8 @@ export default defineSimulation({
     brightness: { kind: 'number', default: 1, min: .2, max: 2.5, step: .05, label: 'Brightness' },
     flow: { kind: 'number', default: .55, min: 0, max: 1, step: .05, label: 'Flow', description: '0 = a cohesive, clumped flock; 1 = motes follow the large folding currents (ribbons and sheets).' },
     attraction: { kind: 'number', default: 1, min: 0, max: 2, step: .05, label: 'Hand attraction', description: 'How strongly the hand draws the flock.' },
+    gripTighten: { kind: 'number', default: .55, min: 0, max: .8, step: .05, label: 'Fist tightens', description: 'How far a closing fist draws the gathered halo into a small, dense, brighter ball (0 = no effect).' },
+    palmLift: { kind: 'number', default: .11, min: 0, max: .25, step: .01, label: 'Palm lift', description: 'How far (picture heights) a palm turned up lifts the halo above the hand, or turned down settles it below.' },
     trail: { kind: 'number', default: .1, min: .03, max: .6, step: .01, unit: 's', label: 'Trail', description: 'How long a mote’s streak persists.' },
   },
   signals: LIVING_SIGNALS,
