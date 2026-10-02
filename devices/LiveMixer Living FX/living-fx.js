@@ -25,10 +25,24 @@ function api(id){return new LiveAPI(null,'id '+id);}
 // A parameter with its id kept: reading LiveAPI's id calls into Live, too slow to do per write.
 function ref(id){return {a:api(id),id:Number(id)};}
 function scalar(o,p){return o.get(p)[0];}
-function tracks(name){var all=ids(song.get('tracks')),r=[];for(var i=0;i<all.length;i++){var t=api(all[i]);if(String(scalar(t,'name'))===name)r.push(t);}return r;}
-function device(t,cls){var ds=ids(t.get('devices'));for(var i=0;i<ds.length;i++){var d=api(ds[i]);if(String(scalar(d,'class_name'))===cls)return d;}return null;}
-function param(d,name){if(!d)return null;var ps=ids(d.get('parameters'));for(var i=0;i<ps.length;i++){var p=ref(ps[i]);if(String(scalar(p.a,'name'))===name)return p;}return null;}
-function named(t,name){if(!t)return null;var ds=ids(t.get('devices'));for(var i=0;i<ds.length;i++){var d=api(ds[i]);if(String(scalar(d,'name'))===name)return d;}return null;}
+// Setup cost matters: a 48-song set has ~380 tracks and ~200 devices, and every LiveAPI object or call runs on Live's
+// main thread. Names and classes are read through one reusable cursor (re-pointed by id, not a new object per
+// lookup); only objects that are kept get their own LiveAPI. A naive scan took minutes and starved the tick.
+var cur=null;
+function cursor(id){if(!cur)cur=new LiveAPI(null,'id '+id);else cur.id=Number(id);return cur;}
+function nameof(id){return String(scalar(cursor(id),'name'));}
+// Tracks by name from one pass over the set (ids; LiveAPI objects made only for tracks that are looked up).
+var tindex=null;
+function scantracks(){var all=ids(song.get('tracks')),r={};for(var i=0;i<all.length;i++){var n=nameof(all[i]);(r[n]=r[n]||[]).push(all[i]);}tindex=r;}
+function tracks(name){if(!tindex)scantracks();var r=[],l=tindex[name]||[];for(var i=0;i<l.length;i++)r.push(api(l[i]));return r;}
+function device(t,cls){var ds=ids(t.get('devices'));for(var i=0;i<ds.length;i++)if(String(scalar(cursor(ds[i]),'class_name'))===cls)return api(ds[i]);return null;}
+// Every copy of a device lists its parameters in the same order: remember where a name was found and check only
+// that slot on the next copy (one call instead of a scan).
+var pslot={};
+function param(d,name){if(!d)return null;var ps=ids(d.get('parameters')),k=pslot[name];
+  if(k!==undefined&&k<ps.length&&nameof(ps[k])===name)return ref(ps[k]);
+  for(var i=0;i<ps.length;i++)if(nameof(ps[i])===name){pslot[name]=i;return ref(ps[i]);}return null;}
+function named(t,name){if(!t)return null;var ds=ids(t.get('devices'));for(var i=0;i<ds.length;i++)if(nameof(ds[i])===name)return api(ds[i]);return null;}
 function mixer(t){return api(ids(t.get('mixer_device'))[0]);}
 function sends(t){return ids(mixer(t).get('sends'));}
 function volume(t){return ref(ids(mixer(t).get('volume'))[0]);}
@@ -76,28 +90,36 @@ function steady(){var sig=manual.join()+'|'+balance+'|'+quiet+'|'+gest.join();if
 function athome(){return balance===.5&&!manual[1]&&!manual[2]&&!manual[3]&&gesturesathome();}
 function quietzone(t){var q=0;for(var i=0;i<zones.length;i++){var z=zones[i];if(t>=z[0]&&t<z[1])q=Math.max(q,Math.min(1,(t-z[0])/2));else if(t>=z[1]&&t<z[1]+2)q=Math.max(q,1-(t-z[1])/2);}return q;}
 
-var retry=null;
-function init(){try{
+var retry=null,t0=0;
+// Setup timing to UDP 7401 (/livemixer/log stage ms) so a slow setup in a large set can be seen from outside Live.
+function lap(stage){outlet(2,'/livemixer/log',stage,Date.now()-t0);}
+function init(){t0=Date.now();try{
   if(retry){retry.cancel();retry=null;}
   if(task)task.cancel();try{restorehome();}catch(e){}
-  song=new LiveAPI(null,'live_set');mix=null;refs={filter:[],cutoff:[],echo:[],bloom:[],snare:[],other:[],drums:[],drumhalo:[]};
+  song=new LiveAPI(null,'live_set');tindex=null;mix=null;refs={filter:[],cutoff:[],echo:[],bloom:[],snare:[],other:[],drums:[],drumhalo:[]};
   var texture=tracks('TEXTURE FX'),drums=tracks('DRUM FX'),vocals=tracks('VOCALS'),sn=tracks('02 Snare'),od=tracks('03 Other Drums'),dr=tracks('02 Drums'),i;
   if(!texture.length)throw new Error('No TEXTURE FX groups: build the set with scripts/ableton-stem-set.py');
+  lap('tracks');
   for(i=0;i<texture.length;i++){var f=param(device(texture[i],'AutoFilter2'),'Control');if(f)refs.filter.push(f);else{f=param(device(texture[i],'AutoFilter'),'Frequency');if(f)refs.cutoff.push({p:f,lo:Number(scalar(f.a,'min')),hi:Number(scalar(f.a,'max'))});}var ts=sends(texture[i]);if(ts.length>1){refs.echo.push(ref(ts[0]));refs.bloom.push(ref(ts[1]));}}
+  lap('textures');
   for(i=0;i<sn.length;i++){var s1=sends(sn[i]);if(s1.length)refs.snare.push(ref(s1[0]));}
   for(i=0;i<od.length;i++){var s2=sends(od[i]);if(s2.length)refs.other.push(ref(s2[0]));}
   for(i=0;i<dr.length;i++){var s3=sends(dr[i]);if(s3.length)refs.drums.push(ref(s3[0]));}
   // Palm up lifts the drums into the halo reverb: send B of every drum track (never the kick).
   var dh=sn.concat(od,dr);for(i=0;i<dh.length;i++){var s4=sends(dh[i]);if(s4.length>1)refs.drumhalo.push(ref(s4[1]));}
+  lap('drum sends');
   mix=[];for(i=0;i<drums.length;i++){var dv=volume(drums[i]);mix.push({p:dv,home:Number(scalar(dv.a,'value')),sign:-1});}
   for(i=0;i<texture.length;i++){var tv=volume(texture[i]);mix.push({p:tv,home:Number(scalar(tv.a,'value')),sign:1});}
-  // Utility's gain is 'Output' in Live 12 and 'Gain' in Live 11.
-  mirror=[];for(i=0;i<vocals.length;i++){var u=device(vocals[i],'StereoGain'),g=param(u,'Output')||param(u,'Gain');if(g)mirror.push(g);}
+  // Utility's gain is 'Output' in Live 12 and 'Gain' in Live 11: find which on the first song, then go straight to it.
+  lap('volumes');
+  var gainname=null;mirror=[];for(i=0;i<vocals.length;i++){var u=device(vocals[i],'StereoGain'),g=gainname?param(u,gainname):null;if(!g){g=param(u,'Output');gainname=g?'Output':null;}if(!g){g=param(u,'Gain');gainname=g?'Gain':null;}if(g)mirror.push(g);}
+  lap('vocals');
   var cs=ids(song.get('cue_points')),cues=[];zones=[];
-  for(i=0;i<cs.length;i++){var c=api(cs[i]);cues.push({t:Number(scalar(c,'time')),name:String(scalar(c,'name'))});}
+  for(i=0;i<cs.length;i++){var c=cursor(cs[i]);cues.push({t:Number(scalar(c,'time')),name:String(scalar(c,'name'))});}
   cues.sort(function(a,b){return a.t-b.t;});
   for(i=0;i<cues.length;i++)if(cues[i].name.indexOf('FX QUIET')===0){var end=Infinity;for(var j=i+1;j<cues.length;j++)if(cues[j].t>cues[i].t&&cues[j].name.indexOf('SONG:')!==0){end=cues[j].t;break;}zones.push([cues[i].t,end]);}
   // Gesture devices: on the RHYTHM / MELODIC groups by class, on Main by name (it has two Utilities and two Auto Filters).
+  lap('cues');
   var halves=[tracks('RHYTHM')[0],tracks('MELODIC')[0]];gref=null;
   if(halves[0]&&halves[1]){
     var main=new LiveAPI(null,'live_set master_track'),fz=named(main,'Freeze');
@@ -113,7 +135,9 @@ function init(){try{
   // The parameter report (dumpparams) is slow LiveAPI work: only on /fx/command dumpparams, never at setup.
   task=new Task(tick,this);task.interval=40;task.repeat();
   var found=gref?[gref.muffle[0],gref.muffle[1],gref.lo[0],gref.hi[1],gref.level[0],gref.level[1],gref.frozen,gref.mix,gref.whoosh,gref.span,gref.lfoAmount,gref.lfoRate].filter(function(p){return p;}).length:0;
+  lap('gestures');
   status('Ready · '+texture.length+' songs · vocals '+mirror.length+'/'+vocals.length+(gref?' · gestures '+found+'/12':'')+(zones.length?' · '+zones.length+' FX QUIET':''));
+  lap('ready');
 }catch(e){refs=null;mix=null;status('Setup: '+e.message+' · retrying in 5 s');error(e+'\n');
   // Unattended: a set that is still loading (or a transient API error) gets another try instead of staying dead.
   if(retry)retry.cancel();retry=new Task(init,this);retry.schedule(5000);}}

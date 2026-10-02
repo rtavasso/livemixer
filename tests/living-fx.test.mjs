@@ -37,7 +37,8 @@ function load(set) {
   class LiveAPI {
     constructor(_cb, path) { this.o = path === 'live_set' ? set.song : path === 'live_set master_track' ? set.master : set.objects.get(Number(String(path).split(' ')[1])); }
     get id() { calls.id++; return String(this.o.id); }  // a call into Live in Max
-    get(prop) { return ref(this.o[prop]); }
+    set id(v) { this.o = set.objects.get(Number(v)); }  // re-pointing a LiveAPI object (Living FX's cursor)
+    get(prop) { if (prop === 'name' && this.o.mixer_device) calls.trackNames = (calls.trackNames ?? 0) + 1; return ref(this.o[prop]); }
     set(prop, v) { calls.set++; this.o[prop] = v; }
   }
   // repeat() is the device's update loop; schedule(ms) a one-off (setup retry), recorded so tests can run it.
@@ -85,6 +86,13 @@ test('sends a merged Drums track to the dub echo, never the kick', () => {
   d.ctx.values(0, 1, 0, 0, .5);
   for (const t of set.byName('02 Drums')) assert.equal(+t.mixer_device.sends[0].value.toFixed(4), +(1 + 20 * Math.log10(.8) / 40).toFixed(4));
   for (const t of set.byName('01 Kick')) assert.equal(t.mixer_device.sends[0].value, 0);
+});
+
+test('setup reads every track name once, however many groups it looks for (a 48-song set has ~380 tracks)', () => {
+  const set = liveSet(4, [], { gestures: true }); const d = load(set);
+  d.ctx.init();
+  assert.match(d.out.filter(a => a[0] === 0 && a[1] === 'set').at(-1)[2], /Ready · 4 songs/);
+  assert.equal(d.calls.trackNames, set.song.tracks.length);
 });
 
 test('an idle tick writes nothing and never reads parameter ids', () => {
