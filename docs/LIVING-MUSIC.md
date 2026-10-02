@@ -53,7 +53,7 @@ The device templates are extracted from the hand-built Drum Transition set: `pyt
 
 ## Try it
 
-1. In Live, open a set built by `scripts/ableton-stem-set.py`; **LiveMixer Living FX** on Main should read `Ready · N songs · M FX QUIET`. Or, for the hand-built set, open `LiveMixer - Two Song Trial.als`. On Main, press **Refresh** on **LiveMixer Two Song FX**, or delete it and add it again from the project's Presets, so it loads the new `two-song-fx.js`. Its status should read `Ready - both song groups` and, when there are zones, `· N FX QUIET`. If it shows `balance off`, the DRUM FX groups were not found.
+1. In Live, open a set built by `scripts/ableton-stem-set.py`; **LiveMixer Living FX** on Main should read `Ready · N songs · vocals N/N · M FX QUIET`; fewer vocals than songs means some songs' vocals will not follow the hand. Or, for the hand-built set, open `LiveMixer - Two Song Trial.als`. On Main, press **Refresh** on **LiveMixer Two Song FX**, or delete it and add it again from the project's Presets, so it loads the new `two-song-fx.js`. Its status should read `Ready - both song groups` and, when there are zones, `· N FX QUIET`. If it shows `balance off`, the DRUM FX groups were not found.
 2. In this repository, run `npm run dev` and, in another terminal, `uv run scripts/ableton-bridge.py`.
 3. Open http://127.0.0.1:4178/sim.html?sim=tide (or `lantern` or `murmuration`).
 4. In the same browser, open http://127.0.0.1:4178/ableton.html and click **Connect to Live**. **Living** is selected automatically once the simulation's schema arrives. The meters show the song axes and the incoming signals.

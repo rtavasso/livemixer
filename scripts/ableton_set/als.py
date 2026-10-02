@@ -22,6 +22,7 @@ from pathlib import Path
 from . import transitions as tx
 
 TEMPLATES = Path(__file__).resolve().parent.parent / "ableton-templates"
+LIVE11_TEMPLATES = TEMPLATES / "live11"  # made by scripts/make-live11-templates.py
 START = "-63072000"  # Live's time for an envelope's initial value
 WARP_BEATS, WARP_COMPLEX_PRO = 0, 6
 
@@ -32,8 +33,8 @@ def _set_name(track, name):
 
 
 class LiveSet:
-    def __init__(self, template=TEMPLATES / "stem-set.als"):
-        with gzip.open(template, "rt", encoding="utf-8") as f:
+    def __init__(self, templates=TEMPLATES):
+        with gzip.open(templates / "stem-set.als", "rt", encoding="utf-8") as f:
             self.root = ET.fromstring(f.read())
         self.live_set = self.root.find("LiveSet")
         self.tracks = self.live_set.find("Tracks")
@@ -41,7 +42,9 @@ class LiveSet:
         self.stem_template = self.tracks.find("AudioTrack")
         self.tracks.remove(self.group_template)
         self.tracks.remove(self.stem_template)
-        self.eq_template = ET.fromstring((TEMPLATES / "eq-three.xml").read_text())
+        self.eq_template = ET.fromstring((templates / "eq-three.xml").read_text(encoding="utf-8"))
+        # Live 12 calls the master track Main
+        self.main_track = next(t for t in (self.live_set.find("MainTrack"), self.live_set.find("MasterTrack")) if t is not None)
         self.next_pointee = int(self.live_set.find("NextPointeeId").get("Value"))
         self.next_track = max(100, 1 + max(int(t.get("Id")) for t in self.tracks))
         self.position = 0  # insertion index: before the return tracks
@@ -79,11 +82,16 @@ class LiveSet:
             chain.append(device)
         return self._insert(group)
 
-    def add_stem(self, group, name, color):
+    def add_stem(self, group, name, color, devices=()):
         track = copy.deepcopy(self.stem_template)
         _set_name(track, name)
         track.find("Color").set("Value", str(color))
         track.find("TrackGroupId").set("Value", group.get("Id"))
+        chain = track.find("DeviceChain/DeviceChain/Devices")
+        for index, device in enumerate(devices, start=len(chain)):
+            device = copy.deepcopy(device)
+            device.set("Id", str(index))
+            chain.append(device)
         return self._insert(track)
 
     @staticmethod
@@ -94,10 +102,16 @@ class LiveSet:
     def eq_low_target(group):
         return group.find("DeviceChain/DeviceChain/Devices/FilterEQ3/GainLo/AutomationTarget").get("Id")
 
-    def set_clip(self, track, path, frames, rate, name, color, output_dir, *, start, end, loop_start, markers, warp_mode):
-        """Place the track's single Arrangement clip, warped by `markers` [(seconds, clip beat)]."""
+    def set_clip(self, track, path, frames, rate, name, color, output_dir, *, start, end, loop_start, markers, warp_mode,
+                 seconds=None):
+        """Place the track's single Arrangement clip, warped by `markers` [(seconds, clip beat)].
+
+        `seconds`: play unwarped instead, at the audio's own speed, from 0 s to this many seconds. Live keeps an
+        unwarped clip's loop points in seconds and its place in the Arrangement in beats."""
         clip = track.find("DeviceChain/MainSequencer/Sample/ArrangerAutomation/Events/AudioClip")
         length = end - start
+        if seconds is not None:
+            loop_start, length = 0.0, seconds
         clip.set("Time", repr(start))
         clip.find("CurrentStart").set("Value", repr(start))
         clip.find("CurrentEnd").set("Value", repr(end))
@@ -109,7 +123,7 @@ class LiveSet:
         loop.find("LoopOn").set("Value", "false")
         clip.find("Name").set("Value", name)
         clip.find("Color").set("Value", str(color))
-        clip.find("IsWarped").set("Value", "true")
+        clip.find("IsWarped").set("Value", "false" if seconds is not None else "true")
         clip.find("WarpMode").set("Value", str(warp_mode))
         warp = clip.find("WarpMarkers")
         for child in list(warp):
@@ -156,7 +170,7 @@ class LiveSet:
         ET.SubElement(view, "TimeAndValueTransforms")
 
     def set_tempo(self, initial, points):
-        main = self.live_set.find("MainTrack")
+        main = self.main_track
         tempo = main.find("DeviceChain/Mixer/Tempo")
         tempo.find("Manual").set("Value", repr(float(initial)))
         target = tempo.find("AutomationTarget").get("Id")
@@ -186,7 +200,7 @@ class LiveSet:
             self.tracks.insert(index, new)
 
     def add_main_devices(self, devices):
-        chain = self.live_set.find("MainTrack/DeviceChain/DeviceChain/Devices")
+        chain = self.main_track.find("DeviceChain/DeviceChain/Devices")
         for device in devices:
             device = copy.deepcopy(device)
             device.set("Id", str(len(chain)))
@@ -216,8 +230,8 @@ LIVING_GROUPS = [(tx.DRUMS, "DRUM FX"), (tx.BASS, None), (tx.MELODIC, "TEXTURE F
 class Living:
     """The installation's devices, from ableton-templates/living.xml."""
 
-    def __init__(self, template=TEMPLATES / "living.xml", device_dir=LIVING_FX):
-        root = ET.parse(template).getroot()
+    def __init__(self, templates=TEMPLATES, device_dir=LIVING_FX):
+        root = ET.parse(templates / "living.xml").getroot()
         self.texture_filter = root.find("TextureFilter")[0]
         self.vocal_presence = root.find("VocalPresence")[0]
         self.returns = list(root.find("Returns"))
@@ -244,6 +258,8 @@ class Living:
 
 def _point_max_device(device, amxd, output_dir):
     ref = device.find("PatchSlot/Value/MxPatchRef")
+    if ref is None:  # Live 11
+        ref = device.find("PatchSlot/Value/MxDPatchRef")
     file_ref = ref.find("FileRef")
     file_ref.find("RelativePathType").set("Value", "1")
     file_ref.find("RelativePath").set("Value", os.path.relpath(amxd, output_dir))
@@ -258,12 +274,17 @@ def quiet_zones(plan):
     return [(t.start, t.start + 4 * t.bars) for t in plan.transitions if t.bars > 0]
 
 
-def write_mix(plan, envelopes, rendered, output, colors, unfold=False, living=None):
+def write_mix(plan, envelopes, rendered, output, colors, unfold=False, living=None, templates=TEMPLATES, retimed=None):
     """Write a planned mix. `rendered` is one (stems [(name, path)], frames, rate) per song.
 
     `living`: a `Living` to add the installation's effects, or None for a plain stem set.
+    `templates`: ableton-templates/ for Live 12, or LIVE11_TEMPLATES for a set Live 11 can open.
+    `retimed`: a transitions.Retimed (natural_speed) to play every clip unwarped; its automation, locators
+    and overlaps replace the plan's.
     """
-    live = LiveSet()
+    if retimed is not None:
+        envelopes = retimed.envelopes
+    live = LiveSet(templates)
     output_dir = output.parent.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     groups, stem_tracks = [], {}
@@ -277,17 +298,28 @@ def write_mix(plan, envelopes, rendered, output, colors, unfold=False, living=No
             # Role order, each sub-group created just before its first stem: Live lists a group's tracks under it.
             order = [role for role, _ in LIVING_GROUPS]
             stems = sorted(stems, key=lambda s: order.index(tx.stem_role(s[0])))
+        vocal_count = sum(tx.stem_role(name) == tx.VOCALS for name, _ in stems)
         for stem_name, path in stems:
             role = tx.stem_role(stem_name)
-            if living is not None and role not in parents:
-                sub = dict(LIVING_GROUPS)[role]
-                devices = {tx.MELODIC: [living.texture_filter], tx.VOCALS: [living.vocal_device(index == 0)]}.get(role, [])
-                parents[role] = group if sub is None else live.add_group(sub, color, unfold=unfold, parent=group, devices=devices)
-            track = live.add_stem(parents.get(role, group), stem_name, color)
+            if living is not None and role == tx.VOCALS and vocal_count == 1:
+                # One (merged) vocal: the track itself carries Vocal Presence, named VOCALS for LiveMixer Living FX.
+                # Living FX never moves its volume, so the transitions can automate it directly.
+                track = live.add_stem(group, "VOCALS", color, devices=[living.vocal_device(index == 0)])
+            else:
+                if living is not None and role not in parents:
+                    sub = dict(LIVING_GROUPS)[role]
+                    devices = {tx.MELODIC: [living.texture_filter], tx.VOCALS: [living.vocal_device(index == 0)]}.get(role, [])
+                    parents[role] = group if sub is None else live.add_group(sub, color, unfold=unfold, parent=group, devices=devices)
+                track = live.add_stem(parents.get(role, group), stem_name, color)
             mode = WARP_BEATS if tx.stem_role(stem_name) == tx.DRUMS else WARP_COMPLEX_PRO
-            live.set_clip(track, Path(path).resolve(), frames, rate, stem_name, color, output_dir,
-                          start=plan.origins[index] + g.start_beat, end=plan.clip_ends[index],
-                          loop_start=g.start_beat, markers=g.markers, warp_mode=mode)
+            if retimed is not None:
+                live.set_clip(track, Path(path).resolve(), frames, rate, stem_name, color, output_dir,
+                              start=retimed.clip_starts[index], end=retimed.clip_ends[index], loop_start=0,
+                              markers=g.markers, warp_mode=mode, seconds=retimed.end_seconds[index])
+            else:
+                live.set_clip(track, Path(path).resolve(), frames, rate, stem_name, color, output_dir,
+                              start=plan.origins[index] + g.start_beat, end=plan.clip_ends[index],
+                              loop_start=g.start_beat, markers=g.markers, warp_mode=mode)
             stem_tracks[(index, stem_name)] = track
     for target, (initial, points) in envelopes.items():
         if target == "tempo":
@@ -299,7 +331,7 @@ def write_mix(plan, envelopes, rendered, output, colors, unfold=False, living=No
             live.add_envelope(groups[target[1]], live.volume_target(groups[target[1]]), initial, points)
         elif target[0] == "eq":
             live.add_envelope(groups[target[1]], live.eq_low_target(groups[target[1]]), initial, points)
-    for beat, song in plan.locators:
+    for beat, song in (retimed.locators if retimed is not None else plan.locators):
         live.add_locator(beat, f"SONG: {song.name} · {song.native_bpm:.0f} BPM · {song.camelot or '?'}")
     if living is not None:
         live.use_returns(living.returns)
@@ -307,7 +339,7 @@ def write_mix(plan, envelopes, rendered, output, colors, unfold=False, living=No
         for device in live.add_main_devices(living.main):
             if device.tag == "MxDeviceAudioEffect":
                 _point_max_device(device, amxd, output_dir)
-        for start, end in quiet_zones(plan):
+        for start, end in (retimed.zones if retimed is not None else quiet_zones(plan)):
             live.add_locator(start, "FX QUIET")
             live.add_locator(end, "FX ON")
     live.write(output)

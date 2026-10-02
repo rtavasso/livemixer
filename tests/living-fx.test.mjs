@@ -23,17 +23,18 @@ function liveSet(songs, cues) {
 }
 
 function load(set) {
-  const out = []; let task = null; let clock = 1000;
+  const out = []; let task = null; let clock = 1000; const calls = { set: 0, id: 0 };
   const ref = (v) => Array.isArray(v) ? v.flatMap(o => ['id', o.id]) : typeof v === 'object' && v !== null ? ['id', v.id] : [v];
   class LiveAPI {
-    constructor(_cb, path) { this.o = path === 'live_set' ? set.song : set.objects.get(Number(String(path).split(' ')[1])); this.id = String(this.o.id); }
+    constructor(_cb, path) { this.o = path === 'live_set' ? set.song : set.objects.get(Number(String(path).split(' ')[1])); }
+    get id() { calls.id++; return String(this.o.id); }  // a call into Live in Max
     get(prop) { return ref(this.o[prop]); }
-    set(prop, v) { this.o[prop] = v; }
+    set(prop, v) { calls.set++; this.o[prop] = v; }
   }
   class Task { constructor(fn) { this.fn = fn; task = this; } repeat() {} cancel() { task = null; } }
   const ctx = { LiveAPI, Task, outlet: (...a) => out.push(a), arrayfromargs: (a) => Array.prototype.slice.call(a), error: () => {}, post: () => {}, Date: { now: () => clock } };
   vm.createContext(ctx); vm.runInContext(source, ctx);
-  return { ctx, out, tick: (ms = 40) => { clock += ms; task?.fn(); }, advance: (ms) => { clock += ms; } };
+  return { ctx, out, calls, tick: (ms = 40) => { clock += ms; task?.fn(); }, advance: (ms) => { clock += ms; } };
 }
 
 test('drives every song group and mirrors the vocal gain', () => {
@@ -48,6 +49,52 @@ test('drives every song group and mirrors the vocal gain', () => {
   for (const t of set.byName('02 Snare')) assert.ok(t.mixer_device.sends[0].value > 0);
   d.tick();
   assert.deepEqual(set.byName('VOCALS').map(t => t.devices[0].parameters[0].value), [.3, .3, .3]);
+});
+
+test('closes the Live 11 Auto Filter low-pass for dive', () => {
+  const set = liveSet(2, []);
+  for (const t of set.byName('TEXTURE FX')) {
+    t.devices[0].class_name = 'AutoFilter';
+    Object.assign(t.devices[0].parameters[0], { name: 'Frequency', value: 135, min: 20, max: 135 });
+  }
+  const d = load(set);
+  d.ctx.init();
+  assert.match(d.out.filter(a => a[0] === 0 && a[1] === 'set').at(-1)[2], /Ready · 2 songs/);
+  const cutoffs = () => set.byName('TEXTURE FX').map(t => +t.devices[0].parameters[0].value.toFixed(3));
+  assert.deepEqual(cutoffs(), [135, 135]);
+  d.ctx.values(0, 0, 1, 0, .5);
+  assert.deepEqual(cutoffs(), [71.75, 71.75]);
+});
+
+test('sends a merged Drums track to the dub echo, never the kick', () => {
+  const set = liveSet(2, []);
+  for (const t of set.byName('02 Snare')) t.name = '02 Drums';
+  const d = load(set);
+  d.ctx.init();
+  d.ctx.values(0, 1, 0, 0, .5);
+  for (const t of set.byName('02 Drums')) assert.equal(+t.mixer_device.sends[0].value.toFixed(4), +(1 + 20 * Math.log10(.8) / 40).toFixed(4));
+  for (const t of set.byName('01 Kick')) assert.equal(t.mixer_device.sends[0].value, 0);
+});
+
+test('an idle tick writes nothing and never reads parameter ids', () => {
+  const set = liveSet(3, []); const d = load(set);
+  d.ctx.init();
+  d.ctx.values(0, .5, .5, .5, .7);
+  d.tick();
+  const before = { ...d.calls };
+  for (let i = 0; i < 25; i++) d.tick();
+  assert.deepEqual(d.calls, before);
+});
+
+test('mirrors the vocal gain in Live 11, where Utility calls it Gain', () => {
+  const set = liveSet(3, []);
+  for (const t of set.byName('VOCALS')) t.devices[0].parameters[0].name = 'Gain';
+  const d = load(set);
+  d.ctx.init();
+  assert.match(d.out.filter(a => a[0] === 0 && a[1] === 'set').at(-1)[2], /vocals 3\/3/);
+  set.byName('VOCALS')[0].devices[0].parameters[0].value = 0;  // hand out of the box: CC20 at 0
+  d.tick();
+  assert.deepEqual(set.byName('VOCALS').map(t => t.devices[0].parameters[0].value), [0, 0, 0]);
 });
 
 test('reports the song position for the simulation page', () => {

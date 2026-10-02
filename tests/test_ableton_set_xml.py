@@ -10,12 +10,14 @@ import tempfile
 import unittest
 import wave
 import xml.etree.ElementTree as ET
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from ableton_set import transitions as tx  # noqa: E402
-from ableton_set.als import Living, quiet_zones, write_mix  # noqa: E402
+from ableton_set.merge import merge_levels, merge_song  # noqa: E402
+from ableton_set.als import LIVE11_TEMPLATES, TEMPLATES, Living, quiet_zones, write_mix  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_ableton_transitions import STEMS, song  # noqa: E402
@@ -31,6 +33,13 @@ def silent_wav(path, seconds, rate=8000):
 
 
 class MixXmlTest(unittest.TestCase):
+    templates = TEMPLATES
+    main_track = "MainTrack"
+    texture_filter = "AutoFilter2"
+    patch_ref = "MxPatchRef"
+    merge = False
+    natural = False
+
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
@@ -45,10 +54,17 @@ class MixXmlTest(unittest.TestCase):
             stems = [(n, folder / f"{n}.wav") for n in STEMS]
             for _, path in stems:
                 frames, rate = silent_wav(path, s.duration)
+            if cls.merge:
+                stems = merge_song(stems, folder / "merged")
             rendered.append((stems, frames, rate))
+        if cls.merge:
+            songs = [replace(s, bar_levels=merge_levels(s.bar_levels)) for s in songs]
         cls.plan = tx.plan(songs, 16)
         cls.output = root / "Mix.als"
-        write_mix(cls.plan, tx.automation(cls.plan), rendered, cls.output, [1, 5, 9], living=cls.living())
+        envelopes = tx.automation(cls.plan)
+        cls.retimed = tx.natural_speed(cls.plan, envelopes) if cls.natural else None
+        write_mix(cls.plan, envelopes, rendered, cls.output, [1, 5, 9], living=cls.living(),
+                  templates=cls.templates, retimed=cls.retimed)
         cls.live_set = ET.fromstring(gzip.open(cls.output).read()).find("LiveSet")
 
     @staticmethod
@@ -95,7 +111,7 @@ class MixXmlTest(unittest.TestCase):
 
     def test_clips_warped_with_ascending_markers(self):
         clips = list(self.live_set.iter("AudioClip"))
-        self.assertEqual(len(clips), 3 * len(STEMS))
+        self.assertEqual(len(clips), 3 * (5 if self.merge else len(STEMS)))
         for clip in clips:
             self.assertEqual(clip.find("IsWarped").get("Value"), "true")
             markers = [(float(m.get("SecTime")), float(m.get("BeatTime"))) for m in clip.find("WarpMarkers")]
@@ -157,7 +173,7 @@ class LivingMixXmlTest(MixXmlTest):
         vocals = [t for t in tracks if name(t) == "VOCALS"]
         self.assertEqual(len(texture), 3)
         for t in texture:
-            self.assertIsNotNone(t.find("DeviceChain/DeviceChain/Devices/AutoFilter2"))
+            self.assertIsNotNone(t.find("DeviceChain/DeviceChain/Devices/" + self.texture_filter))
         mapped = [bool(list(t.iter("KeyMidi"))) for t in vocals]
         self.assertEqual(mapped, [True, False, False])
         cc = [k.find("NoteOrController").get("Value") for k in vocals[0].iter("KeyMidi")]
@@ -168,16 +184,16 @@ class LivingMixXmlTest(MixXmlTest):
     def test_returns_and_main_chain(self):
         returns = [name(t) for t in self.live_set.findall("Tracks/ReturnTrack")]
         self.assertEqual(returns, ["A-DUB THROW", "B-HALO BLOOM"])
-        main = list(self.live_set.find("MainTrack/DeviceChain/DeviceChain/Devices"))
+        main = list(self.live_set.find(self.main_track + "/DeviceChain/DeviceChain/Devices"))
         self.assertEqual([d.tag for d in main], ["Reverb", "StereoGain", "Limiter", "MxDeviceAudioEffect"])
         self.assertEqual(len({d.get("Id") for d in main}), len(main))
-        ref = main[-1].find("PatchSlot/Value/MxPatchRef/FileRef")
+        ref = main[-1].find(f"PatchSlot/Value/{self.patch_ref}/FileRef")
         path = Path(ref.find("Path").get("Value"))
         self.assertEqual(path.name, "LiveMixer Living FX.amxd")
         self.assertTrue(path.exists())
         self.assertTrue((path.parent / "living-fx.js").exists())
         self.assertEqual((self.output.parent / ref.find("RelativePath").get("Value")).resolve(), path.resolve())
-        ccs = sorted(k.find("NoteOrController").get("Value") for k in self.live_set.find("MainTrack").iter("KeyMidi"))
+        ccs = sorted(k.find("NoteOrController").get("Value") for k in self.live_set.find(self.main_track).iter("KeyMidi"))
         self.assertEqual(ccs, ["21", "23"])
 
     def test_tempo_and_locators(self):
@@ -190,6 +206,75 @@ class LivingMixXmlTest(MixXmlTest):
         for start, end in zones:
             self.assertIn((start, "FX QUIET"), locators)
             self.assertIn((end, "FX ON"), locators)
+
+
+class Live11LivingMixXmlTest(LivingMixXmlTest):
+    """A living set from the Live 11 templates (scripts/make-live11-templates.py)."""
+    templates = LIVE11_TEMPLATES
+    main_track = "MasterTrack"
+    texture_filter = "AutoFilter"
+    patch_ref = "MxDPatchRef"
+
+    @staticmethod
+    def living():
+        return Living(LIVE11_TEMPLATES)
+
+    def test_written_as_live11(self):
+        root = ET.fromstring(gzip.open(self.output).read())
+        self.assertTrue(root.get("MinorVersion").startswith("11."))
+        for tag in ("MainTrack", "AutoFilter2", "MxPatchRef", "SourceHint", "IsStored"):
+            self.assertIsNone(next(root.iter(tag), None), tag)
+
+
+class MergedLivingMixXmlTest(Live11LivingMixXmlTest):
+    """ableton-stem-set.py --merge: Kick, Drums, Bass, Melodic and Vocals per song."""
+    merge = True
+
+    def test_tracks_unique_grouped_and_before_returns(self):
+        tracks = list(self.live_set.find("Tracks"))
+        self.assertEqual(len({t.get("Id") for t in tracks}), len(tracks))
+        self.assertEqual([t.tag for t in tracks][-2:], ["ReturnTrack", "ReturnTrack"])
+        children = lambda parent: [name(t) for t in tracks if t.find("TrackGroupId").get("Value") == parent.get("Id")]  # noqa: E731
+        songs = [t for t in tracks if t.tag == "GroupTrack" and t.find("TrackGroupId").get("Value") == "-1"]
+        self.assertEqual(len(songs), 3)
+        for song_group in songs:
+            self.assertEqual(children(song_group), ["DRUM FX", "04 Bass", "TEXTURE FX", "VOCALS"])
+        for group in [t for t in tracks if name(t) == "DRUM FX"]:
+            self.assertEqual(children(group), ["01 Kick", "02 Drums"])
+        for group in [t for t in tracks if name(t) == "TEXTURE FX"]:
+            self.assertEqual(group.tag, "GroupTrack")  # Living FX moves its volume; the melodic track is automated
+            self.assertEqual(children(group), ["05 Melodic"])
+        self.assertEqual({t.tag for t in tracks if name(t) == "VOCALS"}, {"AudioTrack"})
+
+    def test_merged_files_sum_their_parts(self):
+        folder = self.output.parent / "A" / "merged"
+        self.assertEqual(sorted(p.name for p in folder.glob("*.wav")), ["02 Drums.wav", "05 Melodic.wav", "08 Vocals.wav"])
+        manifest = (folder / "_merge.json").read_text(encoding="utf-8")
+        self.assertIn("02 Snare.wav", manifest)
+        self.assertNotIn("01 Kick.wav", manifest)
+
+    def test_envelopes_follow_merged_tracks(self):
+        names = {name(t) for t in self.live_set.find("Tracks") if list(t.iter("AutomationEnvelope"))}
+        self.assertFalse(names & {"02 Snare", "05 Guitar", "08 Lead Vocals"})
+
+
+class NaturalSpeedMixXmlTest(MergedLivingMixXmlTest):
+    """ableton-stem-set.py --natural-speed: unwarped clips, loop points in seconds."""
+    natural = True
+
+    def test_clips_warped_with_ascending_markers(self):
+        for clip in self.live_set.iter("AudioClip"):
+            self.assertEqual(clip.find("IsWarped").get("Value"), "false")
+            loop = clip.find("Loop")
+            self.assertEqual(float(loop.find("LoopStart").get("Value")), 0.0)
+            self.assertIn(round(float(loop.find("LoopEnd").get("Value")), 6), [round(s, 6) for s in self.retimed.end_seconds])
+
+    def test_tempo_and_locators(self):
+        locators = [float(l.find("Time").get("Value")) for l in self.live_set.iter("Locator")]
+        self.assertEqual(locators, sorted(locators))
+        for start, end in self.retimed.zones:
+            self.assertIn(round(start, 6), [round(t, 6) for t in locators])
+            self.assertIn(round(end, 6), [round(t, 6) for t in locators])
 
 
 if __name__ == "__main__":

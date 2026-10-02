@@ -24,8 +24,8 @@ for (const uploadError of ['timeout of 20000ms exceeded', 'Network Error']) test
     await writeFile(join(root, 'audio.local.json'), JSON.stringify({ test: {
       mp3: 'Test [test].mp3', sha256: createHash('sha256').update(mp3).digest('hex'),
     } }));
-    const html = `<style>.mask{position:fixed;inset:0;z-index:20}.context-menu{position:fixed;top:80px;left:30px;z-index:21;background:white}.download-stems-bank label{display:block}</style><div class="page _stems"><header><button class="switch">Pro<div class="switch-slider on"></div></button></header>
-      <div class="upload"><input type="file"></div><div id="cards"></div></div>
+    const html = `<style>.mask{position:fixed;inset:0;z-index:20}.context-menu{position:fixed;top:80px;left:30px;z-index:21;background:white}.download-stems-bank label{display:block}</style><div class="page _landing"><div class="controller"><button class="upload"><input type="file" accept="audio/mpeg, audio/wav"></button><button class="switch">Pro<div class="switch-slider on"></div></button></div>
+      <div id="cards"></div></div>
       <script>
       window.uploads=0;
       window.retries=0;
