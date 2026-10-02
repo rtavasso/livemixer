@@ -228,3 +228,30 @@ test('refuses a set without TEXTURE FX groups', () => {
   assert.match(d.out.filter(a => a[0] === 0 && a[1] === 'set').at(-1)[2], /Setup: No TEXTURE FX.*retrying in 5 s/);
   assert.deepEqual(d.scheduled.map(s => s.ms), [5000], 'an unattended show retries setup instead of staying dead');
 });
+
+test('writes only the songs within earshot of the playhead, and catches the next one up as it arrives', () => {
+  const cues = Array.from({ length: 6 }, (_, s) => [s * 100, `SONG: Song ${s} · 120 BPM · 8A`]);
+  const set = liveSet(6, cues); const d = load(set);
+  d.ctx.init();
+  set.song.current_song_time = 310;  // in song 3
+  d.tick();
+  d.ctx.values(0, 0, 1, 0, .5);  // dive: every song's texture filter closes, but only where it can be heard
+  d.tick();
+  const filters = () => set.byName('TEXTURE FX').map(t => +t.devices[0].parameters[0].value.toFixed(3));
+  assert.deepEqual(filters(), [.5, .5, .13, .13, .13, .5]);
+  set.song.current_song_time = 410;  // song 4 plays: song 5 comes into earshot before it is heard
+  d.tick();
+  assert.deepEqual(filters(), [.5, .5, .13, .13, .13, .13]);
+});
+
+test('caps the per-song writes per tick on a 48-song set, and finishes them over the next ticks', () => {
+  const set = liveSet(48, []); const d = load(set);
+  d.ctx.init(); d.tick();
+  const before = d.calls.set;
+  d.ctx.values(0, 1, 1, 1, 1);  // every per-song send, filter and volume at once
+  d.tick();
+  assert.ok(d.calls.set - before <= 2 * 64, `${d.calls.set - before} writes in one tick`);
+  for (let i = 0; i < 40; i++) d.tick();
+  assert.deepEqual(new Set(set.byName('TEXTURE FX').map(t => +t.devices[0].parameters[0].value.toFixed(3))), new Set([.13]));
+  for (const t of set.byName('DRUM FX')) assert.ok(Math.abs(t.mixer_device.volume.value - (.85 - .1)) < 1e-9);
+});

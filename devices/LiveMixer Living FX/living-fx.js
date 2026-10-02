@@ -17,6 +17,11 @@ autowatch=0;inlets=1;outlets=3;
 var song=null,refs=null,mix=null,mirror=[],zones=[],task=null,label='',last={},applied='';
 // Live's output meters (Main, RHYTHM, MELODIC) for the simulations: /livemixer/levels on UDP 7401 with each state.
 var meters=null;
+// Per-song writes (sends, volumes, filters, the vocal mirror) go only to the songs that can be heard: the one at the
+// playhead and its neighbours, from the SONG: locators. Writing all 48 songs on every tick a hand moved was ~10,000
+// LiveAPI calls a second and froze Live's main thread. `budget` caps them per tick whatever happens; what is left over
+// is written on the next tick. Global writes (Main, RHYTHM, MELODIC) are a dozen and never wait.
+var starts=[],win=null,songAt=-1,BUDGET=64,budget=Infinity,pending=0,tpos=null;
 var manual=[0,0,0,0],balance=.5,quiet=0,oscOwned=0,lastValues=0,lastTick=0,lastState=0;
 // Hand gestures (/fx/values 5..14, docs/superpowers/specs/2026-10-02-hand-gesture-audio-design.md): muffle R/M,
 // tilt R/M, level R/M, freeze, bloom, span, whoosh. They need a set built with --gestures (RHYTHM / MELODIC groups).
@@ -35,7 +40,12 @@ function cursor(id){if(!cur)cur=new LiveAPI(null,'id '+id);else cur.id=Number(id
 function nameof(id){return String(scalar(cursor(id),'name'));}
 // Tracks by name from one pass over the set (ids; LiveAPI objects made only for tracks that are looked up).
 var tindex=null;
-function scantracks(){var all=ids(song.get('tracks')),r={};for(var i=0;i<all.length;i++){var n=nameof(all[i]);(r[n]=r[n]||[]).push(all[i]);}tindex=r;}
+function scantracks(){var all=ids(song.get('tracks')),r={};tpos={};for(var i=0;i<all.length;i++){var n=nameof(all[i]);(r[n]=r[n]||[]).push(all[i]);tpos[all[i]]=i;}tindex=r;}
+// The song each track called `name` belongs to: songs are laid out in order and every song has one `anchor` track
+// (DRUM FX for the drum stems, TEXTURE FX for the melodic side) above its own stems.
+function songsof(name,anchor){if(!tindex)scantracks();var l=tindex[name]||[],a=tindex[anchor]||[],r=[];
+  for(var i=0;i<l.length;i++){var n=-1;for(var j=0;j<a.length;j++)if(tpos[a[j]]<=tpos[l[i]])n++;r.push(n);}return r;}
+function tag(r,s){if(r)r.s=s;return r;}
 function tracks(name){if(!tindex)scantracks();var r=[],l=tindex[name]||[];for(var i=0;i<l.length;i++)r.push(api(l[i]));return r;}
 function device(t,cls){var ds=ids(t.get('devices'));for(var i=0;i<ds.length;i++)if(String(scalar(cursor(ds[i]),'class_name'))===cls)return api(ds[i]);return null;}
 // Every copy of a device lists its parameters in the same order: remember where a name was found and check only
@@ -49,7 +59,8 @@ function named(t,name){if(!t)return null;var ds=ids(t.get('devices'));for(var i=
 function mixer(t){return api(ids(t.get('mixer_device'))[0]);}
 function sends(t){return ids(mixer(t).get('sends'));}
 function volume(t){return ref(ids(mixer(t).get('volume'))[0]);}
-function put(p,v){if(!p)return;if(p instanceof Array){for(var i=0;i<p.length;i++)put(p[i],v);return;}if(last[p.id]!==undefined&&Math.abs(last[p.id]-v)<.001)return;p.a.set('value',v);last[p.id]=v;}
+function put(p,v){if(!p)return;if(p instanceof Array){for(var i=0;i<p.length;i++)put(p[i],v);return;}var own=p.s!==undefined;if(own&&win&&!win[p.s])return;
+  if(last[p.id]!==undefined&&Math.abs(last[p.id]-v)<.001)return;if(own){if(budget<=0){pending=1;return;}budget--;}p.a.set('value',v);last[p.id]=v;}
 function status(s){if(s!==label){label=s;outlet(0,'set',s);}}
 function sendlevel(u){if(u<=.0001)return 0;var db=20*Math.log(u)/Math.LN10;return Math.max(0,db>=-20?1+db/40:.5+(db+20)/60);}
 
@@ -101,30 +112,33 @@ function lap(stage){outlet(2,'/livemixer/log',stage,clock()-t0);}
 // OSC-silence easing never stall for the size of the step.
 var monoMs=0,lastWall=0;
 function clock(){var n=Date.now(),d=lastWall?n-lastWall:0;lastWall=n;monoMs+=d<0||d>5000?40:d;return monoMs;}
-function init(){t0=clock();try{
+function init(){t0=clock();budget=Infinity;win=null;songAt=-1;starts=[];try{
   if(retry){retry.cancel();retry=null;}
   if(task)task.cancel();try{restorehome();}catch(e){}
   song=new LiveAPI(null,'live_set');tindex=null;mix=null;refs={filter:[],cutoff:[],echo:[],bloom:[],snare:[],other:[],drums:[],drumhalo:[]};
   var texture=tracks('TEXTURE FX'),drums=tracks('DRUM FX'),vocals=tracks('VOCALS'),sn=tracks('02 Snare'),od=tracks('03 Other Drums'),dr=tracks('02 Drums'),i;
   if(!texture.length)throw new Error('No TEXTURE FX groups: build the set with scripts/ableton-stem-set.py');
+  var sD=songsof('DRUM FX','DRUM FX'),sSn=songsof('02 Snare','DRUM FX'),sOd=songsof('03 Other Drums','DRUM FX'),sDr=songsof('02 Drums','DRUM FX'),sV=songsof('VOCALS','TEXTURE FX');
   lap('tracks');
-  for(i=0;i<texture.length;i++){var f=param(device(texture[i],'AutoFilter2'),'Control');if(f)refs.filter.push(f);else{f=param(device(texture[i],'AutoFilter'),'Frequency');if(f)refs.cutoff.push({p:f,lo:Number(scalar(f.a,'min')),hi:Number(scalar(f.a,'max'))});}var ts=sends(texture[i]);if(ts.length>1){refs.echo.push(ref(ts[0]));refs.bloom.push(ref(ts[1]));}}
+  for(i=0;i<texture.length;i++){var f=tag(param(device(texture[i],'AutoFilter2'),'Control'),i);if(f)refs.filter.push(f);else{f=tag(param(device(texture[i],'AutoFilter'),'Frequency'),i);if(f)refs.cutoff.push({p:f,lo:Number(scalar(f.a,'min')),hi:Number(scalar(f.a,'max'))});}var ts=sends(texture[i]);if(ts.length>1){refs.echo.push(tag(ref(ts[0]),i));refs.bloom.push(tag(ref(ts[1]),i));}}
   lap('textures');
-  for(i=0;i<sn.length;i++){var s1=sends(sn[i]);if(s1.length)refs.snare.push(ref(s1[0]));}
-  for(i=0;i<od.length;i++){var s2=sends(od[i]);if(s2.length)refs.other.push(ref(s2[0]));}
-  for(i=0;i<dr.length;i++){var s3=sends(dr[i]);if(s3.length)refs.drums.push(ref(s3[0]));}
+  for(i=0;i<sn.length;i++){var s1=sends(sn[i]);if(s1.length)refs.snare.push(tag(ref(s1[0]),sSn[i]));}
+  for(i=0;i<od.length;i++){var s2=sends(od[i]);if(s2.length)refs.other.push(tag(ref(s2[0]),sOd[i]));}
+  for(i=0;i<dr.length;i++){var s3=sends(dr[i]);if(s3.length)refs.drums.push(tag(ref(s3[0]),sDr[i]));}
   // Palm up lifts the drums into the halo reverb: send B of every drum track (never the kick).
-  var dh=sn.concat(od,dr);for(i=0;i<dh.length;i++){var s4=sends(dh[i]);if(s4.length>1)refs.drumhalo.push(ref(s4[1]));}
+  var dh=sn.concat(od,dr),sh=sSn.concat(sOd,sDr);for(i=0;i<dh.length;i++){var s4=sends(dh[i]);if(s4.length>1)refs.drumhalo.push(tag(ref(s4[1]),sh[i]));}
   lap('drum sends');
-  mix=[];for(i=0;i<drums.length;i++){var dv=volume(drums[i]);mix.push({p:dv,home:Number(scalar(dv.a,'value')),sign:-1});}
-  for(i=0;i<texture.length;i++){var tv=volume(texture[i]);mix.push({p:tv,home:Number(scalar(tv.a,'value')),sign:1});}
+  mix=[];for(i=0;i<drums.length;i++){var dv=tag(volume(drums[i]),sD[i]);mix.push({p:dv,home:Number(scalar(dv.a,'value')),sign:-1});}
+  for(i=0;i<texture.length;i++){var tv=tag(volume(texture[i]),i);mix.push({p:tv,home:Number(scalar(tv.a,'value')),sign:1});}
   // Utility's gain is 'Output' in Live 12 and 'Gain' in Live 11: find which on the first song, then go straight to it.
   lap('volumes');
-  var gainname=null;mirror=[];for(i=0;i<vocals.length;i++){var u=device(vocals[i],'StereoGain'),g=gainname?param(u,gainname):null;if(!g){g=param(u,'Output');gainname=g?'Output':null;}if(!g){g=param(u,'Gain');gainname=g?'Gain':null;}if(g)mirror.push(g);}
+  var gainname=null;mirror=[];for(i=0;i<vocals.length;i++){var u=device(vocals[i],'StereoGain'),g=gainname?param(u,gainname):null;if(!g){g=param(u,'Output');gainname=g?'Output':null;}if(!g){g=param(u,'Gain');gainname=g?'Gain':null;}if(g)mirror.push(tag(g,sV[i]));}
   lap('vocals');
   var cs=ids(song.get('cue_points')),cues=[];zones=[];
   for(i=0;i<cs.length;i++){var c=cursor(cs[i]);cues.push({t:Number(scalar(c,'time')),name:String(scalar(c,'name'))});}
   cues.sort(function(a,b){return a.t-b.t;});
+  for(i=0;i<cues.length;i++)if(cues[i].name.indexOf('SONG:')===0)starts.push(cues[i].t);
+  if(starts.length!==texture.length)starts=[];  // locators that don't match the songs: write every song (budgeted)
   for(i=0;i<cues.length;i++)if(cues[i].name.indexOf('FX QUIET')===0){var end=Infinity;for(var j=i+1;j<cues.length;j++)if(cues[j].t>cues[i].t&&cues[j].name.indexOf('SONG:')!==0){end=cues[j].t;break;}zones.push([cues[i].t,end]);}
   // Gesture devices: on the RHYTHM / MELODIC groups by class, on Main by name (it has two Utilities and two Auto Filters).
   lap('cues');
@@ -146,7 +160,7 @@ function init(){t0=clock();try{
   var found=gref?[gref.muffle[0],gref.muffle[1],gref.lo[0],gref.hi[1],gref.level[0],gref.level[1],gref.frozen,gref.mix,gref.whoosh,gref.span,gref.lfoAmount,gref.lfoRate].filter(function(p){return p;}).length:0;
   lap('gestures');
   status('Ready · '+texture.length+' songs · vocals '+mirror.length+'/'+vocals.length+(gref?' · gestures '+found+'/12':'')+(zones.length?' · '+zones.length+' FX QUIET':''));
-  lap('ready');
+  lap('ready');budget=BUDGET;
 }catch(e){refs=null;mix=null;status('Setup: '+e.message+' · retrying in 5 s');error(e+'\n');
   // Unattended: a set that is still loading (or a transient API error) gets another try instead of staying dead.
   if(retry)retry.cancel();retry=new Task(init,this);retry.schedule(5000);}}
@@ -164,12 +178,14 @@ function values(){var v=arrayfromargs(arguments);oscOwned=1;lastValues=clock();f
   for(var j=0;j<GHOME.length;j++){var x=Number(v[5+j]);gest[j]=v.length>5+j&&x===x?Math.max(0,Math.min(1,x)):GHOME[j];}steady();if(!quiet)status('Living · following the box');}
 function control(index,value){oscOwned=0;var k=Number(index);if(k>0&&k<4)manual[k]=Math.max(0,Math.min(1,Number(value)));steady();status('Manual · combine gently');}
 function auto(v){outlet(1,'auto',0);}
-function reset(){oscOwned=0;manual=[0,0,0,0];balance=.5;gest=GHOME.slice();for(var i=0;i<4;i++)outlet(1,'dial'+i,0);apply(manual);applygestures(1);restorehome();applied='';status('Dry · tails fade naturally');}
+function reset(){budget=Infinity;oscOwned=0;manual=[0,0,0,0];balance=.5;gest=GHOME.slice();for(var i=0;i<4;i++)outlet(1,'dial'+i,0);apply(manual);applygestures(1);restorehome();applied='';status('Dry · tails fade naturally');}
 
 function tick(){try{
   var now=clock(),dt=lastTick?Math.min(.5,Math.max(0,(now-lastTick)/1000)):0;lastTick=now;
-  if(!song)return;
+  if(!song)return;budget=BUDGET;if(pending){pending=0;applied='';}  // writes left over (budget spent): carry on
   var t=Number(scalar(song,'current_song_time')),playing=Number(scalar(song,'is_playing'))?1:0;
+  if(starts.length){var k=0;while(k+1<starts.length&&starts[k+1]<=t)k++;
+    if(k!==songAt){songAt=k;win={};win[k]=1;win[k-1]=1;win[(k+1)%starts.length]=1;applied='';}}  // songs coming into earshot catch up
   // The last value is "bound": 1 once setup found the set, so the controls page can show "Live connected".
   // The first song's Vocal Presence gain (CC20's target) is read once per tick: mirrored to every other song, and
   // reported in the state's "amount" slot (raw Utility gain, -1 when there is none) so the page can show what Live has.
@@ -187,6 +203,6 @@ function tick(){try{
   if(quiet>0)status('FX QUIET · the song leads');else if(label==='FX QUIET · the song leads')status('Living · following the box');
 }catch(e){status('Setup: '+e.message);}}
 
-function notifydeleted(){if(task)task.cancel();try{apply([0,0,0,0]);}catch(e){}try{gest=GHOME.slice();applygestures(1);if(gref){put(gref.mix,0);put(gref.frozen,0);}}catch(e){}try{restorehome();}catch(e){}}
+function notifydeleted(){if(task)task.cancel();budget=Infinity;win=null;try{apply([0,0,0,0]);}catch(e){}try{gest=GHOME.slice();applygestures(1);if(gref){put(gref.mix,0);put(gref.frozen,0);}}catch(e){}try{restorehome();}catch(e){}}
 // Read-only status for local verification.
 function snapshot(){try{var v={playing:Number(scalar(song,'is_playing')),beat:Number(scalar(song,'current_song_time')),tempo:Number(scalar(song,'tempo')),status:label,ready:!!refs,balance:balance,quiet:quiet,zones:zones,songs:refs?refs.filter.length:0,mirrors:mirror.length};var f=new File('/tmp/livemixer-living-fx-state.json','write','TEXT');f.eof=0;f.writestring(JSON.stringify(v));f.close();}catch(e){error(e+'\n');}}
