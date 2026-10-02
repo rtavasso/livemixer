@@ -1,7 +1,11 @@
 export const names = ['vocals', 'space', 'stutter', 'gain'] as const;
 export type Control = typeof names[number];
 export type Controls = Record<Control, number>;
-export const defaults: Controls = { vocals: 1, space: 0, stutter: 0, gain: 1 };
+/**
+ * Home for every mode: vocals off (instrumental), dry, no repeat, unity gain. Nothing automatic ever sends more
+ * vocals than this; only the operator's own slider (Manual) or a fresh hand (Living / Simulation) raises them.
+ */
+export const defaults: Readonly<Controls> = Object.freeze({ vocals: 0, space: 0, stutter: 0, gain: 1 });
 export interface Source { value: number; min: number; max: number }
 export function normalize(source: Source | undefined, fallback: number): number {
   if (!source || ![source.value, source.min, source.max].every(Number.isFinite) || source.max <= source.min) return fallback;
@@ -22,4 +26,33 @@ export function musicRelay(state: unknown): { direction: 'inbound'; message: { t
   const { beat, playing } = state as { beat?: unknown; playing?: unknown };
   if (typeof beat !== 'number' || !Number.isFinite(beat)) return null;
   return { direction: 'inbound', message: { type: 'music', beat, playing: Boolean(playing) } };
+}
+
+/** What the controls page shows for a bridge status message. Every field may be absent (an older bridge). */
+export interface BridgeStatusView {
+  text: string;
+  /** Live connected, MIDI out open, and this window in charge. */
+  ready: boolean;
+  /** This window's ownership, carried over from earlier statuses when the field is absent. */
+  owner: boolean | null;
+  /** Whether Live's Vocal Presence is audible (Living FX `state.amount` > −0.5), or null when not reported. */
+  vocalsInLive: boolean | null;
+}
+
+/** Utility Gain (Live 11, −1..1, 0 = 0 dB) above this counts as vocals audible. */
+export const VOCALS_AUDIBLE_GAIN = -.5;
+
+export function bridgeStatus(message: unknown, previousOwner: boolean | null = null): BridgeStatusView {
+  const m = (message && typeof message === 'object' ? message : {}) as { live?: unknown; midi?: unknown; midiPort?: unknown; owner?: unknown; state?: unknown };
+  const owner = typeof m.owner === 'boolean' ? m.owner : previousOwner;
+  const midi = m.midi !== false; // absent (older bridge) counts as open
+  const live = Boolean(m.live);
+  const amount = m.state && typeof m.state === 'object' ? (m.state as { amount?: unknown }).amount : undefined;
+  const vocalsInLive = typeof amount === 'number' && Number.isFinite(amount) ? amount > VOCALS_AUDIBLE_GAIN : null;
+  const port = typeof m.midiPort === 'string' && m.midiPort ? m.midiPort : 'unknown';
+  const text = owner === false ? 'Another control window is in charge'
+    : !midi ? `MIDI port not available: ${port}`
+    : live ? 'Live connected'
+    : 'Bridge connected · waiting for Live device';
+  return { text, ready: live && midi && owner !== false, owner, vocalsInLive };
 }

@@ -566,7 +566,7 @@
      <UpperRangeNote Value="-1" />
      <ControllerMapMode Value="0" />
     </KeyMidi>
-    <Manual Value="1" />
+    <Manual Value="0" />
 			<MidiControllerRange>
 				<Min Value="0" />
 				<Max Value="1" />

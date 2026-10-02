@@ -59,13 +59,26 @@ describe('living governor', () => {
     expect(wild.space).toBeLessThan(calm.space * .35);
   });
 
-  it('opens vocals in under half a second and fades them over about 2.5 s after withdrawal', () => {
+  it('opens vocals within about 0.7 s (0.3 s hold, 0.4 s rise) and fades them over about 2.5 s after withdrawal', () => {
     const g = new Governor();
-    expect(run(g, { presence: 1 }, .45).vocals).toBe(1);
+    expect(run(g, { presence: 1 }, .25).vocals).toBe(0);  // still inside the hold
+    expect(run(g, { presence: 1 }, .5).vocals).toBe(1);   // 0.75 s in all
     run(g, { presence: 0 }, 2);
     expect(g.value.vocals).toBeGreaterThan(.1);
     run(g, { presence: 0 }, 1);
     expect(g.value.vocals).toBe(0);
+  });
+
+  it('never opens vocals for presence that does not hold for gateHold, and re-opens at once while still releasing', () => {
+    const g = new Governor();
+    for (let i = 0; i < 5; i++) { run(g, { presence: 1 }, .25); run(g, { presence: 0 }, .1); }
+    expect(g.value.vocals).toBe(0);
+    run(g, { presence: .3 }, .2); run(g, { presence: .1 }, DT); run(g, { presence: .3 }, .2);  // a dip below gateLow restarts the hold
+    expect(g.value.vocals).toBe(0);
+    run(g, { presence: 1 }, 1); expect(g.value.vocals).toBe(1);
+    run(g, { presence: 0 }, .5); const releasing = g.value.vocals; expect(releasing).toBeGreaterThan(0);
+    run(g, { presence: 1 }, DT); expect(g.value.vocals).toBeGreaterThan(releasing);  // already open: no new hold
+    expect(new Governor({ gateHold: 0 }).step({ presence: 1 }, DT).vocals).toBeGreaterThan(0);
   });
 
   it('drifts every axis home over a few seconds when the hand leaves', () => {

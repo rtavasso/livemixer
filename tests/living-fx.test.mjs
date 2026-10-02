@@ -179,7 +179,18 @@ test('FX QUIET holds the gestures at home', () => {
 test('reports the song position for the simulation page', () => {
   const set = liveSet(2, []); const d = load(set);
   d.ctx.init(); set.song.current_song_time = 12.5; d.tick(120);
-  assert.deepEqual(d.out.filter(a => a[0] === 2).at(-1), [2, '/livemixer/state', 0, 0, 0, 12.5, 1, 0, 1]);  // bound: set found
+  // amount = the first song's Vocal Presence gain as Live has it (.3 in this set); bound: set found
+  assert.deepEqual(d.out.filter(a => a[0] === 2).at(-1), [2, '/livemixer/state', 0, 0, 0, 12.5, 1, .3, 1]);
+});
+
+test('a wall clock stepping backwards never stalls the state reports', () => {
+  const set = liveSet(1, []); const d = load(set);
+  d.ctx.init(); d.tick(120);
+  const states = () => d.out.filter(a => a[0] === 2 && a[1] === '/livemixer/state').length;
+  const before = states();
+  d.advance(-3600 * 1000);  // the clock jumps back an hour (time change, NTP after wake)
+  for (let i = 0; i < 10; i++) d.tick(40);
+  assert.ok(states() - before >= 3, 'still reporting about every 100 ms');
 });
 
 test('FX QUIET holds home until the next non-SONG cue and eases back after', () => {

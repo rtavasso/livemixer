@@ -138,6 +138,58 @@ class BridgeTests(Quiet):
         bridge.tick(1.05); self.assertIn([0xBF,20,127], midi.messages)
         count = len(midi.messages); bridge.tick(1.1); self.assertEqual(len(midi.messages), count)  # nothing new
 
+    def test_mix_is_resent_when_living_fx_becomes_bound(self):
+        midi = Midi(); bridge = module.Bridge(midi, UDP())
+        bridge.tick(0); self.assertEqual(len(midi.messages), 3)  # sent before the set was open: lost
+        bridge.receive_state(module.osc_state(state_packet(bound=0)), .5); self.assertEqual(len(midi.messages), 3)
+        bridge.receive_state(module.osc_state(state_packet(bound=1)), .6)
+        self.assertEqual(midi.messages[3:], [[0xBF,20,0],[0xBF,21,0],[0xBF,23,127]])
+        bridge.receive_state(module.osc_state(state_packet(bound=1)), .7); self.assertEqual(len(midi.messages), 6)  # still bound
+        bridge.receive_state(module.osc_state(state_packet(bound=1)), 5)  # stale (Live went quiet), then back
+        self.assertEqual(len(midi.messages), 9)
+
+    def test_mix_is_resent_every_two_seconds(self):
+        midi = Midi(); bridge = module.Bridge(midi, UDP())
+        bridge.receive('owner', dict(type='controls', vocals=.5, space=1, stutter=0, gain=1), 0); bridge.tick(0)
+        self.assertEqual(len(midi.messages), 3)
+        for t in range(1, 41): bridge.receive('owner', dict(type='controls', vocals=.5, space=1, stutter=0, gain=1), t * .05); bridge.tick(t * .05)
+        self.assertEqual(len(midi.messages), 6)  # one full resend at 2 s, nothing else
+        self.assertEqual(midi.messages[3:], [[0xBF,20,64],[0xBF,21,127],[0xBF,23,127]])
+        bridge.receive('owner', dict(type='controls', vocals=.5, space=1, stutter=0, gain=1), 4); bridge.tick(4)
+        self.assertEqual(len(midi.messages), 9)
+
+    def test_status_reports_midi_owner_and_passes_state_through(self):
+        class Port(Midi): name, is_open = 'IAC Driver LiveMixer', False
+        midi = Port(); bridge = module.Bridge(midi, UDP()); first, second = object(), object()
+        status = bridge.status(0, first)
+        self.assertEqual(status, dict(type='status', live=False, active=False, state=None, owner=False,
+                                      midi=False, midiPort='IAC Driver LiveMixer'))
+        midi.is_open = True; bridge.receive(first, dict(type='controls', **module.DEFAULTS), 1)
+        state = module.osc_state(state_packet(amount=-.25, bound=1)); bridge.receive_state(state, 1)
+        self.assertEqual(state['amount'], -.25)
+        status = bridge.status(1.1, first)
+        self.assertEqual((status['owner'], status['active'], status['live'], status['midi']), (True, True, True, True))
+        self.assertEqual(status['state']['amount'], -.25)
+        self.assertFalse(bridge.status(1.1, second)['owner']); self.assertFalse(bridge.status(1.1)['owner'])
+        self.assertIsNone(bridge.status(3, first)['state'])  # stale
+        self.assertEqual(module.Bridge(Midi(), UDP()).status(0)['midiPort'], None)
+
+    def test_pump_sends_each_client_its_own_owner_flag(self):
+        import json
+        bridge = module.Bridge(Midi(), UDP())
+        class Client:
+            def __init__(self): self.messages = []
+            async def send(self, message): self.messages.append(json.loads(message))
+        first, second = Client(), Client()
+        bridge.receive(first, dict(type='controls', **module.DEFAULTS), 1e9)  # never times out during the test
+        async def scenario():
+            stop = asyncio.Event()
+            asyncio.get_running_loop().call_later(.1, stop.set)
+            await asyncio.wait_for(module.pump(bridge, {first, second}, stop, period=.005), 2)
+        asyncio.run(scenario())
+        self.assertTrue(first.messages and all(m['owner'] for m in first.messages))
+        self.assertTrue(second.messages and not any(m['owner'] for m in second.messages))
+
 class MidiPortTests(Quiet):
     def setUp(self):
         super().setUp(); self.ports, self.outs = [], []
@@ -238,5 +290,6 @@ HOME = (0, 0, .5, .5, .5, .5, 0, 0, .5, 0, 0)
 
 def fx_sends(udp): return [m for m, a in udp.messages if a == ('127.0.0.1', 7403)]
 def fx_packet(*values): return module.osc_packet('/fx/values', *values)
+def state_packet(amount=0., bound=1.): return module.osc_packet('/livemixer/state', 0., 0., 0., 1., 1., amount, bound)
 
 if __name__ == '__main__': unittest.main()

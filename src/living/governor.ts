@@ -28,6 +28,11 @@ export interface GovernorConfig {
   /** Presence at which the vocal gate starts to open / is fully open. */
   gateLow: number;
   gateHigh: number;
+  /**
+   * Presence must stay at or above gateLow this long (s) before closed vocals may start opening, so a tracking
+   * phantom (a few frames of noise) never opens them. Once they are open (above 0), they follow presence at once.
+   */
+  gateHold: number;
   /** Vocal gate ramp times (s, full scale, linear). */
   vocalRise: number;
   vocalRelease: number;
@@ -46,7 +51,7 @@ export interface GovernorConfig {
 
 export const DEFAULT_GOVERNOR: GovernorConfig = {
   baseAllowance: .35, agitationPull: .7, agitationTau: .6,
-  gateLow: .15, gateHigh: .5, vocalRise: .4, vocalRelease: 2.5,
+  gateLow: .15, gateHigh: .5, gateHold: .3, vocalRise: .4, vocalRelease: 2.5,
   arrangementTau: 1.5, depthTau: .8, spaceRise: 2.5, spaceFall: 3,
   arrangementCeiling: 1, depthCeiling: 1, spaceCeiling: 1,
   swarmRise: .08, swarmFall: .5,
@@ -71,6 +76,8 @@ export class Governor {
   readonly config: GovernorConfig;
   private axes: Axes;
   private agitation = 0;
+  /** Seconds presence has held at or above gateLow without a break. */
+  private gateHeld = 0;
   /**
    * The scene's turbulence as a sound of its own (fx `swarm`): fast attack, gentle release, at full strength and not
    * gated by the hand, so a flock still swirling after the hand leaves is heard swirling. Home on release.
@@ -89,7 +96,7 @@ export class Governor {
   get value(): Axes { return { ...this.axes }; }
 
   /** Return to home at once (the caller has released Live, which fades on its side). */
-  release(): Axes { this.axes = this.home(); this.agitation = 0; this.swarm = 0; return this.value; }
+  release(): Axes { this.axes = this.home(); this.agitation = 0; this.gateHeld = 0; this.swarm = 0; return this.value; }
 
   /** Advance by dtSeconds toward the state the signals ask for. Missing or invalid signals count as absent. */
   step(signals: LivingSignals | null | undefined, dtSeconds: number): Axes {
@@ -109,7 +116,8 @@ export class Governor {
     const allowance = unit((base + (1 - base) * closeness) * (1 - unit(c.agitationPull) * this.agitation));
 
     const a = this.axes;
-    const gate = smoothstep(c.gateLow, c.gateHigh, presence);
+    this.gateHeld = presence >= c.gateLow && presence > 0 ? this.gateHeld + dt : 0;
+    const gate = a.vocals > 0 || this.gateHeld >= c.gateHold - 1e-9 ? smoothstep(c.gateLow, c.gateHigh, presence) : 0;
     const rate = gate > a.vocals ? 1 / Math.max(1e-3, c.vocalRise) : 1 / Math.max(1e-3, c.vocalRelease);
     a.vocals = gate > a.vocals ? Math.min(gate, a.vocals + rate * dt) : Math.max(gate, a.vocals - rate * dt);
 

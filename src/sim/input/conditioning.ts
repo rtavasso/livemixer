@@ -2,9 +2,11 @@
  * Turns raw, jittery, intermittently missing observations into stable
  * `HandState`s the simulations can trust.
  *
- *  - Presence hysteresis: a hand must be seen for `enterMs` before it exists and
- *    is kept for `leaveMs` after the last observation, so a dropped frame does
- *    not make a curtain snap back or a light trail break.
+ *  - Presence hysteresis: a hand must be observed continuously (no gap longer
+ *    than `confirmGapMs`) for `enterMs` before it exists, so a few frames of
+ *    tracking noise never become a hand, and is kept for `leaveMs` after the
+ *    last observation, so a dropped frame does not make a curtain snap back or
+ *    a light trail break.
  *  - One-Euro filtering of position: minimal lag when the hand moves, minimal
  *    jitter when it rests. Velocity is derived from the filtered position.
  *  - Deterministic: all time comes in through arguments, never from Date/performance.
@@ -18,8 +20,13 @@ import type { Box3, Capsule, HandObservation, HandState, InputFrame } from './ty
 export const trackerSettingsSchema = z.object({
   /** Observations below this confidence are ignored. */
   minConfidence: z.number().min(0).max(1).default(.3),
-  /** Continuous observation required before a hand is present. */
-  enterMs: z.number().min(0).default(60),
+  /**
+   * Continuous observation required before a hand is present: the span from the first to the latest observation of
+   * an unbroken run. 150 ms rejects stereo-depth noise blobs (a few frames) while a real hand still appears at once.
+   */
+  enterMs: z.number().min(0).default(150),
+  /** Largest gap between observations that still counts as continuous while a hand is being confirmed (ms). */
+  confirmGapMs: z.number().positive().default(100),
   /** Grace period without observations before a hand leaves. */
   leaveMs: z.number().min(0).default(220),
   /** Frames older than this on arrival are discarded. */
@@ -200,6 +207,12 @@ export class HandTracker {
       return;
     }
     const gapMs = now - track.lastSeenMs;
+    if (!track.present && gapMs > s.confirmGapMs) {
+      // An unconfirmed track whose run broke starts over: confirmation needs continuous observation.
+      this.tracks.delete(o.id);
+      this.observe(o, now);
+      return;
+    }
     const jump = Math.hypot(o.position.x - track.position.x, o.position.y - track.position.y, o.position.z - track.position.z);
     if (gapMs > Math.max(s.teleportGapMs, 2.5 * track.intervalMs) && jump > s.teleportDistance) {
       track.filters.forEach((f, i) => f.reset([o.position.x, o.position.y, o.position.z][i]));
@@ -244,9 +257,10 @@ export class HandTracker {
     for (const [id, t] of this.tracks) {
       const sinceSeen = now - t.lastSeenMs;
       if (sinceSeen > s.leaveMs) { this.tracks.delete(id); continue; }
-      // An unconfirmed track (seen once) gets no leave grace: a single noise blob must not become a hand.
-      if (!t.present && sinceSeen > Math.max(2 * s.enterMs, 3 * t.intervalMs)) { this.tracks.delete(id); continue; }
-      if (!t.present && now - t.firstSeenMs >= s.enterMs && t.lastSeenMs > t.firstSeenMs) t.present = true;
+      // An unconfirmed track gets no leave grace: once its run of observations breaks it is forgotten, so a few
+      // frames of noise (however close together) never become a hand.
+      if (!t.present && sinceSeen > s.confirmGapMs) { this.tracks.delete(id); continue; }
+      if (!t.present && t.lastSeenMs - t.firstSeenMs >= s.enterMs && t.lastSeenMs > t.firstSeenMs) t.present = true;
       if (!t.present) continue;
       // Decay velocity only when the hand is overdue relative to its own observation rate, so a
       // 30 Hz source sampled by a 60 Hz display keeps its true speed while a real dropout coasts to rest.

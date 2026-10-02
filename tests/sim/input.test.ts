@@ -70,15 +70,28 @@ describe('one euro filter', () => {
 });
 
 describe('hand tracker', () => {
-  it('requires enter time, keeps a hand through a dropout, then lets it leave', () => {
+  it('requires continuous enter time, keeps a hand through a dropout, then lets it leave', () => {
+    expect(DEFAULT_TRACKER_SETTINGS.enterMs).toBe(150);
     const t = new HandTracker(SCREEN_MAPPING);
-    t.ingest(frame(0, 0, .5, .5));
-    expect(t.tick(0).hands).toHaveLength(0);
-    t.ingest(frame(1, 30, .5, .5)); expect(t.tick(30).hands).toHaveLength(0);
-    t.ingest(frame(2, 70, .5, .5)); expect(t.tick(70).hands).toHaveLength(1);
+    for (let n = 0; n <= 4; n++) { t.ingest(frame(n, n * 30, .5, .5)); expect(t.tick(n * 30).hands).toHaveLength(0); } // 0..120 ms
+    t.ingest(frame(5, 150, .5, .5)); expect(t.tick(150).hands).toHaveLength(1);
     // Dropout shorter than leaveMs keeps the hand and reports staleness.
-    const held = t.tick(200); expect(held.hands).toHaveLength(1); expect(held.hands[0].staleMs).toBe(130);
-    expect(t.tick(70 + DEFAULT_TRACKER_SETTINGS.leaveMs + 1).hands).toHaveLength(0);
+    const held = t.tick(280); expect(held.hands).toHaveLength(1); expect(held.hands[0].staleMs).toBe(130);
+    expect(t.tick(150 + DEFAULT_TRACKER_SETTINGS.leaveMs + 1).hands).toHaveLength(0);
+  });
+  it('restarts confirmation when the observations break off, however long ago the first one was', () => {
+    const t = new HandTracker(SCREEN_MAPPING);
+    let seq = 0;
+    // Short bursts of noise 120 ms apart: each burst is continuous but too short, and the gaps break the run.
+    for (let burst = 0; burst < 6; burst++) {
+      const start = burst * 200;
+      for (let at = start; at <= start + 80; at += 20) { t.ingest(frame(seq++, at, .5, .5)); expect(t.tick(at).hands).toHaveLength(0); }
+      expect(t.tick(start + 150).hands).toHaveLength(0);
+    }
+    // A single dropped frame (66 ms gap at 30 fps) does not break the run.
+    const c = new HandTracker(SCREEN_MAPPING);
+    for (const at of [0, 33, 99, 132, 165]) { c.ingest(frame(seq++, at, .5, .5)); c.tick(at); }
+    expect(c.tick(165).hands).toHaveLength(1);
   });
   it('restarts a hand that reappears far away after a gap with zero velocity (teleport guard)', () => {
     const t = new HandTracker(SCREEN_MAPPING);
@@ -113,9 +126,8 @@ describe('hand tracker', () => {
     for (let at = 0; at <= 1000; at += 16) { t.ingest(frame(seq++, at, at / 1000, .5)); state = t.tick(at); }
     expect(state.hands[0].velocity.x).toBeGreaterThan(.7); expect(state.hands[0].velocity.x).toBeLessThan(1.3);
     expect(state.presence).toBeGreaterThan(.95); expect(state.activity).toBeGreaterThan(.3);
-    t.ingest({ ...frame(seq++, 1016, .9, .5), hands: [{ id: 1, position: { x: .9, y: .5, z: .5 }, confidence: 1 }, { id: 7, position: { x: .1, y: .5, z: .5 }, confidence: 1 }] });
-    t.ingest({ ...frame(seq++, 1100, .9, .5), hands: [{ id: 1, position: { x: .9, y: .5, z: .5 }, confidence: 1 }, { id: 7, position: { x: .1, y: .5, z: .5 }, confidence: 1 }] });
-    expect(t.tick(1100).hands.map(h => h.id)).toEqual([1, 7]);
+    for (let at = 1016; at <= 1200; at += 16) t.ingest({ ...frame(seq++, at, .9, .5), hands: [{ id: 1, position: { x: .9, y: .5, z: .5 }, confidence: 1 }, { id: 7, position: { x: .1, y: .5, z: .5 }, confidence: 1 }] });
+    expect(t.tick(1200).hands.map(h => h.id)).toEqual([1, 7]);
   });
   it('reports true speed for a 30 Hz source sampled by a 60 Hz display, and coasts to rest on a dropout', () => {
     const t = new HandTracker(SCREEN_MAPPING);

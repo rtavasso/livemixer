@@ -35,6 +35,7 @@ FX_HEARTBEAT = .25
 RETRY = 2.          # seconds between attempts to open a MIDI port or bind a busy network port
 PORT_CHECK = 5.     # seconds between checks that the open MIDI port still exists
 LOG_INTERVAL = 60.  # a repeating failure is logged at most once per this many seconds
+RESEND = 2.         # seconds between full resends of the mix CCs, so a CC Live missed (set not open yet) is corrected
 
 
 class Log:
@@ -89,7 +90,11 @@ def osc_packet(address, *values):
 
 
 def osc_state(packet):
-    """Decode the fixed seven-number status packet emitted by our Max device."""
+    """Decode the fixed seven-number status packet emitted by our Max device.
+
+    Slots: repeat, onLeft, offLeft, beat, playing, amount, bound. `amount` carries Live's current Vocal Presence gain
+    as the raw parameter value (Live 11 Utility Gain, -1..1, roughly 35 dB per unit: 0 = 0 dB, -1 = -inf); older
+    devices send something else there. The bridge passes every slot through unchanged in status()["state"]."""
     def string(offset):
         end = packet.index(0, offset)
         return packet[offset:end].decode(), (end + 4) & ~3
@@ -180,6 +185,7 @@ class Bridge:
         self.last_controls = 0.
         self.value = self.home.copy()
         self.state, self.last_state = None, 0.
+        self.last_resend = None
         self.fx, self.last_fx = None, 0.
 
     def send_udp(self, packet, port):
@@ -228,9 +234,24 @@ class Bridge:
         if fx is None: self.release_fx()
         elif fx != self.fx: self.fx = fx; self.send_fx(now)
 
+    def live(self, now):
+        """Living FX is bound to the set and its status is fresh."""
+        return bool(self.state is not None and now - self.last_state < TIMEOUT and self.state.get("bound"))
+
+    def receive_state(self, state, now):
+        """A /livemixer/state packet. When Living FX becomes bound (Live just opened the set, or came back after
+        going quiet) the whole mix is sent again at once: CCs sent before the set was open were lost."""
+        was_live = self.live(now)
+        self.state, self.last_state = state, now
+        if not was_live and self.live(now):
+            self.last_midi.clear(); self.send_mix()
+
     def tick(self, now):
         poll = getattr(self.midi, "poll", None)
         if poll is not None and poll(): self.last_midi.clear()  # port (re)opened: tell Live everything again
+        if self.last_resend is None: self.last_resend = now
+        elif now - self.last_resend >= RESEND - 1e-6:
+            self.last_resend = now; self.last_midi.clear()  # a lost CC is never left uncorrected for long
         if self.owner is not None:
             if now - self.last_controls >= TIMEOUT:
                 LOG("controls went quiet; releasing to the fail-safe mix")
@@ -240,10 +261,13 @@ class Bridge:
                 if self.fx is not None and now - self.last_fx >= FX_HEARTBEAT - 1e-6: self.send_fx(now)
         self.send_mix()
 
-    def status(self, now):
+    def status(self, now, client=None):
+        """Status for one connection: `owner` says whether `client` is the controls owner."""
         fresh = self.state is not None and now - self.last_state < TIMEOUT
-        return {"type": "status", "live": bool(fresh and self.state["bound"]),
-                "active": self.owner is not None, "state": self.state if fresh else None}
+        return {"type": "status", "live": self.live(now),
+                "active": self.owner is not None, "state": self.state if fresh else None,
+                "owner": client is not None and self.owner is client,
+                "midi": bool(getattr(self.midi, "is_open", True)), "midiPort": getattr(self.midi, "name", None)}
 
 
 def install_signal_handlers(loop, stop):
@@ -266,18 +290,18 @@ def install_signal_handlers(loop, stop):
 
 
 async def pump(bridge, clients, stop, period=.05):
-    """The 20 Hz loop: ticks the bridge and sends status every other tick until `stop` is set. Never raises."""
+    """The 20 Hz loop: ticks the bridge and sends each client its status every other tick until `stop` is set.
+    Never raises."""
     count = 0
     while not stop.is_set():
         now = time.monotonic(); count += 1
         try: bridge.tick(now)
         except Exception as error: LOG.every("tick", f"tick failed: {error!r}")
-        if count % 2 == 0 and clients:
-            try: message = json.dumps(bridge.status(now))
-            except Exception as error: message = None; LOG.every("status", f"status failed: {error!r}")
-            for connection in list(clients) if message else ():
-                try: await connection.send(message)
-                except Exception: clients.discard(connection)
+        for connection in list(clients) if count % 2 == 0 else ():
+            try: message = json.dumps(bridge.status(now, connection))
+            except Exception as error: LOG.every("status", f"status failed: {error!r}"); continue
+            try: await connection.send(message)
+            except Exception: clients.discard(connection)
         await asyncio.sleep(period)
 
 
@@ -307,7 +331,9 @@ async def run(port, midi_port, fail_safe="living"):
         def datagram_received(self, data, addr):
             if addr[0] != "127.0.0.1": return
             state = osc_state(data)
-            if state is not None: bridge.state, bridge.last_state = state, time.monotonic()
+            if state is None: return
+            try: bridge.receive_state(state, time.monotonic())
+            except Exception as error: LOG.every("state", f"status packet failed: {error!r}")
 
         def error_received(self, error):
             LOG.every("udp-7401", f"UDP 7401: {error!r}")

@@ -31,8 +31,8 @@ describe('solid hand from the Leap skeleton', () => {
   it('flows through the mapping and tracker, riding on the smoothed position', () => {
     const t = new HandTracker(LEAP_MAPPING);
     const obs = leapFrameToHands(parseLeapMessage(realFrame)!, DEFAULT_LEAP_BOX);
-    for (let i = 0; i < 12; i++) { t.ingest({ source: 'leap', sequence: i, observedAtMs: i * 9, receivedAtMs: i * 9, hands: obs }); t.tick(i * 9); }
-    const h = t.tick(110).hands[0];
+    for (let i = 0; i < 20; i++) { t.ingest({ source: 'leap', sequence: i, observedAtMs: i * 9, receivedAtMs: i * 9, hands: obs }); t.tick(i * 9); }
+    const h = t.tick(180).hands[0];
     expect(h.capsules.length).toBe(obs[0].capsules!.length);
     // A still hand: smoothed == raw, so the capsules are exactly the mapped ones.
     const mapped = mapCapsule(LEAP_MAPPING, obs[0].capsules![0]);

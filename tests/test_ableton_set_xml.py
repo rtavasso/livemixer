@@ -186,6 +186,13 @@ class LivingMixXmlTest(MixXmlTest):
             if t.find("TrackGroupId").get("Value") != "-1":
                 self.assertEqual(t.find("DeviceChain/AudioOutputRouting/Target").get("Value"), "AudioOut/GroupTrack", name(t))
 
+    def test_vocals_open_silent_until_cc20_arrives(self):
+        # Live keeps a device's saved value until the first CC arrives; a set saved at full sang with an empty box.
+        gains = [d.find("Gain/Manual").get("Value") for t in self.live_set.find("Tracks") if name(t) == "VOCALS"
+                 for d in t.iter("StereoGain")]
+        self.assertTrue(gains)
+        self.assertEqual(set(gains), {"0"})
+
     def test_group_devices_and_one_vocal_mapping(self):
         tracks = list(self.live_set.find("Tracks"))
         texture = [t for t in tracks if name(t) == "TEXTURE FX"]

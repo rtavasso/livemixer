@@ -92,8 +92,13 @@ function quietzone(t){var q=0;for(var i=0;i<zones.length;i++){var z=zones[i];if(
 
 var retry=null,t0=0;
 // Setup timing to UDP 7401 (/livemixer/log stage ms) so a slow setup in a large set can be seen from outside Live.
-function lap(stage){outlet(2,'/livemixer/log',stage,Date.now()-t0);}
-function init(){t0=Date.now();try{
+function lap(stage){outlet(2,'/livemixer/log',stage,clock()-t0);}
+// A clock that only moves forward: the wall clock's step since the last reading, but a step backwards (a manual time
+// change, an NTP correction after waking) or a jump over 5 s counts as one 40 ms tick, so the state reports and the
+// OSC-silence easing never stall for the size of the step.
+var monoMs=0,lastWall=0;
+function clock(){var n=Date.now(),d=lastWall?n-lastWall:0;lastWall=n;monoMs+=d<0||d>5000?40:d;return monoMs;}
+function init(){t0=clock();try{
   if(retry){retry.cancel();retry=null;}
   if(task)task.cancel();try{restorehome();}catch(e){}
   song=new LiveAPI(null,'live_set');tindex=null;mix=null;refs={filter:[],cutoff:[],echo:[],bloom:[],snare:[],other:[],drums:[],drumhalo:[]};
@@ -151,19 +156,22 @@ var SCALES=['Gain','Frequency','1 Frequency A','4 Frequency A','Stereo Width','D
 function dumpscales(t,label){if(!t)return;var ds=ids(t.get('devices'));for(var i=0;i<ds.length;i++){var d=api(ds[i]),ps=ids(d.get('parameters'));for(var j=0;j<ps.length;j++){var p=api(ps[j]),n=String(scalar(p,'name'));if(SCALES.indexOf(n)<0)continue;var lo=Number(scalar(p,'min')),hi=Number(scalar(p,'max')),out=['/livemixer/scale',label,String(scalar(d,'name')),n];for(var k=0;k<=10;k++){var v=lo+(hi-lo)*k/10;out.push(v,String(p.call('str_for_value',v)));}outlet(2,out);}}}
 function dumpparams(){try{var r=tracks('RHYTHM'),m=tracks('MELODIC'),main=new LiveAPI(null,'live_set master_track');dumpdevices(r[0],'RHYTHM');dumpdevices(m[0],'MELODIC');dumpdevices(main,'Main');dumpscales(r[0],'RHYTHM');dumpscales(main,'Main');}catch(e){error('dumpparams: '+e+'\n');}}
 
-function values(){var v=arrayfromargs(arguments);oscOwned=1;lastValues=Date.now();for(var i=1;i<4;i++)manual[i]=Math.max(0,Math.min(1,Number(v[i])||0));var b=Number(v[4]);balance=v.length>4&&b===b?Math.max(0,Math.min(1,b)):.5;
+function values(){var v=arrayfromargs(arguments);oscOwned=1;lastValues=clock();for(var i=1;i<4;i++)manual[i]=Math.max(0,Math.min(1,Number(v[i])||0));var b=Number(v[4]);balance=v.length>4&&b===b?Math.max(0,Math.min(1,b)):.5;
   for(var j=0;j<GHOME.length;j++){var x=Number(v[5+j]);gest[j]=v.length>5+j&&x===x?Math.max(0,Math.min(1,x)):GHOME[j];}steady();if(!quiet)status('Living · following the box');}
 function control(index,value){oscOwned=0;var k=Number(index);if(k>0&&k<4)manual[k]=Math.max(0,Math.min(1,Number(value)));steady();status('Manual · combine gently');}
 function auto(v){outlet(1,'auto',0);}
 function reset(){oscOwned=0;manual=[0,0,0,0];balance=.5;gest=GHOME.slice();for(var i=0;i<4;i++)outlet(1,'dial'+i,0);apply(manual);applygestures(1);restorehome();applied='';status('Dry · tails fade naturally');}
 
 function tick(){try{
-  var now=Date.now(),dt=lastTick?Math.min(.5,Math.max(0,(now-lastTick)/1000)):0;lastTick=now;
+  var now=clock(),dt=lastTick?Math.min(.5,Math.max(0,(now-lastTick)/1000)):0;lastTick=now;
   if(!song)return;
   var t=Number(scalar(song,'current_song_time')),playing=Number(scalar(song,'is_playing'))?1:0;
   // The last value is "bound": 1 once setup found the set, so the controls page can show "Live connected".
-  if(now-lastState>=100){lastState=now;outlet(2,'/livemixer/state',0,0,0,t,playing,0,refs?1:0);}
-  if(mirror.length>1){var g=Number(scalar(mirror[0].a,'value'));for(var i=1;i<mirror.length;i++)put(mirror[i],g);}
+  // The first song's Vocal Presence gain (CC20's target) is read once per tick: mirrored to every other song, and
+  // reported in the state's "amount" slot (raw Utility gain, -1 when there is none) so the page can show what Live has.
+  var g=mirror.length?Number(scalar(mirror[0].a,'value')):-1;
+  if(now-lastState>=100){lastState=now;outlet(2,'/livemixer/state',0,0,0,t,playing,g,refs?1:0);}
+  for(var i=1;i<mirror.length;i++)put(mirror[i],g);
   if(!refs)return;
   if(oscOwned&&now-lastValues>1500&&!athome()){var e=Math.exp(-dt/.8);for(var k=1;k<4;k++){manual[k]*=e;if(manual[k]<.002)manual[k]=0;}balance=.5+(balance-.5)*e;if(Math.abs(balance-.5)<.002)balance=.5;
     for(var n=0;n<GHOME.length;n++){gest[n]=GHOME[n]+(gest[n]-GHOME[n])*e;if(Math.abs(gest[n]-GHOME[n])<.002)gest[n]=GHOME[n];}status(athome()?'OSC silent · home':'OSC silent · easing home');}
