@@ -26,6 +26,8 @@ export interface HandTelemetry {
   x: number; y: number; z: number;
   vx: number; vy: number; vz: number;
   speed: number; radius: number; openness: number; pinch: number; push: number;
+  /** Palm facing: 1 up, −1 down, 0 sideways or unknown. */
+  palmUp: number;
   ageMs: number; staleMs: number;
   /** Number of capsules in the hand's solid shape (0 = position and radius only). */
   solid: number;
@@ -70,8 +72,14 @@ export const inboundSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('set-params'), values: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])) }).strict(),
   z.object({ type: z.literal('select-sim'), id: z.string().min(1) }).strict(),
   z.object({ type: z.literal('get-schema') }).strict(),
-  /** Live's transport from the Ableton controls page: song position in beats, optionally the tempo. */
-  z.object({ type: z.literal('music'), beat: z.number().finite(), playing: z.boolean(), bpm: z.number().finite().optional() }).strict(),
+  /**
+   * Live's transport from the Ableton controls page: song position in beats, optionally the tempo
+   * and the output meter levels (0..1; −1 or absent when that group does not exist).
+   */
+  z.object({
+    type: z.literal('music'), beat: z.number().finite(), playing: z.boolean(), bpm: z.number().finite().optional(),
+    levels: z.object({ main: z.number().finite().optional(), rhythm: z.number().finite().optional(), melodic: z.number().finite().optional() }).optional(),
+  }).strict(),
   z.object({ type: z.literal('ping'), id: z.union([z.number(), z.string()]).optional() }).strict(),
 ]);
 export type TelemetryInbound = z.infer<typeof inboundSchema>;

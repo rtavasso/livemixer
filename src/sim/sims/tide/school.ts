@@ -9,7 +9,10 @@
  *  - bounds: a soft push back inside the active area, stronger the closer to the edge;
  *  - boldness: swim to a ring around the hand (radius ≈ hand radius + margin) and circle it, each
  *    eel in its own preferred direction, so they brush around the hand rather than onto a point;
- *  - fear: scatter away from the hand (or the middle) toward the dim edges, where they slow down.
+ *  - fear: scatter away from the hand (or the middle) toward the dim edges, where they slow down;
+ *  - grip: a fist (`grip` → 1) draws the ring in tighter and pulls harder, so a willing school
+ *    coils close around it. It only shapes the approach: fear is untouched, and boldness (which
+ *    fear caps) still decides whether they come at all.
  *
  * The body follows the head as a chain of fixed-length links, so turns ripple down it. Everything
  * is deterministic from the seed and the drives; the step allocates nothing.
@@ -36,11 +39,24 @@ export interface SchoolDrive {
   hand: SchoolHand | null;
   /** Where the eels may swim, uniform units. */
   bounds: SchoolBounds;
+  /** The primary hand's grip, 0 open … 1 fist (smoothed by the caller). Omitted reads as open. */
+  grip?: number;
+  /** How much a fist shrinks the ring (0..1 of its radius). Default `FIST_COIL`. */
+  coil?: number;
+  /** Extra pull toward the ring with a fist (multiplier − 1). Default `FIST_PULL`. */
+  pull?: number;
 }
+
+/** A fist shrinks the ring by this fraction of its radius… */
+export const FIST_COIL = .45;
+/** …and pulls the school onto it this much harder (1 + this). */
+export const FIST_PULL = .8;
 
 /** The ring the bold school circles: a little outside the hand. */
 export const ringRadius = (handRadius: number) => Math.max(handRadius * 1.3, handRadius + .035);
 /** "Close to the hand" for the closeness signal: twice the hand radius, and always a little beyond the ring. */
+/** The ring for a hand with this grip: an open hand gives `ringRadius`, a fist a tighter coil. */
+export const coilRadius = (handRadius: number, grip: number, coil = FIST_COIL) => ringRadius(handRadius) * (1 - clamp01(coil) * clamp01(grip));
 export const closeRadius = (handRadius: number) => Math.max(2 * handRadius, ringRadius(handRadius) + .05);
 
 export class School {
@@ -84,7 +100,8 @@ export class School {
   update(d: SchoolDrive) {
     const n = this.count, dt = d.dt, b = clamp01(d.boldness), f = clamp01(d.fear), r = this.random;
     const { x0, y0, x1, y1 } = d.bounds, cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
-    const hand = d.hand, ring = hand ? ringRadius(hand.radius) : 0;
+    const grip = clamp01(d.grip ?? 0), pull = Math.max(0, d.pull ?? FIST_PULL);
+    const hand = d.hand, ring = hand ? coilRadius(hand.radius, grip, d.coil ?? FIST_COIL) : 0;
     for (let i = 0; i < n; i++) {
       const k = i * SEGMENTS, px = this.x[k], py = this.y[k], hd = this.heading[i];
       // Wander: a preferred direction that random-walks.
@@ -112,7 +129,8 @@ export class School {
         const ux0 = px - hand.x, uy0 = py - hand.y, dist = Math.sqrt(ux0 * ux0 + uy0 * uy0) + 1e-6, ux = ux0 / dist, uy = uy0 / dist;
         const err = Math.max(-1.6, Math.min(1.6, (ring - dist) * 14));
         const tx = -uy * this.spin[i], ty = ux * this.spin[i];
-        const w = 3.2 * b;
+        // A fist pulls harder, but only as far as the school is calm: fear keeps its full say.
+        const w = 3.2 * b * (1 + pull * grip * calm);
         dx += w * (tx * (dist < ring * 2.5 ? 1 : .3) + ux * err); dy += w * (ty * (dist < ring * 2.5 ? 1 : .3) + uy * err);
       }
       // Fear: away from the hand (or the middle), out to the edges.

@@ -16,7 +16,7 @@ const DT = 1 / 60;
 const hand = (id: number, x: number, z: number, y = .6, extra: Partial<HandState> = {}): HandState => ({
   id, position: { x, y, z }, velocity: { x: 0, y: 0, z: 0 }, speed: 0,
   extent: { min: { x: x - .04, y: y - .06, z }, max: { x: x + .04, y: y + .06, z } },
-  radius: .06, openness: 1, pinch: 0, confidence: 1, ageMs: 100, staleMs: 0, push: z, points: [], capsules: [], ...extra,
+  radius: .06, openness: 1, pinch: 0, palmNormal: null, palmUp: 0, confidence: 1, ageMs: 100, staleMs: 0, push: z, points: [], capsules: [], ...extra,
 });
 
 describe('shallows field', () => {

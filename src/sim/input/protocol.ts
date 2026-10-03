@@ -98,6 +98,8 @@ export const bridgeHandSchema = z.object({
   /** Bridges that fit a hand model can send these; blob trackers omit them. */
   openness: unit.min(0).max(1).optional(),
   pinch: unit.min(0).max(1).optional(),
+  /** Unit vector out of the palm in box axes (u right, v down, w away); bridges that know it (`--source leap`). */
+  palmNormal: z.tuple([unit.min(-1).max(1), unit.min(-1).max(1), unit.min(-1).max(1)]).optional(),
   /** Optional sample points on the blob surface, same normalization as pos. */
   points: z.array(vec).max(256).optional(),
   /** The tracked skeleton, when the bridge fits one; blob hands (tracking lost) omit it. */
@@ -196,6 +198,7 @@ export function bridgeFrameToInput(frame: BridgeFrame, observedAtMs: number, rec
       id: h.id, position: v3(h.pos), confidence: h.conf,
       extent: h.extent ? { min: v3(h.extent[0]), max: v3(h.extent[1]) } : undefined,
       openness: h.openness, pinch: h.pinch,
+      palmNormal: h.palmNormal ? v3(h.palmNormal) : undefined,
       // A tracking bridge may leave `points` to the browser: the palm and fingertips are in the skeleton.
       points: h.points?.map(v3) ?? (skeleton ? skeletonPoints(skeleton) : undefined),
       capsules: capsules.length ? capsules : undefined,

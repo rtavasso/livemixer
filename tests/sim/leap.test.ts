@@ -52,8 +52,8 @@ describe('leap protocol', () => {
     const h = leapFrameToHands(parseLeapMessage(frame({ hands: [{ id: 3, palmPosition: [0, 200, 0], confidence: 0 }], pointables: [] }))!, DEFAULT_LEAP_BOX)[0];
     expect(h.confidence).toBeGreaterThanOrEqual(.5);
     const t = new HandTracker(LEAP_MAPPING);
-    for (let i = 0; i < 12; i++) { t.ingest({ source: 'leap', sequence: i, observedAtMs: i * 9, receivedAtMs: i * 9, hands: [h] }); t.tick(i * 9); }
-    expect(t.tick(110).hands).toHaveLength(1);
+    for (let i = 0; i < 20; i++) { t.ingest({ source: 'leap', sequence: i, observedAtMs: i * 9, receivedAtMs: i * 9, hands: [h] }); t.tick(i * 9); }
+    expect(t.tick(180).hands).toHaveLength(1);
   });
   it('rejects a degenerate box', () => { expect(() => leapBoxSchema.parse({ x: [0, 5], y: [0, 100], z: [0, 100] })).toThrow(); });
 });
@@ -71,8 +71,8 @@ describe('leap mapping into sim space', () => {
   it('flows through the tracker as a present hand with openness', () => {
     const t = new HandTracker(LEAP_MAPPING);
     const hands = leapFrameToHands(parseLeapMessage(frame())!, DEFAULT_LEAP_BOX);
-    for (let i = 0; i < 12; i++) { t.ingest({ source: 'leap', sequence: i, observedAtMs: i * 9, receivedAtMs: i * 9, hands }); t.tick(i * 9); }
-    const s = t.tick(110);
+    for (let i = 0; i < 20; i++) { t.ingest({ source: 'leap', sequence: i, observedAtMs: i * 9, receivedAtMs: i * 9, hands }); t.tick(i * 9); }
+    const s = t.tick(180);
     expect(s.hands).toHaveLength(1); expect(s.hands[0].openness).toBeCloseTo(.75, 6); expect(s.hands[0].points).toHaveLength(6);
   });
 });

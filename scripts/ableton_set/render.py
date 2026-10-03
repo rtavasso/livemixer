@@ -1,5 +1,6 @@
-"""Equal-length stem rendering: decode, find the audible end, cut or pad, write WAV or FLAC."""
+"""Equal-length stem rendering: decode (afconvert on macOS, else ffmpeg), find the audible end, cut or pad, write WAV or FLAC."""
 import json
+import shutil
 import subprocess
 import sys
 import wave
@@ -13,7 +14,10 @@ AUDIO = {".mp3", ".wav", ".aif", ".aiff", ".flac", ".ogg", ".m4a"}
 def decode(stem, scratch):
     """Decode a stem to 16-bit PCM with afconvert; returns (frames x channels array, rate)."""
     temp = scratch / f"{stem.stem}.decode.wav"
-    subprocess.run(["afconvert", "-f", "WAVE", "-d", "LEI16", str(stem), str(temp)], check=True)
+    if shutil.which("afconvert"):
+        subprocess.run(["afconvert", "-f", "WAVE", "-d", "LEI16", str(stem), str(temp)], check=True)
+    else:  # Windows and Linux
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(stem), "-c:a", "pcm_s16le", str(temp)], check=True)
     with wave.open(str(temp)) as f:
         rate, channels = f.getframerate(), f.getnchannels()
         samples = np.frombuffer(f.readframes(f.getnframes()), dtype="<i2").reshape(-1, channels)
@@ -60,7 +64,7 @@ def render_song(folder, render_root, silence_db, fmt):
     sources = {f.name: [f.stat().st_size, int(f.stat().st_mtime)] for f in stems}
     outputs = [(f.stem, target_dir / f"{f.stem}.{fmt}") for f in stems]
     if manifest_path.exists():
-        manifest = json.loads(manifest_path.read_text())
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if manifest.get("sources") == sources and manifest.get("silence_db") == silence_db and all(p.exists() for _, p in outputs):
             return outputs, manifest["frames"], manifest["rate"]
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -79,5 +83,5 @@ def render_song(folder, render_root, silence_db, fmt):
         sys.exit(f"{folder.name}: every stem is below {silence_db} dBFS")
     with ThreadPoolExecutor(max_workers=len(stems)) as pool:
         list(pool.map(lambda job: write_stem(job[0][0], frames, rate, job[1][1]), zip(decoded, outputs)))
-    manifest_path.write_text(json.dumps({"silence_db": silence_db, "sources": sources, "frames": frames, "rate": rate}, indent=2))
+    manifest_path.write_text(json.dumps({"silence_db": silence_db, "sources": sources, "frames": frames, "rate": rate}, indent=2), encoding="utf-8")
     return outputs, frames, rate

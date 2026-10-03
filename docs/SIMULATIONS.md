@@ -42,6 +42,13 @@ URL parameters fix a configuration for an installation launch:
 
 Settings persist in `localStorage` under `livemixer-sim-settings`; URL parameters override and are then persisted.
 
+**Unattended running.** The page keeps telemetry alive through the failures a long show meets:
+
+- *Page hidden or window covered*: rendering pauses (no `requestAnimationFrame`), but the input source stays connected and a background tick (30 Hz, plus one per arriving source frame, since Chrome throttles hidden-page timers to 1 Hz) keeps stepping the simulation and publishing signals and telemetry. Only deactivating the player stops the host.
+- *Simulation failure*: its signals are cleared at once (telemetry carries `signals: {}`, so the controls fall back to input presence) and the simulation is recreated every 5 s.
+- *WebGL context lost*: signals cleared; if the browser has not restored the context within 10 s the host builds a new canvas; if that fails, or the new canvas is lost within a minute, the page reloads and restores its simulation and source from the URL and `localStorage`.
+- *Depth bridge / Leap socket*: reconnects forever with backoff (0.5 → 8 s); a socket that is open but delivers no frame for 5 s is dropped and reconnected.
+
 ## Coordinate spaces
 
 Three frames exist and only one of them is ever seen by a simulation.
@@ -86,7 +93,8 @@ Keep the physical box proportional to the volume so a solid hand keeps its shape
 
 - **Sources** (`src/sim/input/*.ts`) implement `InputSource`: `pointer` (mouse/touch; press = push, wheel = depth, Shift = closed hand), `synthetic` (deterministic scripted performer with an occupancy blob), `webcam` (MediaPipe landmarks through the existing local worker; depth from apparent hand size), `leap` (Leap Motion Controller through the local service's WebSocket API; see below), `depth` (bridge WebSocket client), `replay` (JSONL recorded from any source).
 - **Tracker** (`conditioning.ts`): presence hysteresis (`enterMs` before a hand exists, `leaveMs` grace after the last observation), One-Euro filtering of position, EMA velocity, a faster-filtered `push` for tap-like responses, smoothed `presence` and `activity`, occupancy resampled into sim orientation. Deterministic: all time arrives through arguments.
-- **Gestures** (`gestures.ts`): `enter`, `leave`, `swipe` (once per fast segment, with direction), `push` (fast z rise), `hold` (still for ~1 s, once), `grab`/`release` (openness hysteresis; only landmark sources supply openness).
+- **Gestures** (`gestures.ts`): `enter`, `leave`, `swipe` (once per fast segment, with direction), `push` (fast z rise), `hold` (still for ~1 s, once), `grab`/`release` (openness hysteresis; only landmark sources supply openness), `palmUp`/`palmDown` (the palm turns past ±0.55 on `palmUp` and must come back inside ±0.3 to re-arm; only sources that send a palm normal).
+- **Palm facing**: every hand has `palmNormal` (unit vector out of the palm in sim space, y up, or null) and `palmUp` (its y: 1 palm up, −1 palm down, 0 sideways or unknown). The bridge's Leap source supplies it; the direction goes through the same hologram affine and space mapping as positions, so a mirrored or turned-around mounting flips it correctly. `palmUp` is in telemetry's `input.hands[]`.
 
 `SimInput` also carries `occupancy`, a 64×48 field (row 0 = bottom) of how much of each cell the tracked matter fills. Simulations that want the whole silhouette rather than a point (a curtain, water) upload it as a texture.
 
@@ -183,7 +191,7 @@ The reference simulation: a soft light gathers around a hand and travels with it
 - `schema` on connect and whenever the simulation changes: the active simulation's `params` and `signals` specs (names, ranges, units, descriptions), the list of simulations, the hand fields and gesture names.
 - `frame` at `rate` Hz (default 30): `sim.params`, `sim.signals`, `input.presence`, `input.activity`, `input.hands[]` (position, velocity, speed, radius, openness, pinch, push, age), `input.events[]` since the last frame, `input.stats` from the source (bridge fps, pixel counts…), `perf`. Occupancy can be included (base64, row 0 = bottom) with the overlay toggle.
 
-Inbound: `set-param`, `set-params`, `select-sim`, `get-schema`, `ping`. Transports: `BroadcastChannel('livemixer-sim')` (a second tab), WebSocket (the page connects to a server the audio process runs; reconnects forever), and `window.postMessage` when embedded. `window.livemixerSim.host.bus.subscribe(fn)` works from devtools.
+Inbound: `set-param`, `set-params`, `select-sim`, `get-schema`, `ping`, and `music` (Live's transport from the Ableton controls page: `{type: 'music', beat, playing, bpm?, levels?}`, where `levels` = `{main, rhythm, melodic}` are Live's output meters 0..1, −1 or absent for a missing group, rhythm = drums + bass, melodic = textures + vocals). `MusicClockEstimator` (`src/sim/core/music.ts`) turns it into `SimInput.music`: beat, tempo, and with levels `levels` (as reported, a missing group falling back to main) and `dynamics`: an envelope per channel (40 ms attack, 250 ms release, integrated between the ~10 Hz reports), `energy` (envelope over a slowly tracked recent peak, so quiet and loud songs both reach ~1) and `onset` (a 0..1 pulse on each rise of the rhythm envelope above its slow average, decaying over ~200 ms). Both are null without levels or when levels are older than 3 s (the clock's own staleness rule). Transports: `BroadcastChannel('livemixer-sim')` (a second tab), WebSocket (the page connects to a server the audio process runs; reconnects forever), and `window.postMessage` when embedded. `window.livemixerSim.host.bus.subscribe(fn)` works from devtools.
 
 Two ready-made diagnostic consumers are available:
 
@@ -200,7 +208,7 @@ channel.postMessage({ direction: 'inbound', message: { type: 'get-schema' } });
 
 ## Depth bridge protocol
 
-Defined once in `src/sim/input/protocol.ts` (zod) and implemented by `bridge/depth_bridge.py`. The bridge is a WebSocket server; on connect it sends `hello` (source name, physical box in metres, fps, occupancy/voxel/surface grid sizes, `skeleton: true` when it tracks hands, and `frame: "upright"` when a camera lying on the desk looking up has been re-oriented by the bridge so that v is 1 − height and w is reach toward the display, see below), then `frame` messages: `seq`, `t` (bridge monotonic seconds; the client estimates the clock offset with a sliding minimum), `hands[]` with `pos [u, v, w]` (u right, v down, w deeper), `conf`, `extent`, optional `openness`/`pinch`/`points`, plus optional base64 `occupancy` (row 0 = top of the image), `voxels`, `surface` (the scan) and `stats`. See `bridge/README.md`.
+Defined once in `src/sim/input/protocol.ts` (zod) and implemented by `bridge/depth_bridge.py`. The bridge is a WebSocket server; on connect it sends `hello` (source name, physical box in metres, fps, occupancy/voxel/surface grid sizes, `skeleton: true` when it tracks hands, and `frame: "upright"` when a camera lying on the desk looking up has been re-oriented by the bridge so that v is 1 − height and w is reach toward the display, see below), then `frame` messages: `seq`, `t` (bridge monotonic seconds; the client estimates the clock offset with a sliding minimum), `hands[]` with `pos [u, v, w]` (u right, v down, w deeper), `conf`, `extent`, optional `openness`/`pinch`/`points`/`palmNormal` (unit vector out of the palm in box axes, Leap only), plus optional base64 `occupancy` (row 0 = top of the image), `voxels`, `surface` (the scan) and `stats`. See `bridge/README.md`.
 
 A hand may carry a `skeleton` (bridges that fit a hand model, i.e. `--source leap`; blob hands omit it). It uses the same normalization as `pos`, joints are sent unclamped (they may overshoot `[0, 1]` slightly, and the browser never clamps them either), and widths are DIAMETERS as fractions of the box width at that depth:
 

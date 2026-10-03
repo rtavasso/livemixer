@@ -148,5 +148,68 @@ class AutomationTest(unittest.TestCase):
         self.assertEqual(points[0][1], tx.SILENT)
 
 
+
+class ShortCrossfadeTest(unittest.TestCase):
+    def test_two_bar_crossfades_everywhere(self):
+        songs = [song("A", 100, 64, camelot="8A"), song("B", 128, 64, camelot="3B"), song("C", 126, 64, camelot="3B")]
+        p = tx.plan(songs, 2, "crossfade")
+        self.assertEqual([(t.style, t.bars) for t in p.transitions], [("crossfade", 2), ("crossfade", 2)])
+        envelopes = tx.automation(p)
+        stems = [k for k in envelopes if k != "tempo" and k[0] == "stem"]
+        self.assertEqual({tx.stem_role(k[2]) for k in stems}, {tx.VOCALS})
+        for t in p.transitions:
+            for name in ("08 Lead Vocals", "09 Background Vocals"):
+                initial, points = envelopes[("stem", t.incoming, name)]
+                self.assertEqual(initial, tx.SILENT)  # silent through the whole crossfade
+                self.assertEqual(points, tx.step(t.start + 8, True))
+        for t in p.transitions:
+            out_initial, out_points = envelopes[("group", t.outgoing)]
+            self.assertEqual(out_points[-1], (t.start + 8, tx.SILENT))
+            self.assertEqual(envelopes[("group", t.incoming)][1][0], (t.start, tx.SILENT))
+            self.assertEqual(p.clip_ends[t.outgoing], t.start + 8)
+
+
+
+class NaturalSpeedTest(unittest.TestCase):
+    def setUp(self):
+        self.songs = [song("A", 100, 64, camelot="8A"), song("B", 140, 64, camelot="8A"), song("C", 75, 64, camelot="8A")]
+        self.plan = tx.plan(self.songs, 2, "crossfade")
+        self.r = tx.natural_speed(self.plan, tx.automation(self.plan))
+
+    def test_tempo_steps_at_each_overlap_end_and_never_ramps(self):
+        initial, points = self.r.envelopes["tempo"]
+        self.assertEqual(initial, self.songs[0].bpm)
+        a, b, c = (s.bpm for s in self.songs)  # grid tempos (C may be counted in double time); audio is untouched
+        self.assertEqual([v for _, v in points], [a, b, b, c])
+        for (b0, _), (b1, _) in zip(points[::2], points[1::2]):
+            self.assertAlmostEqual(b1 - b0, tx.STEP)
+        self.assertEqual([round(b, 6) for b, _ in points[1::2]], [round(z[1], 6) for z in self.r.zones])
+
+    def test_overlap_lasts_the_outgoing_songs_own_two_bars(self):
+        # During an overlap Live runs at the outgoing tempo, so its two bars span 8 Arrangement beats.
+        for start, end in self.r.zones:
+            self.assertAlmostEqual(end - start, 8, places=6)
+
+    def test_audio_lengths_survive_the_tempo_map(self):
+        # Each clip's beats, read through the tempo in force, must equal its audio seconds.
+        changes = [(0.0, self.songs[0].bpm)] + [(b, v) for b, v in self.r.envelopes["tempo"][1][1::2]]
+        def seconds(b0, b1):
+            total = 0.0
+            for (c0, bpm), (c1, _) in zip(changes, changes[1:] + [(float("inf"), 0)]):
+                lo, hi = max(b0, c0), min(b1, c1)
+                if hi > lo:
+                    total += (hi - lo) * 60 / bpm
+            return total
+        for start, end, length in zip(self.r.clip_starts, self.r.clip_ends, self.r.end_seconds):
+            self.assertAlmostEqual(seconds(start, end), length, places=6)
+
+    def test_crossfade_automation_follows_the_overlaps(self):
+        for (start, end), t in zip(self.r.zones, self.plan.transitions):
+            initial, points = self.r.envelopes[("group", t.outgoing)]
+            self.assertAlmostEqual(points[-1][0], end)
+            self.assertEqual(points[-1][1], tx.SILENT)
+            self.assertAlmostEqual(self.r.envelopes[("group", t.incoming)][1][0][0], start)
+
+
 if __name__ == "__main__":
     unittest.main()

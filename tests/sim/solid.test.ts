@@ -31,8 +31,8 @@ describe('solid hand from the Leap skeleton', () => {
   it('flows through the mapping and tracker, riding on the smoothed position', () => {
     const t = new HandTracker(LEAP_MAPPING);
     const obs = leapFrameToHands(parseLeapMessage(realFrame)!, DEFAULT_LEAP_BOX);
-    for (let i = 0; i < 12; i++) { t.ingest({ source: 'leap', sequence: i, observedAtMs: i * 9, receivedAtMs: i * 9, hands: obs }); t.tick(i * 9); }
-    const h = t.tick(110).hands[0];
+    for (let i = 0; i < 20; i++) { t.ingest({ source: 'leap', sequence: i, observedAtMs: i * 9, receivedAtMs: i * 9, hands: obs }); t.tick(i * 9); }
+    const h = t.tick(180).hands[0];
     expect(h.capsules.length).toBe(obs[0].capsules!.length);
     // A still hand: smoothed == raw, so the capsules are exactly the mapped ones.
     const mapped = mapCapsule(LEAP_MAPPING, obs[0].capsules![0]);
@@ -47,7 +47,7 @@ describe('capsule mapping and packing', () => {
     expect(c.a.x).toBe(0); expect(c.b.x).toBe(1); expect(c.radius).toBeCloseTo(.1, 9);
   });
   it('packs hands into world-unit capsules with a bounding sphere, and spheres for shapeless hands', () => {
-    const base: HandState = { id: 1, position: { x: .5, y: .5, z: .5 }, velocity: { x: 0, y: 0, z: 0 }, speed: 0, extent: { min: { x: .4, y: .4, z: .5 }, max: { x: .6, y: .6, z: .5 } }, radius: .05, openness: 1, pinch: 0, confidence: 1, ageMs: 0, staleMs: 0, push: .5, points: [], capsules: [] };
+    const base: HandState = { id: 1, position: { x: .5, y: .5, z: .5 }, velocity: { x: 0, y: 0, z: 0 }, speed: 0, extent: { min: { x: .4, y: .4, z: .5 }, max: { x: .6, y: .6, z: .5 } }, radius: .05, openness: 1, pinch: 0, palmNormal: null, palmUp: 0, confidence: 1, ageMs: 0, staleMs: 0, push: .5, points: [], capsules: [] };
     const solid: HandState = { ...base, id: 2, capsules: [{ a: { x: .1, y: .5, z: .2 }, b: { x: .3, y: .5, z: .2 }, radius: .02 }, { a: { x: .3, y: .5, z: .2 }, b: { x: .3, y: .7, z: .2 }, radius: .01 }] };
     const packed = packHands([base, solid], 2, 1, createPackedHands());
     expect(packed.count).toBe(3); expect(packed.boundCount).toBe(2);

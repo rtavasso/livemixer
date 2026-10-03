@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import ctypes as C
+import json
 import logging
 import os
 import sys
@@ -146,6 +147,7 @@ DEVICE_TYPES = {
 }
 LOG_SEVERITY = {0: logging.DEBUG, 1: logging.ERROR, 2: logging.WARNING, 3: logging.INFO}
 
+STALL_LOG_EVERY_S = 60.0
 STALL_MESSAGE = (
     "no stereo images from LeapC for {elapsed:.0f} s ({state}). This is the known 'Leap Motion Service 5.0.0-preview' "
     "stall: that build grants the images policy and then LeapPollConnection never returns. Fix: install current "
@@ -350,6 +352,7 @@ MAX_TRACKED_HANDS = 16                       # an event claiming more is garbage
 MAX_JOINT_DISTANCE_MM = 3000.0               # the controller tracks to ~80 cm; anything farther is not a hand
 HAND_TYPE_NAMES = {0: "left", 1: "right"}
 FOREARM_STUB_MM = 70.0                       # how much forearm is kept past the wrist before projecting
+PALM_NORMAL_MM = 50.0                        # how far out of the palm the normal is sampled before projecting
 #: Where the rectification maps come from: ``LeapRectilinearToPixel`` (what the service computes, exact) or the 64x64
 #: distortion lattice attached to every image event (:class:`leap_stereo.GridCalibration`; the same answer in the
 #: centre of the sensor, a few pixels off towards its edges, but built without a per-point call into LeapC).
@@ -677,7 +680,10 @@ class HandProjector:
     def to_image_hand(self, hand: DeviceHand, frame: HandFrame | None = None) -> TrackedHand | None:
         joints = hand.joints.copy()
         joints[JOINT_ELBOW] = trim_forearm(joints[JOINT_WRIST], joints[JOINT_ELBOW])
-        image = self.project(joints, frame)
+        # The palm normal rides along as one more point, so it is mirrored and reoriented exactly like the hand.
+        normal_tip = joints[JOINT_PALM] + PALM_NORMAL_MM * np.asarray(hand.palm_normal, dtype=np.float64)
+        projected = self.project(np.vstack([joints, normal_tip]), frame)
+        image, tip = projected[:-1], projected[-1]
         if not np.isfinite(image).all() or (image[:, 2] <= 0).any():
             return None  # part of the hand below the device plane: not a hand this camera can see
         depth_of_part = np.empty(N_WIDTHS, dtype=np.float64)
@@ -689,6 +695,7 @@ class HandProjector:
         return TrackedHand(
             id=hand.id, type=hand.type, joints=image, widths_px=widths_px, extended=hand.extended.copy(),
             confidence=hand.confidence, grab_strength=hand.grab_strength, pinch_strength=hand.pinch_strength, has_elbow=True,
+            palm_normal_tip=tip if np.isfinite(tip).all() and tip[2] > 0 else None,
         )
 
     def resolve(self, hands: Sequence[DeviceHand], depth: np.ndarray) -> tuple[TrackedHand, ...]:
@@ -709,6 +716,92 @@ class HandProjector:
             return f"{self.fixed.name} (fixed)"
         assert self.detector is not None
         return self.detector.describe()
+
+
+# --------------------------------------------------------------------------- #
+# What a run learned, kept for the next one (--leap-state)
+# --------------------------------------------------------------------------- #
+
+
+def load_learned_state(path: str | None) -> dict[str, Any]:
+    """The JSON object in ``path`` (``{}`` when there is no path, no file or it is unreadable: never fatal)."""
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            state = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        log.warning("ignoring the learned Leap state in %s: %s", path, exc)
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def save_learned_state(path: str | None, **updates: Any) -> None:
+    """Merge ``updates`` into the state file (atomically replaced); failures are logged, never raised."""
+    if not path:
+        return
+    state = load_learned_state(path)
+    state.update(updates)
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError as exc:
+        log.warning("could not save the learned Leap state to %s: %s", path, exc)
+
+
+def resolve_learned(path: str | None, alignment: str, hand_frame: str, swap: bool, orient: str, relearn: bool = False) -> tuple[str, str]:
+    """The ``(alignment, hand_frame)`` modes to start with: what an earlier run learned in place of ``auto``.
+
+    A value given explicitly (anything but ``auto``) always wins; ``relearn``
+    ignores the file (it is overwritten once the new values are learned). The
+    hand frame is only reused under the same camera order and orientation.
+    """
+    if relearn or not path or (alignment != "auto" and hand_frame != "auto"):
+        return alignment, hand_frame
+    state = load_learned_state(path)
+    saved_at = state.get("saved", "an earlier run")
+    if alignment == "auto" and isinstance(state.get("alignment"), dict):
+        a = state["alignment"]
+        try:
+            text = f"{float(a['pitch'])},{float(a['roll'])}"
+            ls.CameraAlignment.parse(text)
+        except (KeyError, TypeError, ValueError) as exc:
+            log.warning("ignoring the saved camera alignment in %s: %s", path, exc)
+        else:
+            alignment = text
+            log.info("camera alignment %s reused from %s (learned %s); pass --relearn to fit it again", text, path, saved_at)
+    if hand_frame == "auto" and isinstance(state.get("hand_frame"), dict):
+        h = state["hand_frame"]
+        name = h.get("name")
+        if name in HAND_FRAME_BY_NAME and h.get("swap") == bool(swap) and h.get("orient") == orient:
+            hand_frame = name
+            log.info("hand frame %s reused from %s (learned %s); pass --relearn to detect it again", name, path, saved_at)
+        elif name is not None:
+            log.info("the hand frame saved in %s was learned with other camera settings (or is unknown); detecting it again", path)
+    return alignment, hand_frame
+
+
+def _stamp() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def remember_alignment(path: str | None, fit: ls.AlignmentFit) -> None:
+    save_learned_state(path, alignment={"pitch": fit.alignment.pitch, "roll": fit.alignment.roll, "matches": fit.matches, "row_error_px": round(fit.after_px, 3)}, saved=_stamp())
+
+
+def remember_hand_frame(path: str | None, projector: HandProjector, swap: bool, orient: str) -> bool:
+    """Save the detector's lock once it has one; returns True when there is nothing left to save."""
+    detector = projector.detector
+    if detector is None:
+        return True
+    if detector.locked is None:
+        return False
+    save_learned_state(path, hand_frame={"name": detector.locked.name, "swap": bool(swap), "orient": orient, "score": round(float(detector.scores.max()), 3)}, saved=_stamp())
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -914,24 +1007,32 @@ class LeapStereoSource(FrameSource):
     ``tracking_window_s``, lends its hands, which :class:`HandProjector` puts
     into the depth image (``hand_frame``: ``"auto"`` or a convention name).
     If no image arrives within ``stall_after`` seconds the
-    stall is logged with the fix; after ``restart_after`` seconds ``read()``
-    raises so the server reports it to the browser and retries. A poll thread
+    stall is logged with the fix (at most once a minute per process); after
+    ``restart_after`` seconds (``--stall-restart``) ``read()`` raises so the
+    server reports it to the browser and restarts the source. A poll thread
     that never returns (the 5.0-preview stall) is left alone rather than
-    joined, and ``needs_hard_exit`` tells the CLI to ``os._exit`` at the end.
+    joined: ``start()`` then refuses to run beside it and ``needs_hard_exit``
+    tells the server and CLI that only a fresh process (``os._exit``, then
+    ``run-leap.sh`` relaunching) gets images again. With ``state_file`` a
+    fitted alignment and a locked hand frame are saved for the next run
+    (:func:`resolve_learned` reads them back).
     """
 
     name = "leap"
     skeleton = True
+    _stall_logged_at: float | None = None  # process-wide: when the long stall explanation was last logged
 
     def __init__(
         self, dll_path: str | None = None, view: ls.RectifiedView | None = None, params: ls.StereoParams | None = None,
-        swap: bool = False, orient: str = "none", fps: float = 30.0, stall_after: float = 3.0, restart_after: float = 20.0,
+        swap: bool = False, orient: str = "none", fps: float = 30.0, stall_after: float = 3.0, restart_after: float = 5.0,
         poll_timeout_ms: int = 100, sample_step: int = 4, baseline_mm: float | None = None,
         hand_frame: str = "auto", tracking_window_s: float = 0.05, alignment: str = "auto", calibration: str = "function",
-        align_every: int = 3, far_mm: float = 450.0,
+        align_every: int = 3, far_mm: float = 450.0, state_file: str | None = None,
     ) -> None:
         if orient not in ls.ORIENTATIONS:
             raise ValueError(f"orient must be one of {ls.ORIENTATIONS}")
+        if not restart_after > 0:
+            raise ValueError("the stall restart time must be positive")
         if hand_frame != "auto" and hand_frame not in HAND_FRAME_BY_NAME:
             raise ValueError(f"unknown hand frame {hand_frame!r}; use 'auto' or one of {', '.join(HAND_FRAME_NAMES)}")
         if calibration not in CALIBRATIONS:
@@ -941,7 +1042,10 @@ class LeapStereoSource(FrameSource):
         self.params = params or ls.StereoParams()
         self.swap, self.orient = bool(swap), orient
         self.fps = float(fps) if fps and fps > 0 else None
-        self.stall_after, self.restart_after = float(stall_after), float(restart_after)
+        self.restart_after = float(restart_after)
+        self.stall_after = min(float(stall_after), self.restart_after)
+        self.state_file = state_file
+        self._hand_frame_saved = False
         self.poll_timeout_ms, self.sample_step = int(poll_timeout_ms), int(sample_step)
         self.forced_baseline_mm = baseline_mm
         self.hand_frame = hand_frame
@@ -1005,8 +1109,9 @@ class LeapStereoSource(FrameSource):
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
-            log.warning("LeapC poll thread from the previous start is still running (stuck inside LeapPollConnection); reusing it")
-            return
+            # Stuck inside LeapPollConnection: a second connection beside it never gets images, only a fresh process does.
+            self._mark_stuck()
+            raise RuntimeError("the LeapC poll thread from the previous start is stuck inside LeapPollConnection; a fresh process is needed")
         path = find_leapc(self.dll_path)
         self.lib = LeapC(path)
         self._stop.clear()
@@ -1026,9 +1131,7 @@ class LeapStereoSource(FrameSource):
         if thread is not None:
             thread.join(2.0)
             if thread.is_alive():
-                if not self._stuck:
-                    self._stuck = True
-                    atexit.register(_hard_exit_at_shutdown)  # a normal interpreter exit hangs behind the stuck native call
+                self._mark_stuck()
                 log.warning("LeapC poll thread did not return within 2 s (stuck inside LeapPollConnection); leaving the connection open")
                 return
         self._thread = None
@@ -1042,6 +1145,11 @@ class LeapStereoSource(FrameSource):
                 log.warning("closing LeapC: %s", exc)
         self._conn, self._device = None, None
         self.rectifier, self._maps_key = None, None
+
+    def _mark_stuck(self) -> None:
+        if not self._stuck:
+            self._stuck = True
+            atexit.register(_hard_exit_at_shutdown)  # a normal interpreter exit hangs behind the stuck native call
 
     # ---- poll thread ------------------------------------------------------ #
 
@@ -1270,12 +1378,16 @@ class LeapStereoSource(FrameSource):
                 raise RuntimeError(f"LeapC event handling failed: {error}")
             if self._thread is None or not self._thread.is_alive():
                 raise RuntimeError("LeapC poll thread is not running")
-            elapsed = time.monotonic() - waited_from
+            now = time.monotonic()
+            elapsed = now - waited_from
             if elapsed >= self.stall_after and not stall_logged:
                 stall_logged = True
-                log.warning(STALL_MESSAGE.format(elapsed=elapsed, state=self.state()))
+                last = LeapStereoSource._stall_logged_at
+                if last is None or now - last >= STALL_LOG_EVERY_S:  # an unplugged controller stalls every few seconds: once a minute is enough
+                    LeapStereoSource._stall_logged_at = now
+                    log.warning(STALL_MESSAGE.format(elapsed=elapsed, state=self.state()))
             if elapsed >= self.restart_after:
-                raise RuntimeError(STALL_MESSAGE.format(elapsed=elapsed, state=self.state()))
+                raise RuntimeError(f"no stereo images from LeapC for {elapsed:.0f} s ({self.state()}); restarting the connection")
 
     def _ensure_pipeline(self, pair: StereoPair) -> None:
         """Build (or rebuild) the rectifier and matcher for this pair's size, calibration version and baseline.
@@ -1339,6 +1451,7 @@ class LeapStereoSource(FrameSource):
             self.alignment = fit.alignment
             log.info("camera alignment fitted from the images: %s (%.0f ms); the right camera's rays are now rotated by it and the maps rebuilt",
                      fit.describe(), (time.perf_counter() - started) * 1000.0)
+            remember_alignment(self.state_file, fit)
         elif estimator.done:
             log.warning("camera alignment: %s; put a hand or something textured 20-40 cm above the device, or pass --leap-align PITCH,ROLL", estimator.describe())
 
@@ -1358,6 +1471,8 @@ class LeapStereoSource(FrameSource):
         depth = ls.reorient(depth, self.orient)
         stats = ls.depth_statistics(depth, self.params.min_depth_mm, self.far_mm)
         hands = self.projector.resolve(self._hands_at(pair.timestamp_us), depth)
+        if not self._hand_frame_saved and self.state_file:
+            self._hand_frame_saved = remember_hand_frame(self.state_file, self.projector, self.swap, self.orient)
         self.last_pair, self.last_rectified, self.last_depth, self.last_hands, self.last_stats = pair, (left, right), depth, hands, stats
         self._last_return = time.monotonic()
         return LeapDepthFrame(depth, pair.timestamp, hands, stats)
@@ -1395,7 +1510,7 @@ class LeapSyntheticSource(FrameSource):
         orient: str = "none", fps: float = 30.0, paced: bool = True, raw_model: ls.FisheyeModel | None = None,
         baseline_mm: float = ls.CONTROLLER_BASELINE_MM, speed: float = 1.0, absences: bool = True, sample_step: int = 4,
         hand_frame: str = "auto", true_frame: str = DEFAULT_HAND_FRAME, skeletons: bool = True, alignment: str = "none",
-        far_mm: float = 450.0,
+        far_mm: float = 450.0, state_file: str | None = None,
     ) -> None:
         if orient not in ls.ORIENTATIONS:
             raise ValueError(f"orient must be one of {ls.ORIENTATIONS}")
@@ -1415,6 +1530,8 @@ class LeapSyntheticSource(FrameSource):
         self.temporal = self.stereo.temporal_filter()
         self.last_stats: dict[str, float] = {}
         self.projector = HandProjector(self.view, self.baseline_mm, self.swap, self.orient, hand_frame)
+        self.state_file = state_file  # the hand frame it locks is saved like the live source's (the stand-in cameras need no alignment)
+        self._hand_frame_saved = False
         self.true_frame = HAND_FRAME_BY_NAME[true_frame]
         self.skeletons = bool(skeletons)
         self._origin: float | None = None
@@ -1468,6 +1585,8 @@ class LeapSyntheticSource(FrameSource):
     def tracked_hands(self, t: float, depth: np.ndarray) -> tuple[TrackedHand, ...]:
         """The skeleton at ``t`` projected into ``depth``'s frame (scoring the detector on the way while it is unlocked)."""
         hands = self.projector.resolve(self.device_hands(t), depth)
+        if not self._hand_frame_saved and self.state_file:
+            self._hand_frame_saved = remember_hand_frame(self.state_file, self.projector, self.swap, self.orient)
         self.last_hands = hands
         return hands
 

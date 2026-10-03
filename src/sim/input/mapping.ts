@@ -94,6 +94,17 @@ export function mapPointOpen(mapping: SpaceMapping, p: Vec3): Vec3 {
   return { x: mapAxisOpen(mapping.x, p[mapping.x.from]), y: mapAxisOpen(mapping.y, p[mapping.y.from]), z: mapAxisOpen(mapping.z, p[mapping.z.from]) };
 }
 
+/**
+ * Map a source-frame direction (a unit vector, not a point): each axis keeps the sign and stretch its
+ * interval gives positions, so a mirrored axis flips the direction with it. Returns a unit vector.
+ */
+export function mapDirection(mapping: SpaceMapping, d: Vec3): Vec3 {
+  const axis = (m: AxisMap) => d[m.from] / (m.high - m.low) * (m.mirror ? -1 : 1);
+  const v = { x: axis(mapping.x), y: axis(mapping.y), z: axis(mapping.z) };
+  const n = Math.hypot(v.x, v.y, v.z) || 1;
+  return { x: v.x / n, y: v.y / n, z: v.z / n };
+}
+
 /** Map a source-frame box; corners may swap under mirroring so min/max are recomputed. */
 export function mapBox(mapping: SpaceMapping, box: Box3): Box3 {
   const a = mapPoint(mapping, box.min), b = mapPoint(mapping, box.max);
@@ -109,7 +120,7 @@ export function mapCapsule(mapping: SpaceMapping, c: Capsule): Capsule {
 }
 
 export function mapObservation(mapping: SpaceMapping, o: HandObservation): HandObservation {
-  return { ...o, position: mapPoint(mapping, o.position), extent: o.extent ? mapBox(mapping, o.extent) : undefined, points: o.points?.map(p => mapPoint(mapping, p)), capsules: o.capsules?.map(c => mapCapsule(mapping, c)) };
+  return { ...o, position: mapPoint(mapping, o.position), extent: o.extent ? mapBox(mapping, o.extent) : undefined, points: o.points?.map(p => mapPoint(mapping, p)), capsules: o.capsules?.map(c => mapCapsule(mapping, c)), palmNormal: o.palmNormal ? mapDirection(mapping, o.palmNormal) : undefined };
 }
 
 /**

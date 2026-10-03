@@ -14,8 +14,9 @@ UV = ["uv", "run", "--no-project", "--python", "3.12",
 
 
 def _fingerprint(render_dir, prior):
-    manifest = json.loads((render_dir / "_render.json").read_text())
-    worker = hashlib.sha256(WORKER.read_bytes()).hexdigest()[:16]
+    manifest = json.loads((render_dir / "_render.json").read_text(encoding="utf-8"))
+    # Line endings ignored: a Windows checkout of the worker still matches caches made on macOS
+    worker = hashlib.sha256(WORKER.read_bytes().replace(b"\r\n", b"\n")).hexdigest()[:16]
     return {"render": [manifest["frames"], manifest["rate"], manifest["sources"]], "prior": prior, "worker": worker}
 
 
@@ -24,7 +25,7 @@ def analyze(render_dir, prior):
     cache = render_dir / "_analysis.json"
     fingerprint = _fingerprint(render_dir, prior)
     if cache.exists():
-        cached = json.loads(cache.read_text())
+        cached = json.loads(cache.read_text(encoding="utf-8"))
         if cached.get("fingerprint") == fingerprint:
             return cached
     result = subprocess.run(UV + [str(WORKER), str(render_dir), str(prior or "")], capture_output=True, text=True)
@@ -32,7 +33,7 @@ def analyze(render_dir, prior):
         sys.exit(f"Beat analysis failed for {render_dir.name}:\n{result.stderr[-2000:]}")
     analysis = json.loads(result.stdout)
     analysis["fingerprint"] = fingerprint
-    cache.write_text(json.dumps(analysis))
+    cache.write_text(json.dumps(analysis), encoding="utf-8")
     return analysis
 
 

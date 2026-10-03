@@ -25,6 +25,9 @@ export const gestureSettingsSchema = z.object({
   /** Grab/release hysteresis on openness. */
   grabBelow: z.number().min(0).max(1).default(.35),
   releaseAbove: z.number().min(0).max(1).default(.55),
+  /** Palm facing hysteresis on `palmUp` (−1 down … 1 up): enter a facing beyond `palmEnter`, leave it inside `palmLeave`. */
+  palmEnter: z.number().min(0).max(1).default(.55),
+  palmLeave: z.number().min(0).max(1).default(.3),
 }).strict();
 export type GestureSettings = z.infer<typeof gestureSettingsSchema>;
 export const DEFAULT_GESTURE_SETTINGS: GestureSettings = gestureSettingsSchema.parse({});
@@ -37,8 +40,11 @@ export type GestureEvent =
   | { type: 'push'; handId: number; atMs: number; position: Vec3; depth: number }
   | { type: 'hold'; handId: number; atMs: number; position: Vec3; durationMs: number }
   | { type: 'grab'; handId: number; atMs: number; position: Vec3 }
-  | { type: 'release'; handId: number; atMs: number; position: Vec3 };
-export const GESTURE_TYPES = ['enter', 'leave', 'swipe', 'push', 'hold', 'grab', 'release'] as const;
+  | { type: 'release'; handId: number; atMs: number; position: Vec3 }
+  /** The palm turned to face up / down (skeleton sources that report the palm's facing). */
+  | { type: 'palmUp'; handId: number; atMs: number; position: Vec3 }
+  | { type: 'palmDown'; handId: number; atMs: number; position: Vec3 };
+export const GESTURE_TYPES = ['enter', 'leave', 'swipe', 'push', 'hold', 'grab', 'release', 'palmUp', 'palmDown'] as const;
 
 interface HandMemory {
   enteredMs: number;
@@ -48,6 +54,8 @@ interface HandMemory {
   zHistory: { z: number; atMs: number }[]; lastPushMs: number;
   stillSinceMs: number | null; holdFired: boolean;
   grabbed: boolean;
+  /** Current palm facing after hysteresis. */
+  palm: 'up' | 'down' | null;
 }
 export interface GestureMemory { hands: Map<number, HandMemory> }
 export const emptyGestureMemory = (): GestureMemory => ({ hands: new Map() });
@@ -59,7 +67,7 @@ export function detectGestures(memory: GestureMemory, hands: readonly HandState[
     const p = hand.position;
     let m = memory.hands.get(hand.id);
     if (!m) {
-      m = { enteredMs: nowMs, lastPosition: p, swipeOrigin: p, swipeStartMs: nowMs, lastSwipeMs: -Infinity, swipeArmed: true, zHistory: [], lastPushMs: -Infinity, stillSinceMs: null, holdFired: false, grabbed: false };
+      m = { enteredMs: nowMs, lastPosition: p, swipeOrigin: p, swipeStartMs: nowMs, lastSwipeMs: -Infinity, swipeArmed: true, zHistory: [], lastPushMs: -Infinity, stillSinceMs: null, holdFired: false, grabbed: false, palm: null };
       events.push({ type: 'enter', handId: hand.id, atMs: nowMs, position: p });
     } else {
       m = { ...m, zHistory: m.zHistory.slice() };
@@ -90,6 +98,14 @@ export function detectGestures(memory: GestureMemory, hands: readonly HandState[
     // Grab/release on openness with hysteresis.
     if (!m.grabbed && hand.openness <= settings.grabBelow) { m.grabbed = true; events.push({ type: 'grab', handId: hand.id, atMs: nowMs, position: p }); }
     else if (m.grabbed && hand.openness >= settings.releaseAbove) { m.grabbed = false; events.push({ type: 'release', handId: hand.id, atMs: nowMs, position: p }); }
+    // Palm facing with hysteresis; a source that cannot tell (no palmNormal) never fires these.
+    if (hand.palmNormal) {
+      const up = hand.palmUp;
+      if (m.palm === 'up' && up < settings.palmLeave) m.palm = null;
+      else if (m.palm === 'down' && up > -settings.palmLeave) m.palm = null;
+      if (m.palm === null && up >= settings.palmEnter) { m.palm = 'up'; events.push({ type: 'palmUp', handId: hand.id, atMs: nowMs, position: p }); }
+      else if (m.palm === null && up <= -settings.palmEnter) { m.palm = 'down'; events.push({ type: 'palmDown', handId: hand.id, atMs: nowMs, position: p }); }
+    }
     m.lastPosition = p;
     next.set(hand.id, m);
   }

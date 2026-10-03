@@ -1,6 +1,6 @@
 # Living music: the song is the instrument
 
-When nobody is at the installation, the song plays as it was mixed. A visitor moves it away from that mix on four slow axes. When they leave, it drifts back over a few seconds. The governor is in `src/living/governor.ts`. The controls page runs it in **Living** mode, the bridge carries its output, and the **LiveMixer Two Song FX** device applies it in Live.
+When nobody is at the installation, the song plays as it was mixed. A visitor moves it away from that mix on four slow axes. When they leave, it drifts back over a few seconds. The governor is in `src/living/governor.ts`. The controls page runs it in **Living** mode, the bridge carries its output, and the **LiveMixer Living FX** device applies it in Live (the hand-built two-song sets use **LiveMixer Two Song FX**). Hand gestures and the scene's turbulence add to this; see *Hand gestures* below.
 
 ## Axes
 
@@ -14,6 +14,34 @@ Every living simulation (Tide, Lantern, Murmuration) publishes `presence`, `reac
 | Space | 0: dry | closeness while present | rises with τ 2.5 s, falls with τ 3 s | Halo send, Dub echo sends (kept low), Main reverb |
 
 **Allowance** is how far the song may leave home: `(0.35 + 0.65·closeness) × (1 − 0.7·agitation)`. Agitation is smoothed first (τ 0.6 s), so one flick of the hand does not collapse the song. Arrangement and depth are scaled by allowance, and space is capped by it. A patient visitor gets the transformed song. A flailing one gets something close to the plain song. When presence is 0, every target is home. Missing or invalid signals count as absent.
+
+## Hand gestures
+
+Sets built with `--gestures` (Live 11) split every song into two top-level groups, **RHYTHM** (DRUM FX,
+Bass) and **MELODIC** (TEXTURE FX, VOCALS), each with Muffle (Auto Filter), Tilt (EQ Eight shelves) and
+Level (Utility), and add Whoosh, Freeze (Spectral Time) and Span (Utility width) on Main. The controls
+page combines the hands (`src/living/hands.ts`) into ten more values, and the governor adds an eleventh,
+`swarm`, from the simulation's turbulence; they ride on `/fx/values` and every one acts at full strength. The
+three palm/fist gestures are deliberately different kinds of sound so they never blur: a fist is tone (filter),
+palm up is space (reverb), palm down is time (echo). Design: [the spec](superpowers/specs/2026-10-02-hand-gesture-audio-design.md).
+
+| Gesture | One hand | Two hands | In Live |
+|---|---|---|---|
+| Closing the fist | Muffles the whole song | Muffles that hand's half | Muffle low-pass down to ~450 Hz |
+| Holding a fist ~0.4 s | Freezes the moment | Either hand | Spectral Time frozen, wet to 65% in 0.3 s; never longer than 6 s |
+| Opening the hand | Freeze fades out over 1.5 s with a reverb bloom | Same | Halo sends swell |
+| Palm up | That half lifts into a shimmering reverb wash, a touch brighter | For that hand's half | Halo sends up (textures, or the drums but never the kick) + Tilt high shelf +3 dB |
+| Palm down | That half sinks into dub-echo repeats, a touch heavier | For that hand's half | Dub echo sends up + Tilt low shelf +3 dB |
+| Hand height | High: melody and vocals forward; low: drums and bass forward | Each hand sets its half's level | Level −10 … +6 dB |
+| Hands apart / together | — | Wider / narrower | Span 40 … 180%, wide also swells the halo |
+| Fast swipe | A short sweep | Either hand | Whoosh filter dip |
+| Reach through the picture | Underwater dive at full strength | Deeper hand | TEXTURE FX Auto Filter |
+| A turbulent scene (e.g. Murmuration's motes scattered fast) | The whole mix flutters and swirls, faster and deeper the busier it is; not tied to the hand | — | Whoosh's LFO: sine, Spin 25%, 3 → 7.5 Hz, depth 0 → ±16 around ~5.5 kHz (`swarm`, rise 0.08 s, fall 0.5 s) |
+
+The left hand on the picture plays the rhythm half; roles swap only when the hands clearly cross, and a
+hand arriving or leaving crossfades over 0.5 s. Inside FX QUIET zones every gesture holds at home.
+LiveMixer Living FX reports what it found in its status (`gestures 12/12`); `/fx/command dumpparams`
+sends every gesture device's parameters and values to UDP 7401 for checking.
 
 ### Ceilings (`toLiveControls`)
 
@@ -31,8 +59,10 @@ These values are defaults in `DEFAULT_MAPPING` and `DEFAULT_GOVERNOR`.
 ## Protocol
 
 - Page → bridge (WebSocket 9001): `{type:'controls', vocals, space, stutter, gain, fx:{flicker, dub, dive, halo, balance}}`. The `fx` object is optional. Every value must be finite and in 0..1, or the whole message is rejected.
-- Bridge → Two Song FX (UDP 7403): `/fx/values flicker dub dive halo balance` whenever the values change, and every 250 ms as a heartbeat. The bridge sends `/fx/release` on release, timeout (1.5 s), disconnect, shutdown, or when messages stop carrying `fx`.
-- Two Song FX eases back to home on its own if no `/fx/values` arrives for 1.5 s.
+- Bridge → Living FX / Two Song FX (UDP 7403): `/fx/values` with 16 floats, `flicker dub dive halo balance` then `muffleRhythm muffleMelodic tiltRhythm tiltMelodic levelRhythm levelMelodic freeze bloom span whoosh swarm` (`GESTURE_KEYS` in `src/living/governor.ts`, `FX` in `scripts/ableton-bridge.py`; a missing value means home, so older devices and pages still work), whenever the values change and every 250 ms as a heartbeat. The bridge sends `/fx/release` on release, timeout (1.5 s), disconnect, shutdown, or when messages stop carrying `fx`.
+- `/fx/command <word>` (UDP 7403) is passed straight into Living FX's `js` object: `compile` reloads `living-fx.js` from disk without reopening the set, `init` reruns setup, `dumpparams` sends every gesture device's parameter names, ranges, values and display scales to UDP 7401 (read them with a listener while the bridge is stopped, since it owns that port).
+- Living FX also sends `/livemixer/levels main rhythm melodic` (Live's output meters for Main and the RHYTHM / MELODIC groups, 0..1, −1 when a group is absent) with each state report, about every 100 ms. The bridge puts fresh levels in its status (`levels`), the controls page adds them to the `music` message it relays, and the simulations pulse with them (Murmuration's brightness, breath and shimmer), with or without a visitor.
+- The device eases back to home on its own if no `/fx/values` arrives for 1.5 s. Living FX reports `bound = 1` in its `/livemixer/state` once setup found the set (the page then shows *Live connected*) and retries a failed setup every 5 s.
 - Page → simulation (BroadcastChannel `livemixer-sim`): `{direction:'inbound', message:{type:'music', beat, playing}}`, relayed from every bridge status that includes Live's transport.
 
 ## FX QUIET zones: the song has the last word
@@ -53,10 +83,10 @@ The device templates are extracted from the hand-built Drum Transition set: `pyt
 
 ## Try it
 
-1. In Live, open a set built by `scripts/ableton-stem-set.py`; **LiveMixer Living FX** on Main should read `Ready · N songs · M FX QUIET`. Or, for the hand-built set, open `LiveMixer - Two Song Trial.als`. On Main, press **Refresh** on **LiveMixer Two Song FX**, or delete it and add it again from the project's Presets, so it loads the new `two-song-fx.js`. Its status should read `Ready - both song groups` and, when there are zones, `· N FX QUIET`. If it shows `balance off`, the DRUM FX groups were not found.
+1. In Live, open a set built by `scripts/ableton-stem-set.py`; **LiveMixer Living FX** on Main should read `Ready · N songs · vocals N/N · gestures 12/12 · M FX QUIET` (gestures only in a `--gestures` set); fewer vocals than songs means some songs' vocals will not follow the hand. Or, for the hand-built set, open `LiveMixer - Two Song Trial.als`. On Main, press **Refresh** on **LiveMixer Two Song FX**, or delete it and add it again from the project's Presets, so it loads the new `two-song-fx.js`. Its status should read `Ready - both song groups` and, when there are zones, `· N FX QUIET`. If it shows `balance off`, the DRUM FX groups were not found.
 2. In this repository, run `npm run dev` and, in another terminal, `uv run scripts/ableton-bridge.py`.
 3. Open http://127.0.0.1:4178/sim.html?sim=tide (or `lantern` or `murmuration`).
-4. In the same browser, open http://127.0.0.1:4178/ableton.html and click **Connect to Live**. **Living** is selected automatically once the simulation's schema arrives. The meters show the song axes and the incoming signals.
+4. In the same browser, open http://127.0.0.1:4178/ableton.html and click **Connect to Live**. **Living** is selected automatically once the simulation's schema arrives. The meters show the song axes and the incoming signals. A simulation without the living signals (trails, veil, …) keeps Living running on the hand alone (presence and gestures); the page never drops to Manual by itself. Every mode starts at home (vocals off), and nothing but a fresh hand (Living, Simulation) or the Manual slider raises the vocals. The status line says *Live connected* only when Live's device is bound and the bridge's MIDI port is open; otherwise it names the missing MIDI port, or says another control window is in charge. *Vocals in Live: on/off* is Live's own Vocal Presence gain, as Living FX reports it.
 5. Start playback in Live.
 
 ## Listening checklist (must be verified by ear in Live)
@@ -68,7 +98,8 @@ The device templates are extracted from the hand-built Drum Transition set: `pyt
 - [ ] Space blooms slowly. The Dub echo is a quiet tail and never a throw. The Main reverb is not washy.
 - [ ] Waving wildly keeps the song near home. A still, patient hand transforms it the most.
 - [ ] In `FX QUIET` zones the transition plays as authored, and the effects return smoothly afterwards.
-- [ ] Closing the controls page or stopping the bridge returns the effects and group balance to home within about 2 s. Vocals return to full, which is the bridge’s existing fail-safe default.
+- [ ] When the hand input or the simulation stalls (or the input never connected), Living mode keeps running with nobody present: vocals fade out over the governor’s normal 2.5 s and the effects ease home, with no cut and no vocal blast. The page releases Live only after 30 s of stall, and when input returns the song starts again from home without a jump.
+- [ ] Closing the controls page or stopping the bridge returns the effects and group balance to home within about 2 s. Vocals go to the bridge’s fail-safe, which is off (instrumental home) with `--fail-safe living`, the default.
 - [ ] The group volumes return to their original positions after Release, Refresh or deleting the device. Check that DRUM FX and TEXTURE FX volumes have no automation, because the device would override it.
 - [ ] The Auto audition and the device dials still work as before.
 

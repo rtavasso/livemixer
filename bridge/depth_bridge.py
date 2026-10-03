@@ -84,7 +84,9 @@ import json
 import logging
 import math
 import os
+import signal
 import sys
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
@@ -189,6 +191,10 @@ class TrackedHand:
     grab_strength: float = 0.0
     pinch_strength: float = 0.0
     has_elbow: bool = True
+    #: ``(u, v, depth)`` of the point ``PALM_NORMAL_MM`` out from the palm along the tracker's palm
+    #: normal, projected like ``joints`` so any mirroring or reorientation applies to it too; None when
+    #: the source has no palm normal.
+    palm_normal_tip: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if self.type not in HAND_TYPES:
@@ -803,6 +809,8 @@ class SkeletonHand:
     pinch: float
     has_elbow: bool
     points: tuple[Vec3, ...]
+    #: Unit vector out of the palm in box axes (u right, v down, w away), or None when unknown.
+    palm_normal: Vec3 | None = None
 
     @property
     def pos(self) -> Vec3:
@@ -935,6 +943,17 @@ def normalize_tracked_hand(
             depth_of_part[WIDTH_FINGERS + f] = hand.finger(f)[:, 2].mean()
         widths = upright.width_to_u(hand.widths_px, depth_of_part)
     palm = joints[JOINT_PALM]
+    palm_normal: Vec3 | None = None
+    if hand.palm_normal_tip is not None:
+        tip = np.asarray(hand.palm_normal_tip, dtype=np.float64)
+        if upright is None:
+            out = np.array([(tip[0] + 0.5 - x0) / rw, (tip[1] + 0.5 - y0) / rh, (tip[2] - near_mm) / (far_mm - near_mm)])
+        else:
+            out = np.array([float(np.asarray(c).reshape(-1)[0]) for c in upright.unit_from_pixels(tip[[0]], tip[[1]], tip[[2]])])
+        d = out - palm
+        n = float(np.linalg.norm(d))
+        if np.isfinite(n) and n > 1e-9:
+            palm_normal = (float(d[0] / n), float(d[1] / n), float(d[2] / n))
     tips = [joints[finger_joint(f, JOINTS_PER_FINGER - 1)] for f in range(N_FINGERS)]
     points: tuple[Vec3, ...] = tuple((float(p[0]), float(p[1]), float(p[2])) for p in (palm, *tips)) if sample_points > 0 else ()
     return SkeletonHand(
@@ -942,7 +961,7 @@ def normalize_tracked_hand(
         conf=min(1.0, max(MIN_TRACKED_CONF, float(hand.confidence))),
         openness=min(1.0, max(0.0, 1.0 - float(hand.grab_strength))),
         pinch=min(1.0, max(0.0, float(hand.pinch_strength))),
-        has_elbow=bool(hand.has_elbow), points=points,
+        has_elbow=bool(hand.has_elbow), points=points, palm_normal=palm_normal,
     )
 
 
@@ -1710,7 +1729,7 @@ def skeleton_message(hand: SkeletonHand) -> dict[str, Any]:
 
 def tracked_hand_message(hand: SkeletonHand) -> dict[str, Any]:
     """A ``hands[]`` entry for a tracked hand: ``pos`` is the palm (clamped), ``extent`` spans every joint."""
-    return {
+    msg = {
         "id": int(hand.id),
         "pos": _vec(hand.pos),
         "conf": _unit(hand.conf),
@@ -1720,6 +1739,9 @@ def tracked_hand_message(hand: SkeletonHand) -> dict[str, Any]:
         "points": [_vec(p) for p in hand.points[:MAX_POINTS]],
         "skeleton": skeleton_message(hand),
     }
+    if hand.palm_normal is not None:
+        msg["palmNormal"] = [round(min(1.0, max(-1.0, c)), 4) for c in hand.palm_normal]
+    return msg
 
 
 def blob_hand_message(b: Blob) -> dict[str, Any]:
@@ -1847,34 +1869,107 @@ def _websockets_api() -> tuple[Callable[..., Any], Callable[..., Any], type[Base
 
 
 class SourceGaveUp(RuntimeError):
-    """The source failed more times in a row than ``max_restarts`` allows."""
+    """The source failed more times in a row than ``max_restarts`` allows, or only a fresh process can bring it back."""
+
+
+class AnalysisFailing(RuntimeError):
+    """Every frame's analysis has raised for longer than ``analysis_fail_exit_s``."""
+
+
+class RateLimitedLog:
+    """Logs the first event of a streak at once, then at most one summary every ``every_s`` seconds."""
+
+    def __init__(self, every_s: float = 60.0, clock: Callable[[], float] = time.monotonic) -> None:
+        self.every_s, self.clock = float(every_s), clock
+        self.since: float | None = None  # start of the current streak
+        self.count = 0
+        self._last: float | None = None
+
+    def hit(self, level: int, message: str, *args: Any, exc_info: bool = False) -> bool:
+        """Count one event; log it (with a running count) when due. Returns whether it was logged."""
+        now = self.clock()
+        if self.since is None:
+            self.since = now
+        self.count += 1
+        if self._last is not None and now - self._last < self.every_s:
+            return False
+        self._last = now
+        suffix = "" if self.count == 1 else f" [{self.count} times over {now - self.since:.0f} s; logged at most every {self.every_s:.0f} s]"
+        log.log(level, message + suffix, *args, exc_info=exc_info)
+        return True
+
+    def reset(self) -> tuple[int, float]:
+        """End the streak; returns ``(events, seconds)`` it lasted."""
+        count, seconds = self.count, (self.clock() - self.since) if self.since is not None else 0.0
+        self.since, self.count, self._last = None, 0, None
+        return count, seconds
+
+
+#: A client whose unsent data exceeds this is skipped by :meth:`BridgeServer.broadcast` until it drains.
+CLIENT_BUFFER_LIMIT = 1 << 20
+
+
+def _write_buffer_size(ws: Any) -> int:
+    transport = getattr(ws, "transport", None)
+    try:
+        return int(transport.get_write_buffer_size()) if transport is not None else 0
+    except Exception:  # noqa: BLE001 - a closing transport: let websockets decide
+        return 0
 
 
 class BridgeServer:
     """Asyncio WebSocket server that broadcasts analyzer output to every client.
 
     Frames are read from the source in a worker thread (``read()`` blocks),
-    analyzed on the loop thread, and fanned out with ``websockets.broadcast``,
-    which skips clients whose send buffer is full rather than stalling the
-    capture. The loop keeps running with zero clients; source errors become
-    ``status`` messages and trigger a restart with backoff.
+    analyzed on the loop thread, and fanned out with ``websockets.broadcast``.
+    That call never awaits, but from websockets 13 on it queues every frame
+    on every open connection, so :meth:`broadcast` itself skips a client whose
+    unsent data is over ``client_buffer_limit`` (a vanished laptop on Wi-Fi):
+    it drops frames for that client until its socket drains or the keepalive
+    ping closes it, and never stalls the capture or grows without bound.
+    The loop keeps running with zero clients; source errors become
+    ``status`` messages and trigger a restart with a short backoff; an
+    analyzer exception skips that frame (``AnalysisFailing`` once every frame
+    has failed for ``analysis_fail_exit_s``).
     """
 
-    def __init__(self, source: FrameSource, analyzer: BoxAnalyzer, hello: dict[str, Any], host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, max_restarts: int | None = None) -> None:
+    def __init__(
+        self, source: FrameSource, analyzer: BoxAnalyzer, hello: dict[str, Any], host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
+        max_restarts: int | None = None, restart_backoff: tuple[float, float] = (1.0, 2.0), analysis_fail_exit_s: float = 30.0,
+        read_timeout_s: float | None = None, client_buffer_limit: int = CLIENT_BUFFER_LIMIT,
+    ) -> None:
         #: Consecutive failed source restarts after which :meth:`run` gives up (``None``: never), so a supervisor can start a fresh process.
         self.max_restarts = max_restarts
+        #: ``(first, longest)`` pause before restarting a failed source, doubling in between.
+        self.restart_backoff = (float(restart_backoff[0]), float(restart_backoff[1]))
+        self.analysis_fail_exit_s = float(analysis_fail_exit_s)
+        #: A ``read()`` that has not returned after this long is taken as hung (only a fresh process helps); ``None``: wait forever.
+        self.read_timeout_s = read_timeout_s
+        self.client_buffer_limit = int(client_buffer_limit)
         self.source, self.analyzer, self.hello, self.host, self.port = source, analyzer, hello, host, port
         self._clients: set[Any] = set()
         self._serve, self._broadcast, self._closed = _websockets_api()
         self.seq = 0
+        self.dropped = 0  # frames skipped for slow clients
+        self.read_hung = False
+        self._source_log = RateLimitedLog(60.0)
+        self._analysis_log = RateLimitedLog(10.0)
+        self._slow_log = RateLimitedLog(60.0)
 
     @property
     def client_count(self) -> int:
         return len(self._clients)
 
     def broadcast(self, msg: dict[str, Any]) -> None:
-        if self._clients:
-            self._broadcast(self._clients, encode_message(msg))
+        if not self._clients:
+            return
+        ready = [ws for ws in self._clients if _write_buffer_size(ws) <= self.client_buffer_limit]
+        slow = len(self._clients) - len(ready)
+        if slow:
+            self.dropped += slow
+            self._slow_log.hit(logging.WARNING, "dropping frames for %d client(s) that are not reading (send buffer over %d KiB)", slow, self.client_buffer_limit >> 10)
+        if ready:
+            self._broadcast(ready, encode_message(msg))
 
     async def _handle_client(self, ws: Any) -> None:
         peer = getattr(ws, "remote_address", None)
@@ -1892,38 +1987,100 @@ class BridgeServer:
             self._clients.discard(ws)
             log.info("client %s disconnected (%d connected)", peer, len(self._clients))
 
+    async def _read(self) -> DepthFrame:
+        """``source.read()`` on a daemon thread (so a read that never returns cannot hold up the interpreter's exit)."""
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[DepthFrame] = loop.create_future()
+
+        def settle(result: Any, exc: BaseException | None) -> None:
+            if not future.done():
+                if exc is not None:
+                    future.set_exception(exc)
+                else:
+                    future.set_result(result)
+
+        def work() -> None:
+            result, error = None, None
+            try:
+                result = self.source.read()
+            except BaseException as exc:  # noqa: BLE001 - handed to the loop
+                error = exc
+            try:
+                loop.call_soon_threadsafe(settle, result, error)
+            except RuntimeError:  # the loop is gone (shutting down)
+                pass
+
+        threading.Thread(target=work, name="source-read", daemon=True).start()
+        done, _ = await asyncio.wait({future}, timeout=self.read_timeout_s)
+        if not done:  # the thread cannot be cancelled and a second read beside it would race: only a new process helps
+            self.read_hung = True
+            log.error("%s.read() has not returned for %.0f s; exiting so a fresh process can take over", self.source.name, self.read_timeout_s)
+            raise SourceGaveUp("read hung")
+        return future.result()
+
     async def pump_once(self) -> bool:
-        """Read, analyze and broadcast one frame. Returns False if the source failed."""
+        """Read, analyze and broadcast one frame. Returns False if the source failed.
+
+        An exception from the analysis skips that frame (logged at most every
+        10 s); once every frame has failed for ``analysis_fail_exit_s`` it
+        raises :class:`AnalysisFailing` so a supervisor restarts the process.
+        """
         try:
-            frame = await asyncio.to_thread(self.source.read)
+            frame = await self._read()
+        except SourceGaveUp:
+            raise
         except Exception as exc:  # noqa: BLE001 - hardware errors are reported, not fatal
-            log.error("source %s failed: %s", self.source.name, exc)
+            self._source_log.hit(logging.ERROR, "source %s failed (retrying until it delivers frames again): %s", self.source.name, exc)
             self.broadcast(status_message("error", f"{self.source.name}: {exc}"))
             return False
-        result = self.analyzer.analyze(frame)
-        self.broadcast(frame_message(self.seq, frame.timestamp, result))
+        try:
+            result = self.analyzer.analyze(frame)
+            self.broadcast(frame_message(self.seq, frame.timestamp, result))
+        except Exception as exc:  # noqa: BLE001 - one bad frame must not stop the show
+            log_ = self._analysis_log
+            log_.hit(logging.ERROR, "analysing a %s frame failed, frame skipped: %s", self.source.name, exc, exc_info=log_.count == 0)
+            if log_.since is not None and time.monotonic() - log_.since > self.analysis_fail_exit_s:
+                log.error("every frame has failed analysis for %.0f s; exiting so a fresh process can take over", time.monotonic() - log_.since)
+                raise AnalysisFailing(str(exc)) from exc
+            return True
+        if self._analysis_log.since is not None:
+            count, seconds = self._analysis_log.reset()
+            log.info("analysis recovered after %d failed frame(s) over %.1f s", count, seconds)
         self.seq += 1
         return True
 
     async def _pump(self) -> None:
-        backoff, failures = 1.0, 0
+        first, longest = self.restart_backoff
+        backoff, failures = first, 0
         while True:
             if await self.pump_once():
-                backoff, failures = 1.0, 0
+                if failures:
+                    count, seconds = self._source_log.reset()
+                    log.info("%s is delivering frames again (after %d failure(s) over %.0f s)", self.source.name, count, seconds)
+                backoff, failures = first, 0
                 continue
             failures += 1
+            self._give_up_if_stuck(failures)
             if self.max_restarts is not None and failures > self.max_restarts:
                 log.error("%s failed %d times in a row; giving up so a fresh process can take over", self.source.name, failures)
                 self.broadcast(status_message("error", f"{self.source.name}: giving up after {failures} failures; restarting the bridge"))
                 raise SourceGaveUp(failures)
             await asyncio.sleep(backoff)
-            backoff = min(8.0, backoff * 2.0)
+            backoff = min(longest, backoff * 2.0)
             try:
                 self.source.stop()
                 self.source.start()
                 self.broadcast(status_message("info", f"{self.source.name} restarted"))
             except Exception as exc:  # noqa: BLE001
-                log.error("restarting %s failed: %s", self.source.name, exc)
+                self._source_log.hit(logging.ERROR, "restarting %s failed: %s", self.source.name, exc)
+            self._give_up_if_stuck(failures)
+
+    def _give_up_if_stuck(self, failures: int) -> None:
+        """A source whose native thread is stuck (``needs_hard_exit``) cannot be restarted in this process."""
+        if getattr(self.source, "needs_hard_exit", False):
+            log.error("%s is stuck in a native call; exiting so a fresh process can take over", self.source.name)
+            self.broadcast(status_message("error", f"{self.source.name}: stuck; restarting the bridge"))
+            raise SourceGaveUp(failures)
 
     async def run(self) -> None:
         async with self._serve(self._handle_client, self.host, self.port):
@@ -2023,6 +2180,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--background-file", default=None, metavar="PATH", help="with --background, save the learned scene here (.npy) and reuse it on later starts instead of learning again; delete the file to relearn")
     p.add_argument("--background-margin", type=float, default=30.0, metavar="MM", help="with --background, how far in front of the learned scene a pixel must be to count (default: %(default)s)")
     p.add_argument("--max-restarts", type=int, default=None, metavar="N", help="exit with status 3 after N consecutive failed source restarts instead of retrying forever, so a supervisor (bridge/run-leap.sh) can start a fresh process; the Leap service sometimes re-enumerates the camera in a way only a new LeapC connection from a new process recovers from (default: keep retrying)")
+    p.add_argument("--stall-restart", type=float, default=5.0, metavar="SECONDS", help="--source leap: restart the LeapC connection after this long without a stereo image (unplugged controller, service restart, stall); retried every few seconds until frames return (default: %(default)s)")
     p.add_argument("--max-jump", type=float, default=0.25, help="largest normalized centroid move per frame that keeps a blob id (default: %(default)s)")
     p.add_argument("--resolution", type=int, nargs=2, default=(640, 480), metavar=("W", "H"), help="camera/synthetic frame size (default: 640 480)")
     p.add_argument("--decimation", type=int, default=0, help="RealSense decimation filter magnitude, 0 = off (default: %(default)s)")
@@ -2055,7 +2213,8 @@ def build_parser() -> argparse.ArgumentParser:
     leap.add_argument("--swap-cameras", action="store_true", help="exchange the two cameras before matching (use when the depth image stays empty with a hand over the device)")
     leap.add_argument("--leap-orient", choices=LEAP_ORIENTATIONS, default="none", help="rotate/flip the depth image before analysis so image right/down mean what the browser expects (default: none)")
     leap.add_argument("--leap-hand-frame", default="auto", metavar="MODE", help="how the LeapC hand skeleton is projected onto the depth image: 'auto' (default: every convention is scored against the scan until one clearly leads) or a convention name u{+|-}{x|z}_v{+|-}{z|x}_ref{+|-}, see bridge/README.md")
-    leap.add_argument("--leap-timeout", type=float, default=20.0, metavar="S", help="treat the Leap as failed after S seconds without a stereo pair; the service streams even with the box empty, so silence means it stopped (default: %(default)s)")
+    leap.add_argument("--leap-state", default=None, metavar="PATH", help="save the auto-fitted camera alignment and the locked hand frame here (JSON) and start from them next time instead of learning again; an explicit --leap-align/--leap-hand-frame wins (default: off; bridge/run-leap.sh uses bridge/.leap-state.json)")
+    leap.add_argument("--relearn", action="store_true", help="with --leap-state, ignore the saved alignment and hand frame and learn them again (the file is overwritten once they are)")
     p.add_argument("--log-level", default="info", choices=("debug", "info", "warning", "error"))
     return p
 
@@ -2071,11 +2230,14 @@ def make_source(args: argparse.Namespace) -> FrameSource:
         try:
             view = leap.ls.RectifiedView.from_fov(args.leap_view[0], args.leap_view[1], args.leap_fov)
             params = leap.stereo_params_from_args(args, args.near * 1000.0, prefix="leap_")
+            state = getattr(args, "leap_state", None)
+            alignment, hand_frame = leap.resolve_learned(state, args.leap_align, args.leap_hand_frame, args.swap_cameras, args.leap_orient, relearn=getattr(args, "relearn", False))
             if args.source == "leap-synthetic":
-                return leap.LeapSyntheticSource(view, params, args.swap_cameras, args.leap_orient, fps=args.fps, paced=args.dump is None, hand_frame=args.leap_hand_frame, far_mm=args.far * 1000.0)
-            return leap.LeapStereoSource(args.leapc, view, params, args.swap_cameras, args.leap_orient, fps=args.fps, hand_frame=args.leap_hand_frame,
-                                         alignment=args.leap_align, calibration=args.leap_calibration, far_mm=args.far * 1000.0,
-                                         restart_after=args.leap_timeout)
+                return leap.LeapSyntheticSource(view, params, args.swap_cameras, args.leap_orient, fps=args.fps, paced=args.dump is None, hand_frame=hand_frame,
+                                                far_mm=args.far * 1000.0, state_file=state)
+            return leap.LeapStereoSource(args.leapc, view, params, args.swap_cameras, args.leap_orient, fps=args.fps, hand_frame=hand_frame,
+                                         alignment=alignment, calibration=args.leap_calibration, far_mm=args.far * 1000.0,
+                                         restart_after=getattr(args, "stall_restart", 5.0), state_file=state)
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
     raise SystemExit(f"unknown source {args.source!r}")
@@ -2098,9 +2260,9 @@ def resolve_intrinsics(source: FrameSource, frame: str) -> Intrinsics | None:
     return intrinsics
 
 
-def _finish(source: FrameSource, code: int) -> int:
+def _finish(source: FrameSource, code: int, force: bool = False) -> int:
     """Exit code, or a hard exit when a native thread is stuck inside the source (LeapC's 5.0-preview stall)."""
-    if getattr(source, "needs_hard_exit", False):
+    if force or getattr(source, "needs_hard_exit", False):
         log.warning("a native thread is stuck inside %s; exiting hard", source.name)
         sys.stdout.flush()
         sys.stderr.flush()
@@ -2131,6 +2293,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     except ValueError as exc:
         parser.error(str(exc))
+    if not args.stall_restart > 0:
+        parser.error("--stall-restart must be positive")
     source = make_source(args)
     try:
         intrinsics = resolve_intrinsics(source, args.frame)
@@ -2158,8 +2322,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         source.start()
     except (RuntimeError, NotImplementedError) as exc:
         log.error("%s", exc)
-        return 1
-    server = BridgeServer(source, analyzer, hello, args.host, args.port, max_restarts=args.max_restarts)
+        return _finish(source, 1)
+    server = BridgeServer(source, analyzer, hello, args.host, args.port, max_restarts=args.max_restarts,
+                          read_timeout_s=max(30.0, 4.0 * args.stall_restart))
+    install_stop_signals()
     code = 0
     try:
         asyncio.run(server.run())
@@ -2167,9 +2333,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         log.info("stopping")
     except SourceGaveUp:
         code = 3
+    except AnalysisFailing:
+        code = 4
+    except Exception:  # noqa: BLE001 - logged with its traceback; the supervisor restarts the process
+        log.exception("bridge failed")
+        code = 1
     finally:
-        source.stop()
-    return _finish(source, code)
+        if not server.read_hung:  # a hung read() holds the source: stopping it would hang too
+            source.stop()
+    return _finish(source, code, force=server.read_hung)
+
+
+STOP_SIGNALS = tuple(getattr(signal, name) for name in ("SIGINT", "SIGTERM", "SIGHUP") if hasattr(signal, name))
+
+
+def install_stop_signals() -> None:
+    """Ctrl-C, SIGTERM and SIGHUP all stop the bridge the same way: the source is closed and the exit code is 0.
+
+    The first one raises ``KeyboardInterrupt``; later ones (bridge/run-leap.sh
+    forwards a Ctrl-C as SIGTERM, and uv forwards it again) are ignored so they
+    cannot interrupt the clean-up. Installing a SIGINT handler also undoes
+    the "ignored" SIGINT a shell hands to a background job.
+    """
+    def stop(_signum: int, _frame: Any) -> None:
+        for s in STOP_SIGNALS:
+            signal.signal(s, signal.SIG_IGN)
+        raise KeyboardInterrupt
+
+    for s in STOP_SIGNALS:
+        signal.signal(s, stop)
 
 
 if __name__ == "__main__":

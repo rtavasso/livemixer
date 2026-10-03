@@ -4,6 +4,10 @@
  * loop and is the only place where those pieces meet.
  *
  * Frame:  source.sample → tracker.tick → gestures → N fixed steps → render → signals → telemetry
+ *
+ * Liveness: requestAnimationFrame drives rendered frames. A hidden page gets no rAF, so a
+ * background ticker (and every arriving source frame) keeps input, simulation steps, signals and
+ * telemetry flowing without rendering; the audio side never notices the page was hidden.
  */
 import type { AnyParamValue, GestureSettingsLike, OccupancyField, Quality, SimContext, SimInput, SimulationInstance } from './contracts';
 import { clampSignals, coerceParam, resolveParams } from '../core/params';
@@ -33,7 +37,11 @@ import type { SimulationOutput } from '../core/output';
 
 export interface HostWarning { atMs: number; message: string }
 export interface HostPerf { fps: number; stepMs: number; renderMs: number; steps: number; droppedMs: number }
-export interface HostOptions { externalTelemetry?: boolean; fullscreenRoot?: HTMLElement }
+export interface HostOptions {
+  externalTelemetry?: boolean; fullscreenRoot?: HTMLElement;
+  /** Last resort after an unrecoverable WebGL loss; the page restores its source and simulation from URL/localStorage. */
+  reload?: () => void;
+}
 
 export interface HostState {
   simulation: AnySimulation;
@@ -64,12 +72,22 @@ export interface HostState {
 }
 
 const RAW_SAMPLE_WINDOW_MS = 1000;
+/** Rate of the input/telemetry ticks that stand in for rAF while the page is hidden. */
+export const BACKGROUND_TICK_MS = 1000 / 30;
+/** Without a rAF frame for this long on a visible page (an occluded window), the background ticker takes over too. */
+const RAF_STALL_MS = 500;
+/** How long the browser gets to restore a lost WebGL context before the host builds a new canvas. */
+export const CONTEXT_RESTORE_MS = 10_000;
+/** A replacement canvas lost again within this window means the GPU is not coming back in this page: reload. */
+const CONTEXT_RELOAD_WINDOW_MS = 60_000;
 
 export class SimHost {
   private output: SimulationOutput | null = null;
   /** Null while stopped, restarting, or recovering from a simulation/GL failure. */
   get latestOutput(): SimulationOutput | null { return this.output; }
-  readonly canvas: HTMLCanvasElement;
+  private stage: HTMLCanvasElement;
+  /** Replaced (same element role, new GL context) when a lost WebGL context is not restored. */
+  get canvas(): HTMLCanvasElement { return this.stage; }
   readonly settings: SettingsStore;
   readonly bus: TelemetryBus;
   readonly tracker: HandTracker;
@@ -107,6 +125,11 @@ export class SimHost {
   private fps = new RateMeter();
   private perf: HostPerf = { fps: 0, stepMs: 0, renderMs: 0, steps: 0, droppedMs: 0 };
   private raf = 0; private running = false; private contextLost = false;
+  private backgroundTimer?: ReturnType<typeof setInterval>;
+  /** When frame() last ran, rendered or not; keeps rAF and the background ticker from both driving a frame. */
+  private lastFrameMs = -Infinity;
+  private contextTimer?: ReturnType<typeof setTimeout>;
+  private lastCanvasReplaceMs = -Infinity;
   /** Pending automatic recreate after a simulation failure. */
   private retryTimer?: ReturnType<typeof setTimeout>;
   private recording = false;
@@ -121,14 +144,10 @@ export class SimHost {
     this.sessionOriginMs = this.now();
     const problems = validateRegistry();
     if (problems.length) throw new Error(`Simulation registry problems:\n${problems.join('\n')}`);
-    this.canvas = document.createElement('canvas');
-    this.canvas.className = 'sim-stage';
-    this.canvas.setAttribute('aria-label', 'Simulation');
-    root.appendChild(this.canvas);
+    this.stage = this.makeCanvas();
+    root.appendChild(this.stage);
     // The bus exists before anything that may warn (GL capability probing does).
     this.bus = new TelemetryBus(settings.value.telemetry.rateHz);
-    this.canvas.addEventListener('webglcontextlost', event => { event.preventDefault(); this.contextLost = true; this.warn('WebGL context lost. Waiting for the browser to restore it.'); this.disposeInstance(); });
-    this.canvas.addEventListener('webglcontextrestored', () => { invalidateQuadCache(this.gl); this.contextLost = false; this.warn('WebGL context restored.'); this.setupGl(); this.createInstance(); });
     this.setupGl();
     // A persisted 'replay' has no file to replay at launch; fall back to the pointer.
     this.sourceId = settings.value.source === 'replay' ? 'pointer' : settings.value.source;
@@ -138,7 +157,7 @@ export class SimHost {
     this.bus.onInbound(message => {
       if (message.type === 'set-param') this.setParam(message.name, message.value);
       else if (message.type === 'set-params') for (const [name, value] of Object.entries(message.values)) this.setParam(name, value);
-      else if (message.type === 'music') this.music.report(message.beat, message.playing, this.now(), message.bpm);
+      else if (message.type === 'music') this.music.report(message.beat, message.playing, this.now(), message.bpm, message.levels);
       else if (message.type === 'select-sim') { if (!this.selectSimulation(message.id)) this.bus.publishStatus('warning', `Unknown simulation "${message.id}".`); }
     });
     this.configureTelemetry();
@@ -149,6 +168,59 @@ export class SimHost {
   }
 
   // ------------------------------------------------------------------ setup
+
+  private makeCanvas(): HTMLCanvasElement {
+    const canvas = document.createElement('canvas');
+    canvas.className = 'sim-stage';
+    canvas.setAttribute('aria-label', 'Simulation');
+    canvas.addEventListener('webglcontextlost', this.onContextLost);
+    canvas.addEventListener('webglcontextrestored', this.onContextRestored);
+    return canvas;
+  }
+
+  private onContextLost = (event: Event) => {
+    event.preventDefault();
+    this.contextLost = true;
+    this.warn('WebGL context lost. Waiting for the browser to restore it.');
+    this.disposeInstance();
+    if (this.contextTimer) clearTimeout(this.contextTimer);
+    this.contextTimer = setTimeout(() => { this.contextTimer = undefined; if (this.contextLost) this.recoverContext(); }, CONTEXT_RESTORE_MS);
+  };
+
+  private onContextRestored = () => {
+    if (this.contextTimer) { clearTimeout(this.contextTimer); this.contextTimer = undefined; }
+    invalidateQuadCache(this.gl); this.contextLost = false; this.warn('WebGL context restored.'); this.setupGl(); this.createInstance();
+  };
+
+  /** The browser did not restore the context: build a fresh canvas and context, or reload the page if that already failed recently. */
+  private recoverContext() {
+    const now = this.now();
+    if (now - this.lastCanvasReplaceMs < CONTEXT_RELOAD_WINDOW_MS) { this.reloadPage('WebGL did not recover on a new canvas. Reloading the page.'); return; }
+    this.lastCanvasReplaceMs = now;
+    this.warn(`WebGL context not restored after ${CONTEXT_RESTORE_MS / 1000} s. Creating a new canvas.`);
+    const old = this.stage, next = this.makeCanvas();
+    next.tabIndex = old.tabIndex;
+    const hadFocus = typeof document !== 'undefined' && document.activeElement === old;
+    old.removeEventListener('webglcontextlost', this.onContextLost);
+    old.removeEventListener('webglcontextrestored', this.onContextRestored);
+    invalidateQuadCache(this.gl);
+    if (old.parentNode) old.replaceWith(next); else this.root.appendChild(next);
+    this.resizeObserver?.unobserve(old); this.resizeObserver?.observe(next);
+    this.stage = next;
+    if (hadFocus) next.focus();
+    try { this.setupGl(); } catch (error) { this.reloadPage(`WebGL unavailable on a new canvas (${error instanceof Error ? error.message : String(error)}). Reloading the page.`); return; }
+    if (this.gl.isContextLost()) { this.reloadPage('The new canvas has no WebGL context. Reloading the page.'); return; }
+    this.contextLost = false;
+    this.createInstance();
+    // The pointer source listens on the canvas element itself.
+    if (this.running && this.sourceId === 'pointer') void this.setSource('pointer');
+  }
+
+  private reloadPage(reason: string) {
+    this.warn(reason);
+    this.settings.flush();
+    (this.options.reload ?? (() => location.reload()))();
+  }
 
   private setupGl() {
     const { gl, capabilities } = createGl(this.canvas);
@@ -171,6 +243,8 @@ export class SimHost {
 
   private disposeInstance() {
     this.output = null;
+    // Never leave the last values on the bus: absent signals let the music fall back to input presence.
+    this.signals = {}; this.signalViolations = [];
     const instance = this.instance;
     this.instance = null; this.simContext = null;
     if (instance) { try { instance.dispose(); } catch (error) { console.warn('[sim] dispose failed', error); } }
@@ -279,7 +353,7 @@ export class SimHost {
     if (id !== 'replay') this.settings.update(s => { s.source = id; }); // a replay cannot be resumed at launch
     this.tracker.mapping = this.mappingFor(id); this.tracker.settings = this.trackerSettingsFor(id); this.tracker.rectify = this.settings.value.holograms[id]?.affine ?? null; this.tracker.reset();
     this.gestureMemory = emptyGestureMemory(); this.pendingEvents = []; this.rawSamples = []; this.fingertipSamples = []; this.calibration = {};
-    const emit = (frame: InputFrame) => { if (generation === this.sourceGeneration) this.ingest(frame); };
+    const emit = (frame: InputFrame) => { if (generation === this.sourceGeneration) { this.ingest(frame); this.backgroundTick(); } };
     let source: InputSource;
     switch (id) {
       case 'pointer': source = new PointerSource(this.canvas, emit, this.now); break;
@@ -404,13 +478,29 @@ export class SimHost {
     this.setSource(this.sourceId).catch(error => this.warn(error instanceof Error ? error.message : String(error)));
     const tick = () => { if (!this.running) return; this.raf = requestAnimationFrame(tick); this.frame(); };
     this.raf = requestAnimationFrame(tick);
+    // rAF does not run on a hidden page; this keeps input, signals and telemetry alive there (see backgroundTick).
+    this.backgroundTimer = setInterval(() => this.backgroundTick(), BACKGROUND_TICK_MS);
   }
   stop() {
     this.running = false; this.output = null; this.sourceGeneration++;
     cancelAnimationFrame(this.raf); this.source?.stop();
+    if (this.backgroundTimer) { clearInterval(this.backgroundTimer); this.backgroundTimer = undefined; }
     if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = undefined; }
   }
-  dispose() { this.stop(); this.disposeInstance(); this.bus.close(); this.resizeObserver?.disconnect(); this.settings.flush(); this.listeners.clear(); this.canvas.remove(); }
+  dispose() { this.stop(); if (this.contextTimer) { clearTimeout(this.contextTimer); this.contextTimer = undefined; } this.disposeInstance(); this.bus.close(); this.resizeObserver?.disconnect(); this.settings.flush(); this.listeners.clear(); this.canvas.remove(); }
+
+  /**
+   * A frame without rendering, when rAF is not driving: the page is hidden (no rAF at all) or
+   * rAF has stalled. Called from the interval timer and on every source frame, because Chrome
+   * throttles timers on hidden pages to 1 Hz (and less after minutes) while socket messages
+   * still arrive at full rate. The lastFrameMs check means it never doubles up on rAF.
+   */
+  private backgroundTick() {
+    if (!this.running) return;
+    const elapsed = this.now() - this.lastFrameMs;
+    const hidden = typeof document !== 'undefined' && document.hidden;
+    if (elapsed >= (hidden ? BACKGROUND_TICK_MS - 1 : RAF_STALL_MS)) this.frame(false);
+  }
 
   private ingest(frame: InputFrame) {
     if (this.recording) this.recorder.add(frame);
@@ -437,9 +527,11 @@ export class SimHost {
     this.notify();
   }
 
-  private frame() {
+  /** One host frame. `render` is false for background frames (hidden page): steps, signals and telemetry, no picture. */
+  private frame(render = true) {
     const now = this.now();
-    this.fps.tick(now);
+    this.lastFrameMs = now;
+    if (render) this.fps.tick(now);
     this.source?.sample?.(now);
     this.tracked = this.tracker.tick(now);
     const gestures = detectGestures(this.gestureMemory, this.tracked.hands, now, this.gestureSettings);
@@ -453,7 +545,7 @@ export class SimHost {
       if (!this.contextLost && !this.retryTimer) this.retryTimer = setTimeout(() => { this.retryTimer = undefined; this.warn(`Retrying "${this.definition.title}".`); this.createInstance(); }, 5000);
       return;
     }
-    this.resize();
+    if (render) this.resize();
     const { hands, volume, surface } = this.simSolid();
     const primary = hands[0] ?? null;
     const stepStart = this.now();
@@ -472,13 +564,13 @@ export class SimHost {
     try {
       const { width, height } = this.canvas;
       // Render time follows simulation time (plus the fraction of a step not yet simulated) so the two never drift apart.
-      this.instance.render({ time: this.simTime + result.alpha * this.stepper.stepMs / 1000, alpha: result.alpha, width, height, aspect: width / Math.max(1, height), depth: this.settings.value.volumeDepth }, this.params as never);
+      if (render) this.instance.render({ time: this.simTime + result.alpha * this.stepper.stepMs / 1000, alpha: result.alpha, width, height, aspect: width / Math.max(1, height), depth: this.settings.value.volumeDepth }, this.params as never);
       const clamped = clampSignals(this.definition.signals, this.instance.signals() as Record<string, number>);
       this.signals = clamped.values; this.signalViolations = clamped.violations;
       this.output = { simId: this.definition.id, atMs: now, signals: { ...this.signals }, input: { presence: this.tracked.presence, activity: this.tracked.activity } };
     } catch (error) { this.warn(`render failed: ${error instanceof Error ? error.message : String(error)}`); this.disposeInstance(); return; }
     const renderEnd = this.now();
-    this.perf = { fps: this.fps.value, stepMs: this.perf.stepMs + .1 * (stepEnd - stepStart - this.perf.stepMs), renderMs: this.perf.renderMs + .1 * (renderEnd - stepEnd - this.perf.renderMs), steps: result.steps, droppedMs: result.droppedMs };
+    if (render) this.perf = { fps: this.fps.value, stepMs: this.perf.stepMs + .1 * (stepEnd - stepStart - this.perf.stepMs), renderMs: this.perf.renderMs + .1 * (renderEnd - stepEnd - this.perf.renderMs), steps: result.steps, droppedMs: result.droppedMs };
     if (this.bus.publishFrame(now, () => this.telemetryFrame(now))) { this.lastEvents = this.frameEvents; this.frameEvents = []; }
   }
 
@@ -500,7 +592,7 @@ export class SimHost {
       type: 'schema', v: 1,
       sim: { id: this.definition.id, title: this.definition.title, description: this.definition.description, params: this.definition.params, signals: this.definition.signals },
       sims: SIMULATIONS.map(s => ({ id: s.id, title: s.title })),
-      input: { hand: ['id', 'x', 'y', 'z', 'vx', 'vy', 'vz', 'speed', 'radius', 'openness', 'pinch', 'push', 'ageMs', 'staleMs', 'solid'], gestures: GESTURE_TYPES, sources: SOURCE_IDS },
+      input: { hand: ['id', 'x', 'y', 'z', 'vx', 'vy', 'vz', 'speed', 'radius', 'openness', 'pinch', 'palmUp', 'push', 'ageMs', 'staleMs', 'solid'], gestures: GESTURE_TYPES, sources: SOURCE_IDS },
     };
   }
 
@@ -531,6 +623,6 @@ export class SimHost {
 }
 
 function handTelemetry(h: HandState): HandTelemetry {
-  return { id: h.id, x: round(h.position.x), y: round(h.position.y), z: round(h.position.z), vx: round(h.velocity.x), vy: round(h.velocity.y), vz: round(h.velocity.z), speed: round(h.speed), radius: round(h.radius), openness: round(h.openness), pinch: round(h.pinch), push: round(h.push), ageMs: Math.round(h.ageMs), staleMs: Math.round(h.staleMs), solid: h.capsules.length };
+  return { id: h.id, x: round(h.position.x), y: round(h.position.y), z: round(h.position.z), vx: round(h.velocity.x), vy: round(h.velocity.y), vz: round(h.velocity.z), speed: round(h.speed), radius: round(h.radius), openness: round(h.openness), pinch: round(h.pinch), palmUp: round(h.palmUp), push: round(h.push), ageMs: Math.round(h.ageMs), staleMs: Math.round(h.staleMs), solid: h.capsules.length };
 }
 const round = (v: number) => Math.round(v * 1000) / 1000;

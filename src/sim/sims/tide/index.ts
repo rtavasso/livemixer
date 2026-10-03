@@ -12,6 +12,10 @@
  * still, patient hand draws them into a ring circling it; a splash scatters them to the dim edges;
  * they return after calm. They leave faint wakes in the plankton and pulse with the music's beat.
  *
+ * Gestures (smoothed per hand, `HandGestures`): a fist coils a willing school tighter and closer
+ * around it; a palm turned up wells the plankton light up around the hand like an offering; a palm
+ * turned down calms the water under it. Fear is untouched by all three.
+ *
  * Signals are the shared living five (`model.ts`). Emissive light on true black only, faded at the
  * calibrated active area and the weak top band.
  */
@@ -23,8 +27,8 @@ import { PingPong, bindScreen, pickFormat } from '../../gl/fbo';
 import { drawQuad, quadProgram } from '../../gl/quad';
 import { Program } from '../../gl/program';
 import { areaUniform, LIVING_SIGNALS, Mood, pictureHands, type PictureHand } from '../living';
-import { Forces, GLOW_SCALE, HandWater, TideSignals, agitationFrom, substeps, waveGrid } from './model';
-import { School, SEGMENTS, closeRadius, type SchoolBounds } from './school';
+import { Forces, GLOW_SCALE, DEFAULT_GESTURES, HandGestures, HandWater, TideSignals, agitationFrom, substeps, waveGrid } from './model';
+import { FIST_COIL, FIST_PULL, School, SEGMENTS, closeRadius, type SchoolBounds } from './school';
 import * as glsl from './shaders';
 
 const SEED = 41;
@@ -47,6 +51,10 @@ export default defineSimulation({
     school: { kind: 'number', default: 48, min: 0, max: MAX_EELS, step: 1, label: 'School size', description: 'Number of eels.' },
     eelBrightness: { kind: 'number', default: .8, min: 0, max: 2, step: .05, label: 'Eel brightness', description: 'Brightness of the eels.' },
     glimmer: { kind: 'number', default: .5, min: 0, max: 1, step: .01, label: 'Idle glimmer', description: 'Faint twinkles and drops that keep the empty water alive, pulsing with the beat.' },
+    fistCoil: { kind: 'number', default: FIST_COIL, min: 0, max: .8, step: .01, label: 'Fist coil', description: 'How much tighter the school circles a fist than an open hand (fraction of the ring radius).' },
+    fistPull: { kind: 'number', default: FIST_PULL, min: 0, max: 2, step: .05, label: 'Fist pull', description: 'How much harder a willing school is drawn onto its ring around a fist.' },
+    offering: { kind: 'number', default: DEFAULT_GESTURES.offering, min: 0, max: 3, step: .05, label: 'Palm-up offering', description: 'How much brighter and wider the plankton wells up around a palm turned up.' },
+    calming: { kind: 'number', default: DEFAULT_GESTURES.calming, min: 0, max: 1, step: .05, label: 'Palm-down calm', description: 'How much a palm turned down stills the water and light under it.' },
   },
   signals: LIVING_SIGNALS,
   stepHz: 60,
@@ -95,12 +103,13 @@ export default defineSimulation({
     let school = new School(Math.min(MAX_EELS, initial.school), bounds(), SEED);
     const mood = new Mood();
     const water = new HandWater();
+    const gestures = new HandGestures();
     const forces = new Forces();
     const signals = new TideSignals();
     const random = rng(SEED + 1);
     let time = 0, pulse = 0, dropIn = 1, lastBeat = -1;
     let hands: PictureHand[] = [];
-    const handData = new Float32Array(8), contactData = new Float32Array(2);
+    const handData = new Float32Array(8), contactData = new Float32Array(2), offerData = new Float32Array(2), calmData = new Float32Array(2);
 
     gl.disable(gl.BLEND); gl.disable(gl.DEPTH_TEST); gl.disable(gl.SCISSOR_TEST);
 
@@ -154,8 +163,10 @@ export default defineSimulation({
         const primary = picture.primary;
 
         // Hands → disturbances, agitation, mood.
+        gestures.update(hands, dt);
+        const gesture = { offering: params.offering, calming: params.calming };
         forces.begin();
-        water.update(hands, dt, time, aspect, params.force, forces);
+        water.update(hands, dt, time, aspect, params.force, forces, gestures, gesture);
         const agitation = agitationFrom(water.stir);
         const stillness = primary ? 1 - clamp01(primary.speed / .6) : 1;
         mood.update(dt, { presence: input.presence, stillness, agitation });
@@ -172,7 +183,8 @@ export default defineSimulation({
 
         // The school.
         const hand = primary ? { x: primary.x * aspect, y: primary.y, radius: primary.radius * aspect } : null;
-        school.update({ dt, boldness: mood.boldness, fear: mood.fear, hand, bounds: bounds(mood.fear) });
+        school.update({ dt, boldness: mood.boldness, fear: mood.fear, hand, bounds: bounds(mood.fear),
+          grip: primary ? gestures.get(primary.id).grip : 0, coil: params.fistCoil, pull: params.fistPull });
         const closeness = hand ? school.fractionWithin(hand.x, hand.y, closeRadius(hand.radius)) : 0;
         signals.update(dt, input.presence, primary, agitation, closeness);
 
@@ -191,13 +203,16 @@ export default defineSimulation({
           const h = hands[i];
           handData.set([h.x, h.y, h.radius * aspect, h.reach], i * 4);
           contactData[i] = h.contact;
+          const g = gestures.get(h.id);
+          offerData[i] = g.offer; calmData[i] = g.calm;
         }
         const decay = Math.exp(-dt / Math.max(.05, params.persistence / 2.5));
         pGlow.use().texture('u_glow', glowField.read.texture, 0).texture('u_wave', wave.read.texture, 1)
           .f2('u_waveTexel', 1 / wave.width, 1 / wave.height).f2('u_glowSize', glowField.width, glowField.height)
           .f1('u_decay', decay).f1('u_floor', glowFormat === 'rgba8' ? .0025 : .0004).f1('u_gain', 1).f1('u_dt', dt).f1('u_aspect', aspect).f1('u_time', time)
           .f1('u_sparkle', 5e-5 * params.glimmer * (1 + 2 * pulse) * (1 - .5 * input.presence))
-          .i1('u_handCount', hc).f4v('u_hands', handData).f1v('u_contact', contactData);
+          .i1('u_handCount', hc).f4v('u_hands', handData).f1v('u_contact', contactData)
+          .f1v('u_offer', offerData).f1v('u_calm', calmData).f1('u_offering', params.offering).f1('u_calming', clamp01(params.calming));
         glowField.write.bind(); drawQuad(gl); glowField.swap();
 
         // Eel wakes: the heads leave faint light in the water.

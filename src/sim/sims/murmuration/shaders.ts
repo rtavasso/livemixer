@@ -13,12 +13,14 @@ import { ghostFrameGlsl } from '../living';
  * sprite of the same energy). `u_shimmer` is the banking glint: a mote heading toward the sun
  * direction catches the light, one heading away dims, so waves of light run through a turning
  * sheet. `u_hue` grades far motes toward dusk and tints the glint rose.
+ * `u_musicShimmer` (from the melodic parts in Live) runs a slow band of light through the flock on top
+ * of all that, with `u_phase` as its clock.
  */
 export const MOTE_VS = `${GLSL_HEADER}
 in vec4 a_mote;
 in vec2 a_prev;
 uniform vec2 u_px, u_centre, u_sun;
-uniform float u_size, u_gain, u_maxStreak, u_depth, u_shimmer, u_hue;
+uniform float u_size, u_gain, u_maxStreak, u_depth, u_shimmer, u_hue, u_musicShimmer, u_phase;
 uniform vec3 u_color, u_cool, u_rose, u_dusk, u_glint;
 out vec3 v_col;
 out vec2 v_local;
@@ -67,6 +69,11 @@ void main() {
   // Atmosphere: far motes fade into the dark.
   float atmosphere = mix(0.4 + 0.8 * z, 0.28 + 0.95 * z, u_depth);
   v_col = col * a_mote.w * atmosphere * shade * energy * u_gain;
+  // Music shimmer: a slow band of light drifting through the flock, each mote slightly out of step.
+  float wave = sin(a_mote.x * 7.0 + a_mote.y * 3.0 - u_phase + h * 2.5);
+  v_col *= 1.0 + u_musicShimmer * wave;
+  // The crest of the band is a touch whiter (non-negative: additive light must never subtract).
+  v_col = mix(v_col, vec3(max(v_col.r, max(v_col.g, v_col.b))), 0.3 * u_musicShimmer * max(wave, 0.0));
 }`;
 
 export const MOTE_FS = `${GLSL_HEADER}

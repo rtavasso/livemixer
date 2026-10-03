@@ -60,18 +60,21 @@ export async function importPlaylist(page, url, folder, stems = 'pro') {
   console.log(`Imported ${tracks.length} tracks: ${output}`);
 }
 
+const UPLOAD = 'button.upload input[type=file][accept*=audio]';
+
 async function ready(page, pro) {
   const signingIn = /\/(login|signup)(\/|$)/.test(new URL(page.url()).pathname);
   if (!signingIn && new URL(page.url()).pathname !== '/stems') await page.goto('https://fadr.com/stems', { waitUntil: 'domcontentloaded' });
   // Allow hydration and account restoration before checking subscription controls.
   await delay(2000);
-  if (!await page.locator('.page._stems input[type=file]').count()) {
+  // The audio upload input; Fadr's 2026 redesign dropped the .page._stems container around it.
+  if (!await page.locator(UPLOAD).count()) {
     if (!/\/(login|signup)(\/|$)/.test(new URL(page.url()).pathname)) await page.goto('https://fadr.com/login', { waitUntil: 'domcontentloaded' });
     console.log('Sign in to Fadr in the browser window. Credentials stay in that browser.');
     await until(async () => !/\/(login|signup)(\/|\?|$)/.test(new URL(page.url()).pathname), 15 * 60_000, 'Waiting for Fadr login…');
     await page.goto('https://fadr.com/stems', { waitUntil: 'domcontentloaded' });
   }
-  const toggle = page.locator('.page._stems > header button.switch').filter({ hasText: 'Pro' });
+  const toggle = page.locator('button.switch').filter({ hasText: /^\s*Pro\s*$/ });
   await toggle.waitFor({ state: 'visible' });
   await until(() => toggle.isEnabled(), 30_000, 'Waiting for Fadr account…');
   if (Boolean(await toggle.locator('.switch-slider.on').count()) !== pro) await toggle.click();
@@ -167,7 +170,7 @@ export async function splitPlaylist(page, manifestPath, { format = 'mp3', more =
             if (record.submitted) throw new Error('Prior upload not found. Open that song from your Fadr library, then retry to avoid uploading it twice');
             record.submitted = new Date().toISOString();
             await save(statePath, state);
-            await page.locator('.page._stems .upload input[type=file]').setInputFiles(mp3);
+            await page.locator(UPLOAD).setInputFiles(mp3);
           }
         }
         await until(async () => await card.count() === 1, 30_000, 'Waiting for the uploaded song…');
@@ -247,7 +250,7 @@ export async function splitPlaylist(page, manifestPath, { format = 'mp3', more =
         await closeMenu(menu);
         await card.locator('button[title="Close stems"]').click();
       }
-      const result = await run('python3', [extractor, archive, output, '--roles', ...(record.roles ?? [])]);
+      const result = await run(process.platform === 'win32' ? 'python' : 'python3', [extractor, archive, output, '--roles', ...(record.roles ?? [])]);
       record.output = relative(root, output);
       record.complete = new Date().toISOString();
       delete record.error;

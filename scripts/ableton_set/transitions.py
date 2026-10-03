@@ -184,8 +184,10 @@ def choose_style(a, b, window_a, window_b):
     return "crossfade", False, f"compatible keys ({keys}), missing drums or bass"
 
 
-def plan(songs, overlap_bars=16):
-    """Place songs, pick overlaps and styles. Mutates each song's scale."""
+def plan(songs, overlap_bars=16, style=None):
+    """Place songs, pick overlaps and styles. Mutates each song's scale.
+
+    `style`: "crossfade" to crossfade every transition instead of choosing per pair."""
     choose_scales(songs)
     grids = [grid(s) for s in songs]
     origins = [-4 * math.floor(grids[0].start_beat / 4)]
@@ -199,7 +201,7 @@ def plan(songs, overlap_bars=16):
         entry = entry_beat(b)
         bars = overlap_bars
         start = None
-        while bars >= 4:
+        while bars >= min(4, overlap_bars) and bars > 0:
             phrase = math.floor((ga.end_beat - 4 * bars) / PHRASE_BEATS)
             candidate = origin_a + PHRASE_BEATS * phrase
             if phrase >= 0 and candidate >= earliest and gb.end_beat - entry >= 4 * bars:
@@ -208,15 +210,19 @@ def plan(songs, overlap_bars=16):
             bars //= 2
         if start is None:
             start, bars = origin_a + ga.end_beat, 0
-            style, blend, reason = "butt", False, "songs too short to overlap"
+            kind, blend, reason = "butt", False, "songs too short to overlap"
+        elif style:
+            kind, blend, reason = style, False, f"{style} for every transition"
         else:
             window_a = (start - origin_a, start - origin_a + 4 * bars)
             window_b = (entry, entry + 4 * bars)
-            style, blend, reason = choose_style(a, b, window_a, window_b)
-            if style == "short-crossfade":
-                start += 4 * (bars - 4)
-                bars, style = 4, "crossfade"
-        transitions.append(Transition(i - 1, i, start, bars, style, blend, reason))
+            kind, blend, reason = choose_style(a, b, window_a, window_b)
+            if kind == "short-crossfade":
+                if bars > 4:
+                    start += 4 * (bars - 4)
+                    bars = 4
+                kind = "crossfade"
+        transitions.append(Transition(i - 1, i, start, bars, kind, blend, reason))
         clip_ends[i - 1] = min(clip_ends[i - 1], start + 4 * bars)
         origins.append(start - entry)
         clip_ends.append(origins[i] + gb.end_beat)
@@ -226,6 +232,74 @@ def plan(songs, overlap_bars=16):
         beat = transitions[i - 1].start if i else origins[0] + entry_beat(song)
         locators.append((beat, song))
     return Plan(songs, grids, origins, clip_ends, transitions, locators)
+
+
+def seconds_at(markers, beat):
+    """Audio seconds at a clip beat, along the warp markers [(seconds, clip beat)], extended past either end."""
+    for (s0, b0), (s1, b1) in zip(markers, markers[1:]):
+        if beat <= b1 or (s1, b1) == markers[-1]:
+            return s0 + (beat - b0) * (s1 - s0) / (b1 - b0)
+    return markers[-1][0]
+
+
+@dataclass
+class Retimed:
+    """A plan laid out for unwarped clips: every song at its own speed, Live's tempo following the song heard."""
+    clip_starts: list  # Arrangement beat where each song's audio starts (0 s)
+    clip_ends: list  # Arrangement beat where each song's clip ends
+    end_seconds: list  # audio seconds where each song's clip ends
+    envelopes: dict  # the plan's automation moved onto the new Arrangement beats, tempo replaced
+    locators: list  # (beat, song)
+    zones: list  # (start, end) beats of every overlap
+
+
+def natural_speed(plan_, envelopes):
+    """Retime a plan so no song is ever sped up or slowed down.
+
+    Transitions keep the plan's phrase points, found on each song's analysed beat grid, but are laid out in
+    seconds: each overlap lasts the outgoing song's own bars, the incoming song's audio simply plays, and Live's
+    tempo steps to the incoming song's at the end of the overlap (only the grid, FX QUIET markers and the
+    position Living FX reports follow it). A wrong tempo estimate then moves a grid line, never the audio."""
+    songs, grids = plan_.songs, plan_.grids
+    starts, end_seconds, spans = [0.0], [], []  # spans: (old start, old end, new start s, new end s)
+    for t in plan_.transitions:
+        out_beat = t.start - plan_.origins[t.outgoing]
+        at = seconds_at(grids[t.outgoing].markers, out_beat)
+        length = seconds_at(grids[t.outgoing].markers, out_beat + 4 * t.bars) - at
+        begin = starts[t.outgoing] + at
+        starts.append(begin - seconds_at(grids[t.incoming].markers, t.start - plan_.origins[t.incoming]))
+        end_seconds.append(at + length)
+        spans.append((t.start, t.start + 4 * t.bars, begin, begin + length))
+    end_seconds.append(songs[-1].duration)
+    changes = [(span[3], songs[k + 1].bpm) for k, span in enumerate(spans)]
+    origin = plan_.origins[0] + grids[0].start_beat
+
+    def beat(sec):
+        result, at, bpm = origin, 0.0, songs[0].bpm
+        for when, following in changes:
+            if sec <= when:
+                break
+            result, at, bpm = result + (when - at) * bpm / 60, when, following
+        return result + (sec - at) * bpm / 60
+
+    def remap(x):
+        for old0, old1, new0, new1 in spans:
+            if old1 > old0 and old0 - 2 * STEP <= x <= old1 + 1e-9:
+                b0, b1 = beat(new0), beat(new1)
+                return b0 + (x - old0) * (b1 - b0) / (old1 - old0)
+        raise ValueError(f"automation at beat {x} is outside every transition")
+
+    moved = {target: (initial, [(remap(b), v) for b, v in points])
+             for target, (initial, points) in envelopes.items() if target != "tempo"}
+    tempo = []
+    for (when, following), previous in zip(changes, songs):
+        tempo += [(beat(when) - STEP, previous.bpm), (beat(when), following)]
+    moved["tempo"] = (songs[0].bpm, tempo)
+    locators = [(beat(seconds_at(grids[0].markers, plan_.locators[0][0] - plan_.origins[0])), songs[0])]
+    locators += [(beat(span[2]), song) for span, song in zip(spans, songs[1:])]
+    return Retimed(clip_starts=[beat(s) for s in starts], clip_ends=[beat(s + e) for s, e in zip(starts, end_seconds)],
+                   end_seconds=end_seconds, envelopes=moved, locators=locators,
+                   zones=[(beat(n0), beat(n1)) for o0, o1, n0, n1 in spans if o1 > o0])
 
 
 def fade(start, end, rising, points=9):
@@ -276,6 +350,8 @@ def automation(plan_):
                     add(target, fade(at(0), at(length / 4), True), True)
                 elif role == BASS:
                     add(target, step(at(length / 2), True), True)
+                elif role == VOCALS:
+                    pass  # silent until the outgoing song has finished (below)
                 elif role == MELODIC and t.blend:
                     add(target, fade(at(length / 4), at(length / 2), True), True)
                 else:
@@ -288,6 +364,11 @@ def automation(plan_):
             add(("eq", t.incoming), step(at(length / 2), True), True)
             add(("eq", t.outgoing), step(at(length / 2), False), False)
             add(("group", t.outgoing), fade(at(3 * length / 4), at(length), False), False)
+        # The incoming song's vocals stay silent until the outgoing song has ended, whatever the vocal
+        # presence gain: two singers never overlap.
+        for name in b.bar_levels:
+            if stem_role(name) == VOCALS:
+                add(("stem", t.incoming, name), step(at(length), True), True)
 
     envelopes = {}
     for target, entries in moves.items():
