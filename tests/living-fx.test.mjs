@@ -46,14 +46,16 @@ function load(set) {
   class Task { constructor(fn) { this.fn = fn; } repeat() { task = this; } schedule(ms) { scheduled.push({ ms, fn: this.fn }); } cancel() { if (task === this) task = null; } }
   const ctx = { LiveAPI, Task, outlet: (...a) => out.push(a), arrayfromargs: (a) => Array.prototype.slice.call(a), error: () => {}, post: () => {}, Date: { now: () => clock } };
   vm.createContext(ctx); vm.runInContext(source, ctx);
-  return { ctx, out, calls, scheduled, tick: (ms = 40) => { clock += ms; task?.fn(); }, advance: (ms) => { clock += ms; } };
+  const tick = (ms = 40) => { clock += ms; task?.fn(); };
+  // /fx/values only stores the newest values; the next tick applies them.
+  return { ctx, out, calls, scheduled, tick, send: (...v) => { ctx.values(...v); tick(); }, advance: (ms) => { clock += ms; } };
 }
 
 test('drives every song group and mirrors the vocal gain', () => {
   const set = liveSet(3, []); const d = load(set);
   d.ctx.init();
   assert.match(d.out.filter(a => a[0] === 0 && a[1] === 'set').at(-1)[2], /Ready · 3 songs/);
-  d.ctx.values(0, .5, 1, .5, 1);
+  d.send(0, .5, 1, .5, 1);
   const filters = set.byName('TEXTURE FX').map(t => t.devices[0].parameters[0].value);
   assert.deepEqual(filters.map(v => +v.toFixed(3)), [.13, .13, .13]);
   for (const t of set.byName('TEXTURE FX')) { assert.ok(t.mixer_device.sends[0].value > 0); assert.ok(t.mixer_device.sends[1].value > 0); assert.ok(Math.abs(t.mixer_device.volume.value - (.85 + .1)) < 1e-9); }
@@ -74,7 +76,7 @@ test('closes the Live 11 Auto Filter low-pass for dive', () => {
   assert.match(d.out.filter(a => a[0] === 0 && a[1] === 'set').at(-1)[2], /Ready · 2 songs/);
   const cutoffs = () => set.byName('TEXTURE FX').map(t => +t.devices[0].parameters[0].value.toFixed(3));
   assert.deepEqual(cutoffs(), [135, 135]);
-  d.ctx.values(0, 0, 1, 0, .5);
+  d.send(0, 0, 1, 0, .5);
   assert.deepEqual(cutoffs(), [71.75, 71.75]);
 });
 
@@ -83,7 +85,7 @@ test('sends a merged Drums track to the dub echo, never the kick', () => {
   for (const t of set.byName('02 Snare')) t.name = '02 Drums';
   const d = load(set);
   d.ctx.init();
-  d.ctx.values(0, 1, 0, 0, .5);
+  d.send(0, 1, 0, 0, .5);
   for (const t of set.byName('02 Drums')) assert.equal(+t.mixer_device.sends[0].value.toFixed(4), +(1 + 20 * Math.log10(.8) / 40).toFixed(4));
   for (const t of set.byName('01 Kick')) assert.equal(t.mixer_device.sends[0].value, 0);
 });
@@ -98,7 +100,7 @@ test('setup reads every track name once, however many groups it looks for (a 48-
 test('an idle tick writes nothing and never reads parameter ids', () => {
   const set = liveSet(3, []); const d = load(set);
   d.ctx.init();
-  d.ctx.values(0, .5, .5, .5, .7);
+  d.send(0, .5, .5, .5, .7);
   d.tick();
   const before = { ...d.calls };
   for (let i = 0; i < 25; i++) d.tick();
@@ -121,7 +123,7 @@ test('drives the gesture devices of a --gestures set, per half', () => {
   d.ctx.init();
   assert.match(d.out.filter(a => a[0] === 0 && a[1] === 'set').at(-1)[2], /gestures 12\/12/);
   //                 flicker dub dive halo bal | muffleR muffleM tiltR tiltM levelR levelM freeze bloom span whoosh
-  d.ctx.values(0, 0, 0, 0, .5,                 1, 0,      0,   1,    0,     1,     0,     0,    1,   0);
+  d.send(0, 0, 0, 0, .5,                 1, 0,      0,   1,    0,     1,     0,     0,    1,   0);
   assert.equal(set.value('RHYTHM', 'Muffle', 'Frequency'), 70);   // fist on the rhythm half: low-pass ~450 Hz
   assert.equal(set.value('MELODIC', 'Muffle', 'Frequency'), 135); // open
   assert.deepEqual([set.value('RHYTHM', 'Tilt', '1 Gain A'), set.value('RHYTHM', 'Tilt', '4 Gain A')], [3, 0]);  // palm down: a little weight
@@ -136,7 +138,7 @@ test('drives the gesture devices of a --gestures set, per half', () => {
   assert.ok(Math.abs(set.value('MELODIC', 'Level', 'Gain') - 6 / 35) < 1e-9);
   assert.ok(Math.abs(set.value(null, 'Span', 'Stereo Width') - Math.sqrt(1.8)) < 1e-9);  // 180 %
   assert.equal(set.value(null, 'Fade In', 'Fade In') ?? set.value(null, 'Freeze', 'Fade In'), .3);
-  d.ctx.values(0, 0, 0, 0, .5);  // an old page without gesture values: home
+  d.send(0, 0, 0, 0, .5);  // an old page without gesture values: home
   assert.equal(set.value('RHYTHM', 'Muffle', 'Frequency'), 135);
   assert.equal(set.value(null, 'Span', 'Stereo Width'), 1);
 });
@@ -147,19 +149,19 @@ test('a turbulent scene is heard: swarm flutters and spins the mix through Whoos
   const whoosh = (name) => set.value(null, 'Whoosh', name);
   assert.deepEqual([whoosh('LFO Waveform'), whoosh('LFO Sync'), whoosh('LFO Stereo Mode'), whoosh('LFO Spin')], [0, 0, 1, .25]);  // sine, free, spinning
   assert.equal(whoosh('LFO Amount'), 0);
-  const swarm = (x) => d.ctx.values(0, 0, 0, 0, .5, 0, 0, .5, .5, .5, .5, 0, 0, .5, 0, x);
+  const swarm = (x) => d.send(0, 0, 0, 0, .5, 0, 0, .5, .5, .5, .5, 0, 0, .5, 0, x);
   swarm(1);
   assert.equal(whoosh('LFO Amount'), 16); assert.equal(whoosh('Frequency'), 113);
   assert.ok(Math.abs(whoosh('LFO Frequency') - .95) < 1e-9);  // ~7.5 Hz
   swarm(.5); assert.equal(whoosh('LFO Amount'), 8);
-  d.ctx.values(0, 0, 0, 0, .5, 0, 0, .5, .5, .5, .5, 0, 0, .5, 0);  // a page without swarm: calm
+  d.send(0, 0, 0, 0, .5, 0, 0, .5, .5, .5, .5, 0, 0, .5, 0);  // a page without swarm: calm
   assert.equal(whoosh('LFO Amount'), 0); assert.equal(whoosh('Frequency'), 135);
 });
 
 test('freeze holds the moment, then fades out and unfreezes', () => {
   const set = liveSet(1, [], { gestures: true }); const d = load(set);
   d.ctx.init();
-  const freeze = (on) => d.ctx.values(0, 0, 0, 0, .5, 0, 0, .5, .5, .5, .5, on, 0, .5, 0);
+  const freeze = (on) => d.send(0, 0, 0, 0, .5, 0, 0, .5, .5, .5, .5, on, 0, .5, 0);
   freeze(1); d.tick(); assert.equal(set.value(null, 'Freeze', 'Frozen'), 1);
   for (let i = 0; i < 10; i++) { freeze(1); d.tick(); }
   assert.ok(Math.abs(set.value(null, 'Freeze', 'Dry Wet') - .65) < 1e-9, 'fully in after ~0.3 s');
@@ -171,7 +173,7 @@ test('freeze holds the moment, then fades out and unfreezes', () => {
 test('FX QUIET holds the gestures at home', () => {
   const set = liveSet(1, [[0, 'FX QUIET'], [64, 'FX ON']], { gestures: true }); const d = load(set);
   d.ctx.init(); set.song.current_song_time = 8;  // inside the zone, past its 2-beat fade
-  for (let i = 0; i < 100; i++) { d.ctx.values(0, 0, 0, 0, .5, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1); d.tick(); }
+  for (let i = 0; i < 100; i++) { d.send(0, 0, 0, 0, .5, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1); d.tick(); }
   assert.equal(set.value('RHYTHM', 'Muffle', 'Frequency'), 135);
   assert.equal(set.value(null, 'Freeze', 'Frozen'), 0);
 });
@@ -205,20 +207,20 @@ test('a wall clock stepping backwards never stalls the state reports', () => {
 
 test('FX QUIET holds home until the next non-SONG cue and eases back after', () => {
   const set = liveSet(2, [[64, 'FX QUIET'], [72, 'SONG: B · 120 BPM · 8A'], [128, 'FX ON']]); const d = load(set);
-  d.ctx.init(); d.ctx.values(0, 0, 1, 0, .5);
-  set.song.current_song_time = 100; for (let i = 0; i < 100; i++) { d.ctx.values(0, 0, 1, 0, .5); d.tick(); }
+  d.ctx.init(); d.send(0, 0, 1, 0, .5);
+  set.song.current_song_time = 100; for (let i = 0; i < 100; i++) { d.send(0, 0, 1, 0, .5); d.tick(); }
   const filter = () => set.byName('TEXTURE FX')[0].devices[0].parameters[0].value;
   assert.equal(filter(), .5, 'inside the zone (past the SONG: cue) the filter is home');
-  set.song.current_song_time = 140; for (let i = 0; i < 100; i++) { d.ctx.values(0, 0, 1, 0, .5); d.tick(); }
+  set.song.current_song_time = 140; for (let i = 0; i < 100; i++) { d.send(0, 0, 1, 0, .5); d.tick(); }
   assert.ok(Math.abs(filter() - .13) < 1e-3, 'after FX ON the value returns');
 });
 
 test('eases home when the bridge goes silent and restores group volumes on reset', () => {
   const set = liveSet(2, []); const d = load(set);
-  d.ctx.init(); d.ctx.values(0, 1, 1, 1, 0);
+  d.ctx.init(); d.send(0, 1, 1, 1, 0);
   d.advance(2000); for (let i = 0; i < 200; i++) d.tick();
   assert.equal(set.byName('TEXTURE FX')[0].devices[0].parameters[0].value, .5);
-  d.ctx.values(0, 0, 0, 0, 1); d.ctx.reset();
+  d.send(0, 0, 0, 0, 1); d.ctx.reset();
   for (const t of [...set.byName('DRUM FX'), ...set.byName('TEXTURE FX')]) assert.equal(t.mixer_device.volume.value, .85);
 });
 
@@ -235,7 +237,7 @@ test('writes only the songs within earshot of the playhead, and catches the next
   d.ctx.init();
   set.song.current_song_time = 310;  // in song 3
   d.tick();
-  d.ctx.values(0, 0, 1, 0, .5);  // dive: every song's texture filter closes, but only where it can be heard
+  d.send(0, 0, 1, 0, .5);  // dive: every song's texture filter closes, but only where it can be heard
   d.tick();
   const filters = () => set.byName('TEXTURE FX').map(t => +t.devices[0].parameters[0].value.toFixed(3));
   assert.deepEqual(filters(), [.5, .5, .13, .13, .13, .5]);
@@ -248,7 +250,7 @@ test('caps the per-song writes per tick on a 48-song set, and finishes them over
   const set = liveSet(48, []); const d = load(set);
   d.ctx.init(); d.tick();
   const before = d.calls.set;
-  d.ctx.values(0, 1, 1, 1, 1);  // every per-song send, filter and volume at once
+  d.send(0, 1, 1, 1, 1);  // every per-song send, filter and volume at once
   d.tick();
   assert.ok(d.calls.set - before <= 2 * 64, `${d.calls.set - before} writes in one tick`);
   for (let i = 0; i < 40; i++) d.tick();

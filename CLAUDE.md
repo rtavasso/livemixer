@@ -77,7 +77,8 @@ Nothing below has been run on a Mac yet; it was all built and tested on Windows.
 - Max JS (`living-fx.js`) is ES5 (no let/const/arrows). It writes LiveAPI values only through `put()` (cached ids,
   write-on-change); never read `LiveAPI.id` or loop over every song per tick — that froze Live 11's main thread once
   (thousands of LiveAPI calls a second). Per-song writes go only to the songs near the playhead (from the `SONG:`
-  locators) and at most 64 per tick; writing all 48 songs whenever a hand moved froze Live again. Diagnostic dumps are
+  locators) and at most 64 per tick; `/fx/values` only stores the newest values and the 40 ms tick applies them, and
+  the bridge sends at most one per 40 ms (newest wins), so nothing can queue up in Max; writing all 48 songs whenever a hand moved froze Live again. Diagnostic dumps are
   slow and run only on request.
 - The `/fx/values` contract grows by **appending**; a missing value means home on every side (page, bridge,
   device), so old pages and devices keep working. Keep `GESTURE_KEYS` (governor.ts), `FX`/`FX_HOME` (bridge) and

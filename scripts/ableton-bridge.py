@@ -32,6 +32,7 @@ FX = ("flicker", "dub", "dive", "halo", "balance", "muffleRhythm", "muffleMelodi
 FX_HOME = {"muffleRhythm": 0., "muffleMelodic": 0., "tiltRhythm": .5, "tiltMelodic": .5, "levelRhythm": .5,
            "levelMelodic": .5, "freeze": 0., "bloom": 0., "span": .5, "whoosh": 0., "swarm": 0.}
 FX_HEARTBEAT = .25
+FX_MIN = .04        # at most one /fx/values per 40 ms (Living FX's tick); newer values replace unsent ones, never queue
 RETRY = 2.          # seconds between attempts to open a MIDI port or bind a busy network port
 PORT_CHECK = 5.     # seconds between checks that the open MIDI port still exists
 LOG_INTERVAL = 60.  # a repeating failure is logged at most once per this many seconds
@@ -203,7 +204,7 @@ class Bridge:
         self.state, self.last_state = None, 0.
         self.levels, self.last_levels = None, 0.
         self.last_resend = None
-        self.fx, self.last_fx = None, 0.
+        self.fx, self.last_fx, self.fx_due = None, 0., False
 
     def send_udp(self, packet, port):
         """Never raises: a failed send is logged (rate limited) and the next tick or heartbeat sends again."""
@@ -224,7 +225,7 @@ class Bridge:
             else: self.last_midi.pop(name, None)
 
     def send_fx(self, now):
-        self.send_udp(osc_packet("/fx/values", *self.fx), 7403); self.last_fx = now
+        self.send_udp(osc_packet("/fx/values", *self.fx), 7403); self.last_fx, self.fx_due = now, False
 
     def release_fx(self):
         if self.fx is None: return
@@ -249,7 +250,10 @@ class Bridge:
         self.send_mix()
         self.osc("stutter", value["stutter"])
         if fx is None: self.release_fx()
-        elif fx != self.fx: self.fx = fx; self.send_fx(now)
+        elif fx != self.fx:
+            self.fx = fx
+            if now - self.last_fx >= FX_MIN - 1e-6: self.send_fx(now)
+            else: self.fx_due = True  # the next tick sends the newest values
 
     def live(self, now):
         """Living FX is bound to the set and its status is fresh."""
@@ -279,7 +283,7 @@ class Bridge:
                 self.release()
             else:
                 self.osc("stutter", self.value["stutter"])
-                if self.fx is not None and now - self.last_fx >= FX_HEARTBEAT - 1e-6: self.send_fx(now)
+                if self.fx is not None and (self.fx_due or now - self.last_fx >= FX_HEARTBEAT - 1e-6): self.send_fx(now)
         self.send_mix()
 
     def status(self, now, client=None):

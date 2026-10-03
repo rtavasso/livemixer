@@ -67,7 +67,19 @@ class BridgeTests(Quiet):
         bridge.tick(10.1); self.assertEqual(len(fx_sends(udp)), 1)
         bridge.tick(10.3); self.assertEqual(len(fx_sends(udp)), 2)  # heartbeat 250 ms after the last send
         bridge.receive('owner', dict(type='controls', **module.DEFAULTS, fx={**fx, 'dive': .6}), 10.31)
+        self.assertEqual(len(fx_sends(udp)), 2)  # 10 ms after the last send: waits for the next tick
+        bridge.tick(10.35)
         self.assertEqual(fx_sends(udp)[-1], fx_packet(0, .25, .6, .75, .625, *HOME))
+
+    def test_a_burst_of_fx_changes_sends_only_the_newest_never_a_queue(self):
+        udp = UDP(); bridge = module.Bridge(Midi(), udp)
+        fx = dict(flicker=0, dub=0, dive=0, halo=0, balance=.5)
+        for i in range(10):  # a 120 Hz page: ten changes inside 80 ms
+            bridge.receive('owner', dict(type='controls', **module.DEFAULTS, fx={**fx, 'dive': i / 10}), 1 + i / 120)
+        self.assertEqual(len(fx_sends(udp)), 2)  # the first, then one 40 ms later
+        bridge.tick(1.1)
+        self.assertEqual(len(fx_sends(udp)), 3)
+        self.assertEqual(fx_sends(udp)[-1], fx_packet(0, 0, .9, 0, .5, *HOME))  # the newest; the rest were replaced
 
     def test_gesture_values_follow_the_first_five_in_contract_order(self):
         values = module.fx_values(dict(type='controls', fx=dict(flicker=0, dub=.1, dive=.2, halo=.3, balance=.5, **GESTURES)))

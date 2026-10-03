@@ -21,6 +21,9 @@ var meters=null;
 // playhead and its neighbours, from the SONG: locators. Writing all 48 songs on every tick a hand moved was ~10,000
 // LiveAPI calls a second and froze Live's main thread. `budget` caps them per tick whatever happens; what is left over
 // is written on the next tick. Global writes (Main, RHYTHM, MELODIC) are a dozen and never wait.
+// Steps under .001 are skipped, except once everything is back home: then home is written exactly, so easing never
+// leaves a value a hair off.
+var exact=0;
 var starts=[],win=null,songAt=-1,BUDGET=64,budget=Infinity,pending=0,tpos=null;
 var manual=[0,0,0,0],balance=.5,quiet=0,oscOwned=0,lastValues=0,lastTick=0,lastState=0;
 // Hand gestures (/fx/values 5..14, docs/superpowers/specs/2026-10-02-hand-gesture-audio-design.md): muffle R/M,
@@ -60,7 +63,7 @@ function mixer(t){return api(ids(t.get('mixer_device'))[0]);}
 function sends(t){return ids(mixer(t).get('sends'));}
 function volume(t){return ref(ids(mixer(t).get('volume'))[0]);}
 function put(p,v){if(!p)return;if(p instanceof Array){for(var i=0;i<p.length;i++)put(p[i],v);return;}var own=p.s!==undefined;if(own&&win&&!win[p.s])return;
-  if(last[p.id]!==undefined&&Math.abs(last[p.id]-v)<.001)return;if(own){if(budget<=0){pending=1;return;}budget--;}p.a.set('value',v);last[p.id]=v;}
+  if(last[p.id]!==undefined&&(last[p.id]===v||Math.abs(last[p.id]-v)<.001&&!exact))return;if(own){if(budget<=0){pending=1;return;}budget--;}p.a.set('value',v);last[p.id]=v;}
 function status(s){if(s!==label){label=s;outlet(0,'set',s);}}
 function sendlevel(u){if(u<=.0001)return 0;var db=20*Math.log(u)/Math.LN10;return Math.max(0,db>=-20?1+db/40:.5+(db+20)/60);}
 
@@ -98,9 +101,9 @@ function gesturesathome(){for(var i=0;i<GHOME.length;i++)if(gest[i]!==GHOME[i])r
 // Back to each group's home volume, unless the operator has moved that fader since our last write.
 function restorehome(){if(!mix)return;for(var i=0;i<mix.length;i++){var m=mix[i],id=m.p.id;if(last[id]!==undefined&&Math.abs(Number(scalar(m.p.a,'value'))-last[id])>=.001)continue;m.p.a.set('value',m.home);last[id]=m.home;}}
 // Writes only when the controls, the balance or an FX QUIET fade have moved since the last write.
-function steady(){var sig=manual.join()+'|'+balance+'|'+quiet+'|'+gest.join();if(sig===applied)return;applied=sig;var k=1-quiet,v=[];for(var i=0;i<4;i++)v.push(manual[i]*k);
+function steady(){var sig=manual.join()+'|'+balance+'|'+quiet+'|'+gest.join();if(sig===applied)return;applied=sig;exact=athome()&&!quiet?1:0;var k=1-quiet,v=[];for(var i=0;i<4;i++)v.push(manual[i]*k);
   // The release bloom and a wide span swell the halo reverb (Main's Space reverb belongs to CC21).
-  v[3]=Math.min(1,v[3]+(.6*gest[7]+.6*Math.max(0,gest[8]-.5))*k);apply(v,palmsends(k));setbalance(.5+(balance-.5)*k);applygestures(k);}
+  v[3]=Math.min(1,v[3]+(.6*gest[7]+.6*Math.max(0,gest[8]-.5))*k);apply(v,palmsends(k));setbalance(.5+(balance-.5)*k);applygestures(k);exact=0;}
 function athome(){return balance===.5&&!manual[1]&&!manual[2]&&!manual[3]&&gesturesathome();}
 function quietzone(t){var q=0;for(var i=0;i<zones.length;i++){var z=zones[i];if(t>=z[0]&&t<z[1])q=Math.max(q,Math.min(1,(t-z[0])/2));else if(t>=z[1]&&t<z[1]+2)q=Math.max(q,1-(t-z[1])/2);}return q;}
 
@@ -174,8 +177,10 @@ var SCALES=['Gain','Frequency','1 Frequency A','4 Frequency A','Stereo Width','D
 function dumpscales(t,label){if(!t)return;var ds=ids(t.get('devices'));for(var i=0;i<ds.length;i++){var d=api(ds[i]),ps=ids(d.get('parameters'));for(var j=0;j<ps.length;j++){var p=api(ps[j]),n=String(scalar(p,'name'));if(SCALES.indexOf(n)<0)continue;var lo=Number(scalar(p,'min')),hi=Number(scalar(p,'max')),out=['/livemixer/scale',label,String(scalar(d,'name')),n];for(var k=0;k<=10;k++){var v=lo+(hi-lo)*k/10;out.push(v,String(p.call('str_for_value',v)));}outlet(2,out);}}}
 function dumpparams(){try{var r=tracks('RHYTHM'),m=tracks('MELODIC'),main=new LiveAPI(null,'live_set master_track');dumpdevices(r[0],'RHYTHM');dumpdevices(m[0],'MELODIC');dumpdevices(main,'Main');dumpscales(r[0],'RHYTHM');dumpscales(main,'Main');}catch(e){error('dumpparams: '+e+'\n');}}
 
+// Only keeps the newest values: the 40 ms tick applies them. Applying each packet as it came (up to 60 a second, each
+// writing into Live) let packets queue in Max faster than Live could take them, so the music lagged the hand.
 function values(){var v=arrayfromargs(arguments);oscOwned=1;lastValues=clock();for(var i=1;i<4;i++)manual[i]=Math.max(0,Math.min(1,Number(v[i])||0));var b=Number(v[4]);balance=v.length>4&&b===b?Math.max(0,Math.min(1,b)):.5;
-  for(var j=0;j<GHOME.length;j++){var x=Number(v[5+j]);gest[j]=v.length>5+j&&x===x?Math.max(0,Math.min(1,x)):GHOME[j];}steady();if(!quiet)status('Living · following the box');}
+  for(var j=0;j<GHOME.length;j++){var x=Number(v[5+j]);gest[j]=v.length>5+j&&x===x?Math.max(0,Math.min(1,x)):GHOME[j];}if(!quiet)status('Living · following the box');}
 function control(index,value){oscOwned=0;var k=Number(index);if(k>0&&k<4)manual[k]=Math.max(0,Math.min(1,Number(value)));steady();status('Manual · combine gently');}
 function auto(v){outlet(1,'auto',0);}
 function reset(){budget=Infinity;oscOwned=0;manual=[0,0,0,0];balance=.5;gest=GHOME.slice();for(var i=0;i<4;i++)outlet(1,'dial'+i,0);apply(manual);applygestures(1);restorehome();applied='';status('Dry · tails fade naturally');}
