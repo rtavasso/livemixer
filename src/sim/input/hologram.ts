@@ -205,13 +205,18 @@ export function rectifySurface(a: Affine3, mapping: SpaceMapping, surface: Depth
 export type HologramSide = 'far' | 'near';
 
 /**
- * Where the fingertip is, in the source frame, for a calibration capture: the skeleton's index tip
+ * Where the touching hand is, in the source frame, for a calibration capture: the skeleton's palm
  * when a hand is tracked, else the scan cells nearest the hologram side (averaged), else the most
  * confident hand's position. Null when nothing is in view.
+ *
+ * Not the index tip: a finger pointing at the picture is hidden from a Leap below it, so the tracker
+ * guesses the tip, which jumped ~50 mm between an extended and a curled pose from touch to touch on
+ * the installation (11% calibration error; the palm, seen directly, fitted the same touches to ~1%).
+ * The palm is also the hand's position at run time, so it lands where the finger touched.
  */
 export function hologramFingertip(frame: { hands: HandObservation[]; surface?: DepthSurface }, side: HologramSide): Vec3 | null {
   const skeleton = frame.hands.find(h => h.capsules?.length && h.points && h.points.length >= 3);
-  if (skeleton) return skeleton.points![2]; // palm, thumb, INDEX, …
+  if (skeleton) return skeleton.points![0]; // PALM, thumb, index, …
   if (frame.surface) {
     const { width: sw, height: sh, data } = frame.surface;
     let extreme = side === 'far' ? -1 : 256;

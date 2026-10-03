@@ -116,9 +116,10 @@ describe('rectifyObservation / rectifySurface', () => {
 });
 
 describe('hologramFingertip', () => {
-  it('prefers the skeleton index tip, else the scan cell nearest the hologram side, else the hand position', () => {
-    const skeleton: HandObservation = { id: 1, confidence: 1, position: v(.5, .5, .5), points: [v(.5, .5, .5), v(.4, .4, .6), v(.45, .3, .7)], capsules: [{ a: v(0, 0, 0), b: v(1, 1, 1), radius: .1 }] };
-    near(hologramFingertip({ hands: [skeleton] }, 'far')!, v(.45, .3, .7));
+  it('prefers the skeleton palm, else the scan cell nearest the hologram side, else the hand position', () => {
+    // Not the index tip: the tracker guesses an occluded fingertip and it jumps between poses from touch to touch.
+    const skeleton: HandObservation = { id: 1, confidence: 1, position: v(.55, .45, .6), points: [v(.55, .45, .6), v(.4, .4, .6), v(.45, .3, .7)], capsules: [{ a: v(0, 0, 0), b: v(1, 1, 1), radius: .1 }] };
+    near(hologramFingertip({ hands: [skeleton] }, 'far')!, v(.55, .45, .6));
     const sw = 10, sh = 10, data = new Uint8Array(sw * sh);
     data[5 * sw + 5] = 1 + Math.round(254 * .9); data[6 * sw + 5] = 1 + Math.round(254 * .5); data[7 * sw + 5] = 1 + Math.round(254 * .2);
     const blob: HandObservation = { id: 2, confidence: 1, position: v(.5, .6, .5) };
